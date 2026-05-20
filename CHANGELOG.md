@@ -28,10 +28,23 @@ runtime's published `VERSION` on each new Computer row.
     under `$TINYHAT_RUNTIME_HOME` (default still
     `/var/lib/tinyhat-openclaw`); the dev Dockerfile points it at
     an unprivileged user's home dir.
-- `dev/Dockerfile` — local-dev container image: `node:20-slim` +
-  `openclaw@latest` + the supervisor, running as a non-root user.
+- `dev/Dockerfile` — local-dev container image based on
+  `node:22-slim` (OpenClaw `>=22.19` engine floor) + `openclaw@latest`
+  + the supervisor, running as a non-root user. Runs
+  `openclaw --version` immediately after install so a future Node /
+  OpenClaw engine mismatch fails the build instead of the first
+  `docker run`.
 - `dev/README.md` — what dev mode does, the trust boundary, and
   how to build/run the container.
+
+### Notes on the gateway subprocess argv
+
+The dev gateway subprocess invokes `openclaw gateway run` with the
+same loopback / no-auth / no-tailscale flags the prod systemd unit
+uses. It does **not** pass `--config <path>` because the OpenClaw
+CLI does not accept that flag on `gateway run`; the config path is
+read from the `OPENCLAW_CONFIG_PATH` environment variable (set on
+the subprocess and on the prod systemd unit alike).
 
 ### Unchanged
 

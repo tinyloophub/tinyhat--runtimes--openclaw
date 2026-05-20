@@ -22,7 +22,13 @@
 #     -e TINYHAT_BACKEND_AUDIENCE=https://<worktree>.ngrok.app \
 #     tinyhat-openclaw-runtime:dev
 
-FROM node:20-slim
+# Node 22 (LTS) is required: OpenClaw declares
+# ``engines.node >=22.19.0`` as of ``openclaw@2026.5.19``; building
+# on Node 20 produced an image whose CLI exits immediately with
+# ``Node.js v22.19+ is required``. The ``22-slim`` tag tracks the
+# latest 22.x patch so we always satisfy the >=22.19 floor without
+# pinning a specific patch that goes stale.
+FROM node:22-slim
 
 # Base OS deps. The prod bootstrap.sh installs these on the VM; we
 # bake them into the image so the container boots clean.
@@ -37,7 +43,14 @@ RUN apt-get update \
 # version a fresh prod Computer would install today. The
 # ``platform_repo_seeds/runtimes/openclaw/VERSION`` file in the
 # monorepo records the resolved version for any given prod boot.
-RUN npm install -g openclaw@latest
+#
+# ``openclaw --version`` immediately after install is the build-time
+# smoke check: if the runtime's Node base falls behind OpenClaw's
+# engines floor again (the failure mode that triggered the Node 22
+# bump in this Dockerfile), the build fails here instead of at the
+# first ``docker run``.
+RUN npm install -g openclaw@latest \
+    && openclaw --version
 
 # Non-root runtime user (``tinyhat:tinyhat``). The state dir lives
 # under this user's home so the supervisor can write

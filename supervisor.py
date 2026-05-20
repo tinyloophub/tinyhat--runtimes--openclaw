@@ -482,9 +482,10 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
         "--tailscale",
         "off",
         "--verbose",
-        "--config",
-        openclaw_config_path(),
     ]
+    # OpenClaw reads its config path from ``OPENCLAW_CONFIG_PATH`` in
+    # the process env (set below + by the prod systemd unit); the
+    # ``gateway run`` subcommand does not accept a ``--config`` flag.
     log.info(
         "dev: starting OpenClaw gateway subprocess: bot=@%s owner=%s port=%s "
         "log=%s",
