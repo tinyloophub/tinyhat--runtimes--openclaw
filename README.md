@@ -41,6 +41,17 @@ environment-specific.
 | `supervisor.py` | The platform-communication supervisor (state, binding, heartbeat, gateway monitor, OpenClaw config writer). Reads `tinyhat-backend-audience` and `tinyhat-platform-base-url` from instance metadata. |
 | `bootstrap.sh` | The runtime's install command. Writes the supervisor + gateway systemd units and starts the supervisor. Invoked by the VM's thin startup script after this repo is cloned and the framework is installed. |
 | `VERSION` | The runtime version published by this repo; recorded per Computer alongside the resolved commit SHA. |
+| `dev/` | Local-development container that runs the supervisor + real OpenClaw against a dev backend without GCE provisioning. See [`dev/README.md`](dev/README.md). |
+| `CHANGELOG.md` | What changed between published versions. |
+
+## Local development
+
+A `Dockerfile` ships under [`dev/`](dev/) so the supervisor +
+real `openclaw` npm package can run against a dev backend
+without booting a fresh GCE Computer. The dev paths are gated on
+`TINYHAT_DEV_RUNTIME=1` — production behaviour is unchanged when
+that env var is unset. See [`dev/README.md`](dev/README.md) for
+the trust boundary and the build/run recipe.
 
 ## How a Computer uses this repo
 
