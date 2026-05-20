@@ -44,9 +44,13 @@ From the repository root:
 docker build -f dev/Dockerfile -t tinyhat-openclaw-runtime:dev .
 ```
 
-The image is `node:20-slim` + the latest `openclaw` npm package +
-`supervisor.py` + a non-root `tinyhat` user. First build is slow
-(~600MB, ~2min); subsequent builds cache the npm layer.
+The image is `node:22-slim` (OpenClaw declares `engines.node
+>=22.19`) + the latest `openclaw` npm package + `supervisor.py` +
+a non-root `tinyhat` user. `openclaw --version` runs immediately
+after the `npm install -g openclaw@latest` step as a build-time
+smoke check, so a future engine-floor bump fails the build instead
+of the first `docker run`. First build is slow (~600MB, ~2min);
+subsequent builds cache the npm layer.
 
 ## Run
 
@@ -96,11 +100,20 @@ no code at runtime; that matches prod.)
    (default `/home/tinyhat/runtime/openclaw/openclaw.json`).
 4. Supervisor clears the platform's fallback webhook for that bot
    (Telegram only allows one webhook OR one long-poller).
-5. Supervisor launches `openclaw gateway run --config …` as a
-   subprocess. Logs flow to `$TINYHAT_RUNTIME_HOME/openclaw-gateway.log`
-   AND to `docker logs`.
+5. Supervisor launches `openclaw gateway run …` as a subprocess,
+   with `OPENCLAW_CONFIG_PATH` set in the subprocess environment
+   so OpenClaw finds the `openclaw.json` written in step 3. (The
+   `gateway run` CLI does not accept a config-path argv; the env
+   variable is the supported entry point and is the same one the
+   prod systemd unit uses.) The subprocess's stdout + stderr
+   stream to `$TINYHAT_RUNTIME_HOME/openclaw-gateway.log` (NOT to
+   the container's stdout); the supervisor's own log lines —
+   `dev: starting OpenClaw gateway subprocess`, the readiness
+   probe, the heartbeat ticks, the rebind watchdog — are what flow
+   to `docker logs`.
 6. Supervisor waits for `[gateway] ready` + `[telegram] connected
-   to gateway` log lines, then POSTs `state=active`.
+   to gateway` log lines (read from the gateway log file in step
+   5), then POSTs `state=active`.
 7. Supervisor heartbeats every 30s. A watchdog thread re-polls
    `/me/binding` and triggers rebind if the platform unassigns
    this Computer.
