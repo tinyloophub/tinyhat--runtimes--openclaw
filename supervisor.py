@@ -463,7 +463,10 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
     state_dir = openclaw_state_dir()
     os.makedirs(state_dir, exist_ok=True)
     log_path = _dev_gateway_log_path()
-    log_fh = open(log_path, "ab", buffering=0)
+    # ``log_fh`` is kept open intentionally — subprocess.Popen
+    # inherits it as its stdout/stderr and writes for the lifetime
+    # of the gateway. Closing here would lose every log line.
+    log_fh = open(log_path, "ab", buffering=0)  # noqa: SIM115
     cmd = [
         "openclaw",
         "gateway",
@@ -490,7 +493,7 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
         OPENCLAW_GATEWAY_PORT,
         log_path,
     )
-    proc = subprocess.Popen(  # noqa: S603 - cmd is a static argv
+    proc = subprocess.Popen(
         cmd,
         cwd=state_dir,
         stdout=log_fh,
