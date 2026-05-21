@@ -26,6 +26,32 @@ Keeping this code in a standalone public repository (instead of an
 inline startup-script heredoc) is the whole point of the runtime
 repo: the Computer-side platform behaviour is versioned, auditable,
 and reproducible from an explicit ref/tag/SHA.
+
+Development mode (``TINYHAT_DEV_RUNTIME=1``)
+============================================
+
+Set ``TINYHAT_DEV_RUNTIME=1`` to run the supervisor without GCE
+metadata, without systemd, and without a real GCE identity token —
+the shape needed for a local Docker container talking to a
+worktree's dev backend. In dev mode:
+
+- The GCE metadata server is never contacted; ``TINYHAT_PLATFORM_BASE_URL``
+  and ``TINYHAT_BACKEND_AUDIENCE`` env vars are read directly.
+- The bearer token is a constant marker (``dev-runtime``). The
+  platform's ``computer_identity_verifier`` already accepts any
+  bearer when ``ENV=development`` AND ``DEV_AUTO_COMPUTER_ID=<row>``
+  is set; that is the only safe pairing.
+- The OpenClaw gateway is run as a subprocess managed by this
+  supervisor (no ``systemctl`` / ``journalctl``).
+- ``OPENCLAW_CONFIG_PATH`` / ``OPENCLAW_STATE_DIR`` move under
+  ``$TINYHAT_RUNTIME_HOME`` (default ``/var/lib/tinyhat-openclaw``,
+  but the dev Dockerfile points it at a writable workspace) so the
+  container does not need root-owned ``/etc`` writes.
+
+Dev mode is fail-closed against production: the runtime never sends
+a real bearer in dev mode, and the platform-side bypass only fires
+when ``ENV=development``. Running the dev image against a prod
+backend therefore authenticates as nothing and is rejected.
 """
 
 from __future__ import annotations
@@ -42,10 +68,12 @@ import urllib.request
 
 # Path conventions on the VM. Pinned here so the gateway systemd
 # unit (written by bootstrap.sh) and this supervisor stay in
-# lockstep.
-OPENCLAW_CONFIG_PATH = "/etc/openclaw/openclaw.json"
-OPENCLAW_STATE_DIR = "/var/lib/tinyhat-openclaw"
-OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
+# lockstep. Dev mode (``TINYHAT_DEV_RUNTIME=1``) overrides each of
+# these to a writable subdirectory of ``$TINYHAT_RUNTIME_HOME`` so
+# the container does not need root ``/etc`` access.
+_DEFAULT_OPENCLAW_CONFIG_PATH = "/etc/openclaw/openclaw.json"
+_DEFAULT_OPENCLAW_STATE_DIR = "/var/lib/tinyhat-openclaw"
+_DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
@@ -63,6 +91,62 @@ BINDING_POLL_BASE_SECONDS = 3
 BINDING_POLL_IDLE_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
+
+# Marker bearer used in dev mode so the request reaches the
+# platform's ``computer_protected_route`` decorator. The platform's
+# verifier ignores the bearer body entirely when
+# ``DEV_AUTO_COMPUTER_ID`` is set under ``ENV=development``; this
+# string therefore carries no secret value.
+DEV_RUNTIME_BEARER = "dev-runtime"
+
+
+def _dev_mode() -> bool:
+    """True when this supervisor is running against a dev backend.
+
+    Set ``TINYHAT_DEV_RUNTIME=1`` in the container's environment to
+    flip the systemd / metadata-server / GCE-identity-token paths to
+    their local equivalents. Off by default — production behaviour
+    is unchanged.
+    """
+    return (os.environ.get("TINYHAT_DEV_RUNTIME") or "").strip() == "1"
+
+
+def _runtime_home() -> str:
+    """Root for dev-mode writable state.
+
+    Defaults to ``_DEFAULT_OPENCLAW_STATE_DIR`` for parity with prod
+    paths; the dev Dockerfile points it at a workspace the
+    unprivileged container user owns.
+    """
+    return (
+        os.environ.get("TINYHAT_RUNTIME_HOME") or _DEFAULT_OPENCLAW_STATE_DIR
+    ).rstrip("/")
+
+
+def openclaw_config_path() -> str:
+    if _dev_mode():
+        return os.path.join(_runtime_home(), "openclaw", "openclaw.json")
+    return _DEFAULT_OPENCLAW_CONFIG_PATH
+
+
+def openclaw_state_dir() -> str:
+    if _dev_mode():
+        return _runtime_home()
+    return _DEFAULT_OPENCLAW_STATE_DIR
+
+
+def openclaw_workspace_dir() -> str:
+    if _dev_mode():
+        return os.path.join(_runtime_home(), "workspace")
+    return _DEFAULT_OPENCLAW_WORKSPACE_DIR
+
+
+# Back-compat names kept for callers that reach in by attribute
+# (tests + the prod bootstrap heredoc). These are the prod paths;
+# dev callers must go through the helper functions above.
+OPENCLAW_CONFIG_PATH = _DEFAULT_OPENCLAW_CONFIG_PATH
+OPENCLAW_STATE_DIR = _DEFAULT_OPENCLAW_STATE_DIR
+OPENCLAW_WORKSPACE_DIR = _DEFAULT_OPENCLAW_WORKSPACE_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +178,9 @@ def get_backend_base_url() -> str:
          server every loop.
       2. The ``TINYHAT_PLATFORM_BASE_URL`` env fallback bootstrap.sh
          wrote.
+
+    Dev mode skips step 1 entirely (there is no metadata server in a
+    local container) and reads the env var directly.
     """
     now = time.time()
     cached = _base_url_cache.get("value")
@@ -101,15 +188,18 @@ def get_backend_base_url() -> str:
     if cached and (now - ts) < METADATA_TTL_SECONDS:
         return cached
     fallback = (os.environ.get("TINYHAT_PLATFORM_BASE_URL") or "").strip()
-    try:
-        value = _read_metadata_value(METADATA_BASE_URL_KEY)
-    except Exception as exc:
-        log.warning(
-            "metadata read for %s failed: %s; using fallback",
-            METADATA_BASE_URL_KEY,
-            exc,
-        )
+    if _dev_mode():
         value = ""
+    else:
+        try:
+            value = _read_metadata_value(METADATA_BASE_URL_KEY)
+        except Exception as exc:
+            log.warning(
+                "metadata read for %s failed: %s; using fallback",
+                METADATA_BASE_URL_KEY,
+                exc,
+            )
+            value = ""
     resolved = value or fallback
     if resolved != cached:
         log.info(
@@ -138,15 +228,18 @@ def get_backend_audience() -> str:
     if cached and (now - ts) < METADATA_TTL_SECONDS:
         return cached
     fallback = (os.environ.get("TINYHAT_BACKEND_AUDIENCE") or "").strip()
-    try:
-        value = _read_metadata_value(METADATA_AUDIENCE_KEY)
-    except Exception as exc:
-        log.warning(
-            "metadata read for %s failed: %s; using fallback",
-            METADATA_AUDIENCE_KEY,
-            exc,
-        )
+    if _dev_mode():
         value = ""
+    else:
+        try:
+            value = _read_metadata_value(METADATA_AUDIENCE_KEY)
+        except Exception as exc:
+            log.warning(
+                "metadata read for %s failed: %s; using fallback",
+                METADATA_AUDIENCE_KEY,
+                exc,
+            )
+            value = ""
     resolved = value or fallback
     if resolved != cached:
         log.info("backend audience = %s", resolved)
@@ -156,6 +249,17 @@ def get_backend_audience() -> str:
 
 
 def fetch_identity_token() -> str:
+    """Fetch a Google-signed VM identity JWT for this Computer.
+
+    In dev mode there is no metadata server and no GCE identity to
+    sign — return the constant marker bearer. The platform's
+    ``computer_identity_verifier`` short-circuits on
+    ``DEV_AUTO_COMPUTER_ID`` (only honoured under
+    ``ENV=development``) and never inspects this string, so it
+    carries no secret value.
+    """
+    if _dev_mode():
+        return DEV_RUNTIME_BEARER
     audience = get_backend_audience()
     url = (
         "http://metadata.google.internal/computeMetadata/v1/"
@@ -204,9 +308,12 @@ def write_openclaw_config(binding: dict) -> None:
     if not bot_token:
         raise ValueError("binding is missing telegram_bot_token")
 
-    os.makedirs(os.path.dirname(OPENCLAW_CONFIG_PATH), exist_ok=True)
-    os.makedirs(OPENCLAW_STATE_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(OPENCLAW_WORKSPACE_DIR, mode=0o700, exist_ok=True)
+    config_path = openclaw_config_path()
+    state_dir = openclaw_state_dir()
+    workspace_dir = openclaw_workspace_dir()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    os.makedirs(workspace_dir, mode=0o700, exist_ok=True)
 
     # OpenRouter runtime config when the platform delivered it on
     # this binding. OpenClaw's OpenRouter provider reads
@@ -241,7 +348,7 @@ def write_openclaw_config(binding: dict) -> None:
         },
         "agents": {
             "defaults": {
-                "workspace": OPENCLAW_WORKSPACE_DIR,
+                "workspace": workspace_dir,
                 "model": {"primary": primary_model},
                 "agentRuntime": {"id": "pi"},
             },
@@ -268,15 +375,15 @@ def write_openclaw_config(binding: dict) -> None:
     }
     if openrouter_enabled:
         config["env"] = {"OPENROUTER_API_KEY": openrouter_key}
-    tmp = OPENCLAW_CONFIG_PATH + ".tmp"
+    tmp = config_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
-    os.replace(tmp, OPENCLAW_CONFIG_PATH)
-    os.chmod(OPENCLAW_CONFIG_PATH, 0o600)
+    os.replace(tmp, config_path)
+    os.chmod(config_path, 0o600)
     # Log only non-secret summary; never log the API key.
     log.info(
         "wrote OpenClaw config to %s (bot=@%s owner=%s model=%s openrouter=%s)",
-        OPENCLAW_CONFIG_PATH,
+        config_path,
         binding.get("telegram_bot_username"),
         owner_id,
         primary_model,
@@ -331,13 +438,144 @@ def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProces
     return result
 
 
-def start_openclaw_gateway(binding: dict) -> float:
-    """Start real OpenClaw under systemd.
+# In dev mode the supervisor owns the OpenClaw gateway process
+# directly instead of delegating to systemd. The Popen handle lives
+# here so the four lifecycle entry points share state.
+_dev_gateway: dict = {"proc": None, "log_path": None}
 
-    The Python supervisor owns binding coordination only. The
-    OpenClaw gateway itself is a separate systemd unit so it has
-    first-class lifecycle, logs, and crash restart semantics.
+
+def _dev_gateway_log_path() -> str:
+    return os.path.join(openclaw_state_dir(), "openclaw-gateway.log")
+
+
+def _start_openclaw_gateway_dev(binding: dict) -> float:
+    """Spawn ``openclaw gateway run`` as a child of this supervisor.
+
+    Replaces the systemd ``restart`` path in dev mode. The
+    subprocess's stdout / stderr stream into ``openclaw-gateway.log``
+    under the state dir so the health probe in
+    :func:`_probe_openclaw_gateway_health_dev` can read them; they
+    do NOT flow to the container's stdout, so ``docker logs`` shows
+    only the supervisor's own log lines. A maintainer who needs the
+    gateway's output runs ``docker exec -it <container> tail -f
+    $TINYHAT_RUNTIME_HOME/openclaw-gateway.log``. If a prior gateway
+    is still alive, it is stopped first (idempotent restart).
     """
+    if _dev_gateway["proc"] is not None and _dev_gateway["proc"].poll() is None:
+        log.info("dev: stopping previous openclaw gateway before restart")
+        _stop_openclaw_gateway_dev()
+    state_dir = openclaw_state_dir()
+    os.makedirs(state_dir, exist_ok=True)
+    log_path = _dev_gateway_log_path()
+    # ``log_fh`` is kept open intentionally — subprocess.Popen
+    # inherits it as its stdout/stderr and writes for the lifetime
+    # of the gateway. Closing here would lose every log line.
+    log_fh = open(log_path, "ab", buffering=0)  # noqa: SIM115
+    cmd = [
+        "openclaw",
+        "gateway",
+        "run",
+        "--force",
+        "--allow-unconfigured",
+        "--port",
+        str(OPENCLAW_GATEWAY_PORT),
+        "--bind",
+        "loopback",
+        "--auth",
+        "none",
+        "--tailscale",
+        "off",
+        "--verbose",
+    ]
+    # OpenClaw reads its config path from ``OPENCLAW_CONFIG_PATH`` in
+    # the process env (set below + by the prod systemd unit); the
+    # ``gateway run`` subcommand does not accept a ``--config`` flag.
+    log.info(
+        "dev: starting OpenClaw gateway subprocess: bot=@%s owner=%s port=%s "
+        "log=%s",
+        binding.get("telegram_bot_username"),
+        binding.get("telegram_owner_user_id"),
+        OPENCLAW_GATEWAY_PORT,
+        log_path,
+    )
+    proc = subprocess.Popen(
+        cmd,
+        cwd=state_dir,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        env={
+            **os.environ,
+            "HOME": state_dir,
+            "OPENCLAW_CONFIG_PATH": openclaw_config_path(),
+            "OPENCLAW_STATE_DIR": state_dir,
+        },
+    )
+    _dev_gateway["proc"] = proc
+    _dev_gateway["log_path"] = log_path
+    return time.time()
+
+
+def _is_openclaw_gateway_active_dev() -> bool:
+    proc = _dev_gateway.get("proc")
+    return proc is not None and proc.poll() is None
+
+
+def _probe_openclaw_gateway_health_dev(
+    _started_at: float,
+) -> tuple[bool, str]:
+    log_path = _dev_gateway.get("log_path") or _dev_gateway_log_path()
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read()
+    except FileNotFoundError:
+        return False, "gateway log file not created yet"
+    gateway_ready = "[gateway] ready" in tail
+    telegram_connected = "[telegram] connected to gateway" in tail
+    if gateway_ready and telegram_connected:
+        return True, "ok"
+    missing = []
+    if not gateway_ready:
+        missing.append("gateway ready")
+    if not telegram_connected:
+        missing.append("telegram connected")
+    return False, "waiting for OpenClaw " + ", ".join(missing)
+
+
+def _stop_openclaw_gateway_dev() -> None:
+    proc = _dev_gateway.get("proc")
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        _dev_gateway["proc"] = None
+        return
+    log.info("dev: stopping openclaw gateway subprocess (pid=%s)", proc.pid)
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        _dev_gateway["proc"] = None
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        log.warning("dev: gateway did not exit on SIGTERM, sending SIGKILL")
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.error("dev: gateway did not exit on SIGKILL either")
+    _dev_gateway["proc"] = None
+
+
+def start_openclaw_gateway(binding: dict) -> float:
+    """Start real OpenClaw.
+
+    In production the OpenClaw gateway runs as a separate systemd
+    unit so it has first-class lifecycle, logs, and crash-restart
+    semantics. In dev mode the supervisor runs it as a subprocess
+    instead (no systemd in a typical dev container).
+    """
+    if _dev_mode():
+        return _start_openclaw_gateway_dev(binding)
     started_at = time.time()
     log.info(
         "starting OpenClaw gateway unit: bot=@%s owner=%s port=%s",
@@ -351,6 +589,8 @@ def start_openclaw_gateway(binding: dict) -> float:
 
 
 def is_openclaw_gateway_active() -> bool:
+    if _dev_mode():
+        return _is_openclaw_gateway_active_dev()
     return (
         _run_systemctl(
             "is-active", "--quiet", GATEWAY_SYSTEMD_UNIT, check=False
@@ -360,14 +600,17 @@ def is_openclaw_gateway_active() -> bool:
 
 
 def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
-    """Inspect OpenClaw's own systemd logs for channel readiness.
+    """Inspect OpenClaw's logs for channel readiness.
 
     ``openclaw gateway health --url ...`` requires explicit gateway
     credentials even for this unauthenticated loopback setup, so the
-    production readiness gate follows the systemd-owned gateway
-    process and waits for the OpenClaw log lines that matter here:
-    the gateway is ready and Telegram is connected for long polling.
+    readiness gate follows the gateway's own log output and waits
+    for the two lines that matter here: the gateway is ready and
+    Telegram is connected for long polling. In production those logs
+    flow through journald; in dev mode they go to a flat file.
     """
+    if _dev_mode():
+        return _probe_openclaw_gateway_health_dev(started_at)
     since = f"@{int(started_at)}"
     try:
         result = subprocess.run(
@@ -410,7 +653,11 @@ def wait_for_openclaw_start(started_at: float) -> None:
     last_probe = ""
     while time.time() < deadline:
         if not is_openclaw_gateway_active():
-            last_probe = "systemd unit is not active"
+            last_probe = (
+                "openclaw subprocess exited"
+                if _dev_mode()
+                else "systemd unit is not active"
+            )
             time.sleep(1)
             continue
         ok, detail = probe_openclaw_gateway_health(started_at)
@@ -426,6 +673,9 @@ def wait_for_openclaw_start(started_at: float) -> None:
 
 
 def stop_openclaw_gateway() -> None:
+    if _dev_mode():
+        _stop_openclaw_gateway_dev()
+        return
     log.info("stopping OpenClaw gateway unit")
     _run_systemctl("stop", GATEWAY_SYSTEMD_UNIT, check=False)
 
