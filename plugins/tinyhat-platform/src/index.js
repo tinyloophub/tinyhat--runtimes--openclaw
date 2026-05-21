@@ -102,8 +102,8 @@ const plugin = defineToolPlugin({
     tool({
       name: "tinyhat_open_terminal_link",
       description:
-        "Create a Telegram Mini App link/button payload so the owner can open " +
-        "the Tinyhat dev terminal spike for this Computer.",
+        "Create a Telegram Mini App link/button payload so an agent admin can " +
+        "open a secure terminal for this Computer.",
       parameters: emptyParameters,
       execute: async (_params, config, context) => {
         const runtime = resolveExecutionRuntime(config, context);
@@ -217,11 +217,11 @@ plugin.register = (api) => {
   api.registerCommand({
     name: "tinyhat_terminal",
     nativeNames: { default: "tinyhat_terminal" },
-    description: "Open the Tinyhat dev terminal Mini App.",
+    description: "Open a secure Tinyhat terminal.",
     channels: ["telegram"],
     acceptsArgs: false,
     agentPromptGuidance: [
-      "Use /tinyhat_terminal when the owner asks to open the dev terminal for this OpenClaw Computer.",
+      "Use /tinyhat_terminal when an agent admin asks to open a secure terminal for this Computer.",
     ],
     handler: async () => {
       const payload = await fetchTerminalLink(platformConfig);
@@ -377,12 +377,9 @@ function formatTerminalReply(payload) {
       text: message || "Tinyhat terminal is not available for this Computer.",
     };
   }
-  const text = [
-    "Open the Tinyhat terminal Mini App.",
-    message,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const text =
+    message ||
+    "Open a secure terminal to this computer and run commands as an admin. Only admins of this agent can open it.";
   return {
     text,
     channelData: { telegram: { buttons: [[button]] } },
@@ -392,7 +389,7 @@ function formatTerminalReply(payload) {
           type: "buttons",
           buttons: [
             {
-              label: normalizeString(button.text) || "Open terminal",
+              label: normalizeString(button.text) || "Open secure terminal",
               webApp: { url: button.web_app.url },
             },
           ],
