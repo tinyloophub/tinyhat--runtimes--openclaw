@@ -24,6 +24,13 @@ production-only paths are swapped for local equivalents:
 
 Everything else — the `/me/state` → `/me/binding` → `write_openclaw_config` → `start_openclaw_gateway` → `/me/heartbeat` state machine, the rebind watchdog, the OpenClaw config shape — is identical to production. That's the point: any change to `supervisor.py` that breaks the dev loop will break the prod loop too.
 
+Runtime secrets follow the production path too. When the supervisor
+receives an `apply_config` heartbeat command, it writes the Computer's
+latest secret map to `/etc/openclaw/tinyhat-secrets.json` with mode
+`0600`, syncs OpenClaw file SecretRefs in `openclaw.json`, and runs
+`openclaw secrets reload --json`. The dev image keeps the supervisor
+non-root by chowning only `/etc/openclaw` to the `tinyhat` user.
+
 ## Trust boundary
 
 The dev image is **only** safe against a dev backend. The bearer
@@ -126,9 +133,11 @@ supervisor stops the gateway subprocess cleanly and exits.
 ```bash
 docker exec -it <container> sh
 ls /home/tinyhat/runtime/        # openclaw.json, workspace/, openclaw-gateway.log
+ls -l /etc/openclaw/             # tinyhat-secrets.json after first apply_config
 tail -f /home/tinyhat/runtime/openclaw-gateway.log
 cat /home/tinyhat/runtime/openclaw/openclaw.json
 ```
 
 The state dir is intentionally under the unprivileged `tinyhat`
-user's home so nothing in the image needs root.
+user's home. The only `/etc` path the dev image writes is the
+production-compatible Tinyhat SecretRef file under `/etc/openclaw`.

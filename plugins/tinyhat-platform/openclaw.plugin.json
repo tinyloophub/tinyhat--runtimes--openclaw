@@ -1,0 +1,38 @@
+{
+  "id": "tinyhat-platform",
+  "name": "Tinyhat Platform",
+  "description": "Tinyhat Computer credential tools for hosted OpenClaw agents.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "platformBaseUrl": {
+        "type": "string"
+      },
+      "backendAudience": {
+        "type": "string"
+      },
+      "devMode": {
+        "type": "boolean"
+      },
+      "devBearer": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "skills": [
+    "skills"
+  ],
+  "contracts": {
+    "tools": [
+      "tinyhat_list_runtime_secrets",
+      "tinyhat_request_runtime_secret",
+      "tinyhat_open_terminal_link",
+      "tinyhat_secret_command"
+    ]
+  }
+}

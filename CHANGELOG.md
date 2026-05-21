@@ -5,6 +5,45 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.4.0
+
+### Added
+
+- Bundled `tinyhat-platform` OpenClaw tool plugin. The supervisor
+  installs it before gateway startup and enables it in
+  `openclaw.json`.
+- Agent-callable credential helpers:
+  `tinyhat_list_runtime_secrets`,
+  `tinyhat_request_runtime_secret`, and the `/tinyhat_secrets`
+  skill-command dispatcher. These tools return secret metadata and
+  Mini App add-secret links only; they never return secret values.
+
+## 0.3.0
+
+### Added
+
+- Heartbeat-delivered `apply_config` command handling. The
+  supervisor now pulls the latest Computer-scoped runtime secret
+  map, writes `/etc/openclaw/tinyhat-secrets.json` with mode
+  `0600`, syncs OpenClaw file SecretRefs, runs
+  `openclaw secrets reload --json`, and posts the apply result back
+  to Tinyhat.
+- Rapid saves coalesce because the supervisor pulls the latest
+  revision at apply time, not the revision that happened to be in
+  the heartbeat payload.
+- Failed applies record diagnostics and are not retried locally on
+  every heartbeat until Tinyhat issues a newer desired revision.
+
+### Changed
+
+- OpenClaw config now includes a Tinyhat file SecretRef provider.
+  When `OPENAI_API_KEY` exists in the runtime secret map, the
+  supervisor wires `models.providers.openai.apiKey` to the file
+  pointer `/OPENAI_API_KEY`.
+- The dev Docker image keeps running as the non-root `tinyhat` user
+  while chowning `/etc/openclaw` so the local harness exercises the
+  same Tinyhat SecretRef file path as production.
+
 ## 0.2.0
 
 ### Added

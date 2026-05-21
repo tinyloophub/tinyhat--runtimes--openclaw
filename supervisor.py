@@ -61,6 +61,7 @@ import logging
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -74,8 +75,13 @@ import urllib.request
 _DEFAULT_OPENCLAW_CONFIG_PATH = "/etc/openclaw/openclaw.json"
 _DEFAULT_OPENCLAW_STATE_DIR = "/var/lib/tinyhat-openclaw"
 _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
+_DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
+TINYHAT_SECRETS_PROVIDER = "tinyhat"
+TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
+TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
+TINYHAT_PLATFORM_PLUGIN_ID = "tinyhat-platform"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
 
 # Instance-metadata keys the platform writes at insert time and can
@@ -91,6 +97,9 @@ BINDING_POLL_BASE_SECONDS = 3
 BINDING_POLL_IDLE_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
+OPENCLAW_SECRETS_RELOAD_ATTEMPTS = 3
+OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS = 12
+OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (1, 2)
 
 # Marker bearer used in dev mode so the request reaches the
 # platform's ``computer_protected_route`` decorator. The platform's
@@ -141,12 +150,43 @@ def openclaw_workspace_dir() -> str:
     return _DEFAULT_OPENCLAW_WORKSPACE_DIR
 
 
+def tinyhat_secrets_path() -> str:
+    """Path where the supervisor writes Computer-scoped runtime secrets.
+
+    Production intentionally uses OpenClaw's host-level config dir. Dev
+    containers chown this one directory to the unprivileged runtime user
+    so the local harness exercises the same file path without running the
+    supervisor as root.
+    """
+    return (
+        os.environ.get("TINYHAT_SECRETS_PATH") or _DEFAULT_TINYHAT_SECRETS_PATH
+    ).strip()
+
+
+def runtime_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def tinyhat_platform_plugin_dir() -> str:
+    return os.path.join(runtime_dir(), "plugins", TINYHAT_PLATFORM_PLUGIN_ID)
+
+
+def _openclaw_cli_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "HOME": openclaw_state_dir(),
+        "OPENCLAW_CONFIG_PATH": openclaw_config_path(),
+        "OPENCLAW_STATE_DIR": openclaw_state_dir(),
+    }
+
+
 # Back-compat names kept for callers that reach in by attribute
 # (tests + the prod bootstrap heredoc). These are the prod paths;
 # dev callers must go through the helper functions above.
 OPENCLAW_CONFIG_PATH = _DEFAULT_OPENCLAW_CONFIG_PATH
 OPENCLAW_STATE_DIR = _DEFAULT_OPENCLAW_STATE_DIR
 OPENCLAW_WORKSPACE_DIR = _DEFAULT_OPENCLAW_WORKSPACE_DIR
+TINYHAT_SECRETS_PATH = _DEFAULT_TINYHAT_SECRETS_PATH
 
 logging.basicConfig(
     level=logging.INFO,
@@ -299,7 +339,344 @@ def get_json(path: str) -> dict:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def write_openclaw_config(binding: dict) -> None:
+def _tinyhat_platform_plugin_version() -> str:
+    package_json = os.path.join(tinyhat_platform_plugin_dir(), "package.json")
+    try:
+        with open(package_json, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Tinyhat platform plugin package is missing at {package_json}"
+        )
+    return str(payload.get("version") or "unknown")
+
+
+def _tinyhat_platform_plugin_marker_path() -> str:
+    return os.path.join(openclaw_state_dir(), "tinyhat-platform-plugin.version")
+
+
+def ensure_tinyhat_platform_plugin_installed() -> bool:
+    """Install the bundled Tinyhat tool plugin into OpenClaw.
+
+    The plugin is shipped in the runtime repo and installed locally so
+    OpenClaw can expose the Computer-scoped credential tools at
+    gateway startup. It contains no Tinyhat credentials; requests
+    authenticate with the same GCE Computer identity token boundary as
+    the supervisor.
+    """
+    plugin_dir = tinyhat_platform_plugin_dir()
+    if not os.path.isdir(plugin_dir):
+        raise RuntimeError(f"Tinyhat platform plugin not found at {plugin_dir}")
+    version = _tinyhat_platform_plugin_version()
+    marker = _tinyhat_platform_plugin_marker_path()
+    installed_manifest = os.path.join(
+        openclaw_state_dir(),
+        "extensions",
+        TINYHAT_PLATFORM_PLUGIN_ID,
+        "openclaw.plugin.json",
+    )
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            marker_version = fh.read().strip()
+    except FileNotFoundError:
+        marker_version = ""
+    if marker_version == version and os.path.exists(installed_manifest):
+        log.info("Tinyhat platform plugin already installed (version=%s)", version)
+        return True
+
+    cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_openclaw_cli_env(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Tinyhat platform plugin install failed: {detail}")
+    os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(version + "\n")
+    log.info("installed Tinyhat platform plugin (version=%s)", version)
+    return True
+
+
+def try_install_tinyhat_platform_plugin() -> bool:
+    """Best-effort install for optional chat credential tools.
+
+    The runtime must still boot without this plugin: core agent
+    credentials flow through the supervisor's secret-file path, while
+    the plugin only adds metadata-only helper tools for chat UX.
+    """
+    try:
+        return ensure_tinyhat_platform_plugin_installed()
+    except Exception as exc:
+        log.warning(
+            "Tinyhat platform plugin unavailable; continuing without "
+            "credential tools: %s",
+            exc,
+        )
+        return False
+
+
+def _atomic_write_json(path: str, payload: dict, *, mode: int = 0o600) -> None:
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _secret_ref_for_openai_api_key() -> dict:
+    return {
+        "source": "file",
+        "provider": TINYHAT_SECRETS_PROVIDER,
+        "id": TINYHAT_OPENAI_API_KEY_POINTER,
+    }
+
+
+def _ensure_tinyhat_secret_provider_config(config: dict) -> None:
+    secrets_cfg = config.setdefault("secrets", {})
+    providers = secrets_cfg.setdefault("providers", {})
+    providers[TINYHAT_SECRETS_PROVIDER] = {
+        "source": "file",
+        "path": tinyhat_secrets_path(),
+        "mode": "json",
+    }
+    defaults = secrets_cfg.setdefault("defaults", {})
+    defaults["file"] = TINYHAT_SECRETS_PROVIDER
+
+
+def _sync_openai_api_key_ref(config: dict, secrets: dict[str, str]) -> None:
+    models_cfg = config.setdefault("models", {})
+    providers = models_cfg.setdefault("providers", {})
+    openai_cfg = providers.setdefault("openai", {})
+    expected_ref = _secret_ref_for_openai_api_key()
+    if (secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip():
+        openai_cfg["apiKey"] = expected_ref
+        return
+
+    # Removing OPENAI_API_KEY should stop advertising Tinyhat's file
+    # ref. Only remove the value when it is the one this supervisor
+    # manages; leave unrelated operator-authored config alone.
+    if openai_cfg.get("apiKey") == expected_ref:
+        del openai_cfg["apiKey"]
+    if not openai_cfg:
+        del providers["openai"]
+    if not providers:
+        del models_cfg["providers"]
+    if not models_cfg:
+        del config["models"]
+
+
+def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> None:
+    """Update openclaw.json with Tinyhat's file SecretRef surfaces."""
+    config_path = openclaw_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            config = json.load(fh)
+    except FileNotFoundError:
+        config = {}
+
+    _ensure_tinyhat_secret_provider_config(config)
+    _sync_openai_api_key_ref(config, secrets)
+    _atomic_write_json(config_path, config)
+    log.info(
+        "synced OpenClaw SecretRef config (provider=%s openai_ref=%s)",
+        TINYHAT_SECRETS_PROVIDER,
+        "yes" if (secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip() else "no",
+    )
+
+
+def _tinyhat_platform_plugin_config() -> dict:
+    """Return non-secret config for the bundled OpenClaw tool plugin."""
+    plugin_config: dict = {"devMode": _dev_mode()}
+    base_url = get_backend_base_url()
+    if base_url:
+        plugin_config["platformBaseUrl"] = base_url
+    audience = get_backend_audience()
+    if audience:
+        plugin_config["backendAudience"] = audience
+    if _dev_mode():
+        plugin_config["devBearer"] = DEV_RUNTIME_BEARER
+    return plugin_config
+
+
+def write_tinyhat_secrets_file(secrets: dict[str, str]) -> None:
+    """Write the latest Computer-scoped secret map for OpenClaw.
+
+    Secret names are metadata; values are never logged. The file is an
+    OpenClaw JSON file provider source, so refs such as
+    ``/OPENAI_API_KEY`` resolve against the top-level object.
+    """
+    normalized = {
+        str(name): str(value)
+        for name, value in (secrets or {}).items()
+        if str(name).strip()
+    }
+    path = tinyhat_secrets_path()
+    _atomic_write_json(path, normalized)
+    log.info(
+        "wrote Tinyhat runtime secrets file to %s (keys=%d)",
+        path,
+        len(normalized),
+    )
+
+
+def read_tinyhat_secrets_file() -> dict[str, str]:
+    """Read the last applied Computer-scoped runtime-secret map.
+
+    This is used during supervisor restart / rebind to rebuild
+    ``openclaw.json`` from the secrets already persisted on the
+    Computer disk. Values remain process-local and are never logged.
+    """
+    path = tinyhat_secrets_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("could not read Tinyhat runtime secrets file at %s: %s", path, exc)
+        return {}
+    if not isinstance(payload, dict):
+        log.warning("Tinyhat runtime secrets file at %s is not a JSON object", path)
+        return {}
+    return {
+        str(name): str(value)
+        for name, value in payload.items()
+        if str(name).strip()
+    }
+
+
+def _redact_known_secret_values(text: str, secrets: dict[str, str]) -> str:
+    redacted = text
+    for value in (secrets or {}).values():
+        candidate = str(value or "")
+        if len(candidate) >= 4:
+            redacted = redacted.replace(candidate, "[redacted]")
+    return redacted
+
+
+def _diagnostic_from_exception(exc: Exception, secrets: dict[str, str]) -> str:
+    return _redact_known_secret_values(str(exc), secrets)[:1023]
+
+
+def _openclaw_reload_retryable(detail: str) -> bool:
+    lowered = detail.lower()
+    return (
+        "gateway did not respond" in lowered
+        or "secrets runtime snapshot is not active" in lowered
+    )
+
+
+def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
+    """Ask the running gateway to refresh its SecretRef snapshot."""
+    cmd = [
+        "openclaw",
+        "secrets",
+        "reload",
+        "--json",
+    ]
+    env = _openclaw_cli_env()
+    last_detail = ""
+    for attempt in range(1, OPENCLAW_SECRETS_RELOAD_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_detail = _redact_known_secret_values(
+                f"openclaw secrets reload timed out after "
+                f"{OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS}s",
+                secrets,
+            )
+            if exc.stderr:
+                last_detail += ": " + _redact_known_secret_values(
+                    str(exc.stderr),
+                    secrets,
+                )
+            if attempt < OPENCLAW_SECRETS_RELOAD_ATTEMPTS:
+                delay_seconds = OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS[
+                    attempt - 1
+                ]
+                log.warning(
+                    "openclaw secrets reload attempt %d timed out; "
+                    "retrying in %ds",
+                    attempt,
+                    delay_seconds,
+                )
+                time.sleep(delay_seconds)
+                continue
+            break
+        if result.returncode == 0:
+            output = (result.stdout or "").strip()
+            if not output:
+                return {}
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                return {"raw": _redact_known_secret_values(output, secrets)}
+
+        last_detail = _redact_known_secret_values(
+            (result.stderr or result.stdout or "").strip(),
+            secrets,
+        )
+        if (
+            attempt < OPENCLAW_SECRETS_RELOAD_ATTEMPTS
+            and _openclaw_reload_retryable(last_detail)
+        ):
+            delay_seconds = OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS[attempt - 1]
+            log.warning(
+                "openclaw secrets reload attempt %d failed during gateway "
+                "settle; retrying in %ds: %s",
+                attempt,
+                delay_seconds,
+                last_detail,
+            )
+            time.sleep(delay_seconds)
+            continue
+        break
+
+    raise RuntimeError(
+        "openclaw secrets reload failed"
+        + (f": {last_detail}" if last_detail else " (no detail)")
+    )
+
+
+def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
+    """Apply one latest runtime-secret revision to OpenClaw."""
+    write_tinyhat_secrets_file(secrets)
+    sync_openclaw_secret_ref_config(secrets)
+    reload_result = reload_openclaw_secrets(secrets)
+    return {
+        "revision": revision,
+        "secret_count": len(secrets or {}),
+        "reload": reload_result,
+    }
+
+
+def write_openclaw_config(
+    binding: dict,
+    *,
+    enable_tinyhat_platform_plugin: bool = True,
+) -> None:
     """Write the real OpenClaw gateway config for this binding."""
     owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
     bot_token = str(binding.get("telegram_bot_token") or "").strip()
@@ -337,6 +714,19 @@ def write_openclaw_config(binding: dict) -> None:
         else OPENCLAW_DEFAULT_MODEL
     )
     openai_plugin = {"enabled": True}
+    plugin_entries = {
+        "telegram": {"enabled": True},
+        "openai": openai_plugin,
+    }
+    if enable_tinyhat_platform_plugin:
+        plugin_entries[TINYHAT_PLATFORM_PLUGIN_ID] = {
+            "enabled": True,
+            "config": _tinyhat_platform_plugin_config(),
+        }
+    else:
+        log.warning(
+            "Tinyhat platform credential tools are disabled for this OpenClaw boot"
+        )
 
     config = {
         "gateway": {
@@ -366,28 +756,30 @@ def write_openclaw_config(binding: dict) -> None:
             "ownerAllowFrom": ["telegram:" + owner_id],
         },
         "plugins": {
-            "entries": {
-                "telegram": {"enabled": True},
-                "openai": openai_plugin,
-            },
+            "entries": plugin_entries,
         },
         "session": {"dmScope": "per-channel-peer"},
     }
+    _ensure_tinyhat_secret_provider_config(config)
+    current_secrets = read_tinyhat_secrets_file()
+    _sync_openai_api_key_ref(config, current_secrets)
     if openrouter_enabled:
         config["env"] = {"OPENROUTER_API_KEY": openrouter_key}
-    tmp = config_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(config, fh, indent=2)
-    os.replace(tmp, config_path)
-    os.chmod(config_path, 0o600)
+    _atomic_write_json(config_path, config)
     # Log only non-secret summary; never log the API key.
     log.info(
-        "wrote OpenClaw config to %s (bot=@%s owner=%s model=%s openrouter=%s)",
+        "wrote OpenClaw config to %s "
+        "(bot=@%s owner=%s model=%s openrouter=%s openai_ref=%s)",
         config_path,
         binding.get("telegram_bot_username"),
         owner_id,
         primary_model,
         "yes" if openrouter_enabled else "no",
+        (
+            "yes"
+            if (current_secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip()
+            else "no"
+        ),
     )
 
 
@@ -696,6 +1088,11 @@ def stop_openclaw_gateway() -> None:
 #                 unassign + reassign that lands inside the heartbeat
 #                 window still triggers a clean rebind.
 _stop_holder = {"stop": False, "rebind": False, "signature": None}
+_config_apply_state = {
+    "failed_revision": None,
+    "failed_diagnostic": None,
+    "failed_reported": False,
+}
 
 
 def _binding_signature(binding: dict) -> tuple:
@@ -720,6 +1117,115 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
     )
+
+
+def _command_revision(command: dict) -> int | None:
+    try:
+        revision = int(command.get("revision"))
+    except (TypeError, ValueError):
+        return None
+    if revision < 0:
+        return None
+    return revision
+
+
+def _post_config_apply_result(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None = None,
+) -> None:
+    body = {"revision": revision, "status": status}
+    if diagnostic:
+        body["diagnostic"] = diagnostic[:1023]
+    post_json("/hapi/v1/computers/me/config/apply-result", body)
+
+
+def _report_cached_failed_revision() -> None:
+    revision = _config_apply_state.get("failed_revision")
+    if revision is None or _config_apply_state.get("failed_reported"):
+        return
+    diagnostic = str(_config_apply_state.get("failed_diagnostic") or "")
+    _post_config_apply_result(
+        revision=int(revision),
+        status="failed",
+        diagnostic=diagnostic,
+    )
+    _config_apply_state["failed_reported"] = True
+
+
+def handle_apply_config_command(command: dict) -> None:
+    """Handle one heartbeat-delivered `apply_config` command.
+
+    The heartbeat tells us only that config is stale. The Computer then
+    pulls the latest runtime-secret map so multiple rapid saves collapse
+    into one local apply attempt.
+    """
+    requested_revision = _command_revision(command)
+    if requested_revision is None:
+        log.warning("ignoring malformed apply_config command: %r", command)
+        return
+
+    if _config_apply_state.get("failed_revision") == requested_revision:
+        log.info(
+            "apply_config revision=%d was already attempted and failed; "
+            "skipping local reapply until a newer revision arrives",
+            requested_revision,
+        )
+        try:
+            _report_cached_failed_revision()
+        except Exception as exc:
+            log.warning(
+                "failed to re-post cached apply_config diagnostic for "
+                "revision=%d: %s",
+                requested_revision,
+                exc,
+            )
+        return
+
+    log.info("heartbeat command: applying runtime config revision=%d", requested_revision)
+    secrets: dict[str, str] = {}
+    revision = requested_revision
+    try:
+        payload = get_json("/hapi/v1/computers/me/runtime-secrets")
+        revision = int(payload.get("revision") or requested_revision)
+        raw_secrets = payload.get("secrets") or {}
+        if not isinstance(raw_secrets, dict):
+            raise ValueError("/me/runtime-secrets returned a non-object secrets map")
+        secrets = {str(key): str(value) for key, value in raw_secrets.items()}
+        result = apply_runtime_secret_map(revision=revision, secrets=secrets)
+        _post_config_apply_result(
+            revision=revision,
+            status="applied",
+            diagnostic=f"applied {result['secret_count']} runtime secret(s)",
+        )
+        _config_apply_state["failed_revision"] = None
+        _config_apply_state["failed_diagnostic"] = None
+        _config_apply_state["failed_reported"] = False
+        log.info(
+            "apply_config revision=%d applied (keys=%d)",
+            revision,
+            result["secret_count"],
+        )
+    except Exception as exc:
+        diagnostic = _diagnostic_from_exception(exc, secrets)
+        _config_apply_state["failed_revision"] = revision
+        _config_apply_state["failed_diagnostic"] = diagnostic
+        _config_apply_state["failed_reported"] = False
+        log.exception("apply_config revision=%d failed: %s", revision, diagnostic)
+        try:
+            _post_config_apply_result(
+                revision=revision,
+                status="failed",
+                diagnostic=diagnostic,
+            )
+            _config_apply_state["failed_reported"] = True
+        except Exception as post_exc:
+            log.warning(
+                "failed to post apply_config failure result for revision=%d: %s",
+                revision,
+                post_exc,
+            )
 
 
 def main() -> int:
@@ -822,7 +1328,11 @@ def _run_one_binding_cycle() -> int:
 
     # Phase C: persist binding + start OpenClaw + report active
     try:
-        write_openclaw_config(binding)
+        tinyhat_platform_plugin_installed = try_install_tinyhat_platform_plugin()
+        write_openclaw_config(
+            binding,
+            enable_tinyhat_platform_plugin=tinyhat_platform_plugin_installed,
+        )
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)
         wait_for_openclaw_start(gateway_started_at)
@@ -869,9 +1379,12 @@ def _run_one_binding_cycle() -> int:
                 "supervisor_uptime_seconds": int(time.time()),
             }
             try:
-                post_json(
+                heartbeat = post_json(
                     "/hapi/v1/computers/me/heartbeat", {"metrics": metrics}
                 )
+                command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
+                if isinstance(command, dict) and command.get("type") == "apply_config":
+                    handle_apply_config_command(command)
             except Exception as exc:
                 log.warning("/me/heartbeat POST failed: %s", exc)
             # Watchdog: did the platform unassign us OR swap the
