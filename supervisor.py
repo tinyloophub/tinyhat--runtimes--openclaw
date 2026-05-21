@@ -451,11 +451,15 @@ def _dev_gateway_log_path() -> str:
 def _start_openclaw_gateway_dev(binding: dict) -> float:
     """Spawn ``openclaw gateway run`` as a child of this supervisor.
 
-    Replaces the systemd ``restart`` path in dev mode. stdout/stderr
-    stream into ``openclaw-gateway.log`` under the state dir so the
-    health probe + the maintainer's ``docker logs`` can both read
-    them. If a prior gateway is still alive, it is stopped first
-    (idempotent restart).
+    Replaces the systemd ``restart`` path in dev mode. The
+    subprocess's stdout / stderr stream into ``openclaw-gateway.log``
+    under the state dir so the health probe in
+    :func:`_probe_openclaw_gateway_health_dev` can read them; they
+    do NOT flow to the container's stdout, so ``docker logs`` shows
+    only the supervisor's own log lines. A maintainer who needs the
+    gateway's output runs ``docker exec -it <container> tail -f
+    $TINYHAT_RUNTIME_HOME/openclaw-gateway.log``. If a prior gateway
+    is still alive, it is stopped first (idempotent restart).
     """
     if _dev_gateway["proc"] is not None and _dev_gateway["proc"].poll() is None:
         log.info("dev: stopping previous openclaw gateway before restart")
