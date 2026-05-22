@@ -31,6 +31,7 @@
     "tools": [
       "tinyhat_list_runtime_secrets",
       "tinyhat_request_runtime_secret",
+      "tinyhat_open_manage_computer_link",
       "tinyhat_open_terminal_link",
       "tinyhat_secret_command"
     ]

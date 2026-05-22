@@ -113,6 +113,18 @@ const plugin = defineToolPlugin({
       },
     }),
     tool({
+      name: "tinyhat_open_manage_computer_link",
+      description:
+        "Create a Telegram Mini App link/button payload so an agent admin can " +
+        "open Manage Computer for this Computer.",
+      parameters: emptyParameters,
+      execute: async (_params, config, context) => {
+        const runtime = resolveExecutionRuntime(config, context);
+        runtime.signal?.throwIfAborted?.();
+        return fetchManageComputerLink(runtime.config, runtime.signal);
+      },
+    }),
+    tool({
       name: "tinyhat_open_terminal_link",
       description:
         "Create a Telegram Mini App link/button payload so an agent admin can " +
@@ -226,6 +238,20 @@ plugin.register = (api) => {
     handler: async () => {
       const payload = await fetchSecretStatuses(platformConfig);
       return formatSecretListReply(payload);
+    },
+  });
+  api.registerCommand({
+    name: "tinyhat_computer",
+    nativeNames: { default: "tinyhat_computer" },
+    description: "Open Tinyhat Manage Computer.",
+    channels: ["telegram"],
+    acceptsArgs: false,
+    agentPromptGuidance: [
+      "Use /tinyhat_computer when an agent admin asks to manage, inspect, or open controls for this Computer.",
+    ],
+    handler: async () => {
+      const payload = await fetchManageComputerLink(platformConfig);
+      return formatManageComputerReply(payload);
     },
   });
   api.registerCommand({
@@ -383,6 +409,36 @@ function secretManagePresentation(button) {
   };
 }
 
+function formatManageComputerReply(payload) {
+  const button = payload?.telegram_button;
+  const message = normalizeString(payload?.message);
+  if (!button?.web_app?.url) {
+    return {
+      text: message || "Tinyhat Manage Computer is not available.",
+    };
+  }
+  const text =
+    message ||
+    "Open a secure management page for this Computer. Only admins of this agent can open it.";
+  return {
+    text,
+    channelData: { telegram: { buttons: [[button]] } },
+    presentation: {
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: normalizeString(button.text) || "Manage computer",
+              webApp: { url: button.web_app.url },
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
 function formatTerminalReply(payload) {
   const button = payload?.telegram_button;
   const message = normalizeString(payload?.message);
@@ -411,6 +467,15 @@ function formatTerminalReply(payload) {
       ],
     },
   };
+}
+
+async function fetchManageComputerLink(config, signal) {
+  return callTinyhat(
+    config,
+    "/hapi/v1/computers/me/manage/open-link",
+    { method: "POST" },
+    signal,
+  );
 }
 
 async function fetchSecretStatuses(config, signal) {

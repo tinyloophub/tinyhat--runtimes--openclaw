@@ -5,6 +5,15 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## Unreleased
+
+### Added
+
+- Native `/tinyhat_computer` Telegram command and matching
+  `tinyhat_open_manage_computer_link` tool. Both return a Manage
+  Computer Telegram Mini App button for the assigned Computer and
+  never expose a management or terminal URL in message text.
+
 ## 0.5.0
 
 ### Added
