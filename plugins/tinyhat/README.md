@@ -1,4 +1,4 @@
-# Tinyhat Platform
+# Tinyhat
 
 OpenClaw tool plugin for Tinyhat-hosted Computers.
 

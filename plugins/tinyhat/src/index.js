@@ -70,8 +70,8 @@ const commandParameters = {
 };
 
 const plugin = defineToolPlugin({
-  id: "tinyhat-platform",
-  name: "Tinyhat Platform",
+  id: "tinyhat",
+  name: "Tinyhat",
   description: "Tinyhat Computer credential tools for hosted OpenClaw agents.",
   configSchema,
   tools: (tool) => [
@@ -451,7 +451,7 @@ async function callTinyhat(config, path, init, signal) {
   const payload = text ? parseJson(text) : {};
   if (!response.ok) {
     throw new Error(
-      `Tinyhat platform request failed (${response.status}): ${readDetail(payload, text)}`,
+      `Tinyhat request failed (${response.status}): ${readDetail(payload, text)}`,
     );
   }
   return payload;

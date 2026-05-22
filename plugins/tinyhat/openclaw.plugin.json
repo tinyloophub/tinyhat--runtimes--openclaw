@@ -1,6 +1,6 @@
 {
-  "id": "tinyhat-platform",
-  "name": "Tinyhat Platform",
+  "id": "tinyhat",
+  "name": "Tinyhat",
   "description": "Tinyhat Computer credential tools for hosted OpenClaw agents.",
   "version": "0.1.0",
   "configSchema": {

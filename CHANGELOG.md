@@ -9,7 +9,7 @@ runtime's published `VERSION` on each new Computer row.
 
 ### Added
 
-- Bundled `tinyhat-platform` OpenClaw tool plugin. The supervisor
+- Bundled `tinyhat` OpenClaw tool plugin. The supervisor
   installs it before gateway startup and enables it in
   `openclaw.json`.
 - Agent-callable credential helpers:

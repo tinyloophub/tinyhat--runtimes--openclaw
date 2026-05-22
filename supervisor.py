@@ -81,7 +81,7 @@ OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 TINYHAT_SECRETS_PROVIDER = "tinyhat"
 TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
-TINYHAT_PLATFORM_PLUGIN_ID = "tinyhat-platform"
+TINYHAT_PLUGIN_ID = "tinyhat"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
 
 # Instance-metadata keys the platform writes at insert time and can
@@ -167,8 +167,8 @@ def runtime_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def tinyhat_platform_plugin_dir() -> str:
-    return os.path.join(runtime_dir(), "plugins", TINYHAT_PLATFORM_PLUGIN_ID)
+def tinyhat_plugin_dir() -> str:
+    return os.path.join(runtime_dir(), "plugins", TINYHAT_PLUGIN_ID)
 
 
 def _openclaw_cli_env() -> dict[str, str]:
@@ -339,23 +339,23 @@ def get_json(path: str) -> dict:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def _tinyhat_platform_plugin_version() -> str:
-    package_json = os.path.join(tinyhat_platform_plugin_dir(), "package.json")
+def _tinyhat_plugin_version() -> str:
+    package_json = os.path.join(tinyhat_plugin_dir(), "package.json")
     try:
         with open(package_json, encoding="utf-8") as fh:
             payload = json.load(fh)
     except FileNotFoundError:
         raise RuntimeError(
-            f"Tinyhat platform plugin package is missing at {package_json}"
+            f"Tinyhat plugin package is missing at {package_json}"
         )
     return str(payload.get("version") or "unknown")
 
 
-def _tinyhat_platform_plugin_marker_path() -> str:
-    return os.path.join(openclaw_state_dir(), "tinyhat-platform-plugin.version")
+def _tinyhat_plugin_marker_path() -> str:
+    return os.path.join(openclaw_state_dir(), "tinyhat-plugin.version")
 
 
-def ensure_tinyhat_platform_plugin_installed() -> bool:
+def ensure_tinyhat_plugin_installed() -> bool:
     """Install the bundled Tinyhat tool plugin into OpenClaw.
 
     The plugin is shipped in the runtime repo and installed locally so
@@ -364,15 +364,15 @@ def ensure_tinyhat_platform_plugin_installed() -> bool:
     authenticate with the same GCE Computer identity token boundary as
     the supervisor.
     """
-    plugin_dir = tinyhat_platform_plugin_dir()
+    plugin_dir = tinyhat_plugin_dir()
     if not os.path.isdir(plugin_dir):
-        raise RuntimeError(f"Tinyhat platform plugin not found at {plugin_dir}")
-    version = _tinyhat_platform_plugin_version()
-    marker = _tinyhat_platform_plugin_marker_path()
+        raise RuntimeError(f"Tinyhat plugin not found at {plugin_dir}")
+    version = _tinyhat_plugin_version()
+    marker = _tinyhat_plugin_marker_path()
     installed_manifest = os.path.join(
         openclaw_state_dir(),
         "extensions",
-        TINYHAT_PLATFORM_PLUGIN_ID,
+        TINYHAT_PLUGIN_ID,
         "openclaw.plugin.json",
     )
     try:
@@ -381,7 +381,7 @@ def ensure_tinyhat_platform_plugin_installed() -> bool:
     except FileNotFoundError:
         marker_version = ""
     if marker_version == version and os.path.exists(installed_manifest):
-        log.info("Tinyhat platform plugin already installed (version=%s)", version)
+        log.info("Tinyhat plugin already installed (version=%s)", version)
         return True
 
     cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
@@ -394,15 +394,15 @@ def ensure_tinyhat_platform_plugin_installed() -> bool:
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"Tinyhat platform plugin install failed: {detail}")
+        raise RuntimeError(f"Tinyhat plugin install failed: {detail}")
     os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
     with open(marker, "w", encoding="utf-8") as fh:
         fh.write(version + "\n")
-    log.info("installed Tinyhat platform plugin (version=%s)", version)
+    log.info("installed Tinyhat plugin (version=%s)", version)
     return True
 
 
-def try_install_tinyhat_platform_plugin() -> bool:
+def try_install_tinyhat_plugin() -> bool:
     """Best-effort install for optional chat credential tools.
 
     The runtime must still boot without this plugin: core agent
@@ -410,10 +410,10 @@ def try_install_tinyhat_platform_plugin() -> bool:
     the plugin only adds metadata-only helper tools for chat UX.
     """
     try:
-        return ensure_tinyhat_platform_plugin_installed()
+        return ensure_tinyhat_plugin_installed()
     except Exception as exc:
         log.warning(
-            "Tinyhat platform plugin unavailable; continuing without "
+            "Tinyhat plugin unavailable; continuing without "
             "credential tools: %s",
             exc,
         )
@@ -500,7 +500,7 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> None:
     )
 
 
-def _tinyhat_platform_plugin_config() -> dict:
+def _tinyhat_plugin_config() -> dict:
     """Return non-secret config for the bundled OpenClaw tool plugin."""
     plugin_config: dict = {"devMode": _dev_mode()}
     base_url = get_backend_base_url()
@@ -675,7 +675,7 @@ def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
 def write_openclaw_config(
     binding: dict,
     *,
-    enable_tinyhat_platform_plugin: bool = True,
+    enable_tinyhat_plugin: bool = True,
 ) -> None:
     """Write the real OpenClaw gateway config for this binding."""
     owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
@@ -718,14 +718,14 @@ def write_openclaw_config(
         "telegram": {"enabled": True},
         "openai": openai_plugin,
     }
-    if enable_tinyhat_platform_plugin:
-        plugin_entries[TINYHAT_PLATFORM_PLUGIN_ID] = {
+    if enable_tinyhat_plugin:
+        plugin_entries[TINYHAT_PLUGIN_ID] = {
             "enabled": True,
-            "config": _tinyhat_platform_plugin_config(),
+            "config": _tinyhat_plugin_config(),
         }
     else:
         log.warning(
-            "Tinyhat platform credential tools are disabled for this OpenClaw boot"
+            "Tinyhat credential tools are disabled for this OpenClaw boot"
         )
 
     config = {
@@ -1328,10 +1328,10 @@ def _run_one_binding_cycle() -> int:
 
     # Phase C: persist binding + start OpenClaw + report active
     try:
-        tinyhat_platform_plugin_installed = try_install_tinyhat_platform_plugin()
+        tinyhat_plugin_installed = try_install_tinyhat_plugin()
         write_openclaw_config(
             binding,
-            enable_tinyhat_platform_plugin=tinyhat_platform_plugin_installed,
+            enable_tinyhat_plugin=tinyhat_plugin_installed,
         )
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)
