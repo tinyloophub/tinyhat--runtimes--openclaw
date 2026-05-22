@@ -102,8 +102,8 @@ OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS = 12
 OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (1, 2)
 
 # Marker bearer used in dev mode so the request reaches the
-# platform's ``computer_protected_route`` decorator. The platform's
-# verifier ignores the bearer body entirely when
+# Computer-authenticated platform routes. The platform's verifier
+# ignores the bearer body entirely when
 # ``DEV_AUTO_COMPUTER_ID`` is set under ``ENV=development``; this
 # string therefore carries no secret value.
 DEV_RUNTIME_BEARER = "dev-runtime"
