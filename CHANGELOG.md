@@ -5,10 +5,12 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
-## Unreleased
+## 0.5.0
 
 ### Added
 
+- MIT license so operators can use, copy, modify, and redistribute the
+  public runtime payload with clear permission.
 - Heartbeats now include non-secret private-access diagnostics when
   the platform bootstrap enrolled Tailscale on the Computer. The
   report contains provider/state/node/IP diagnostics only, never auth
