@@ -5,7 +5,7 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
-## Unreleased
+## 0.6.0
 
 ### Added
 
