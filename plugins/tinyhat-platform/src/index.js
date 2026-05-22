@@ -43,6 +43,19 @@ const requestSecretParameters = {
   additionalProperties: false,
 };
 
+const terminalLinkParameters = {
+  type: "object",
+  properties: {
+    command: {
+      type: "string",
+      description:
+        "Optional command to show for admin approval before the terminal opens. " +
+        "Do not include secret values.",
+    },
+  },
+  additionalProperties: false,
+};
+
 const commandParameters = {
   type: "object",
   properties: {
@@ -103,12 +116,13 @@ const plugin = defineToolPlugin({
       name: "tinyhat_open_terminal_link",
       description:
         "Create a Telegram Mini App link/button payload so an agent admin can " +
-        "open a secure terminal for this Computer.",
-      parameters: emptyParameters,
-      execute: async (_params, config, context) => {
+        "open a secure terminal for this Computer. Optionally include a command " +
+        "that the admin must review and approve in the Mini App before it runs.",
+      parameters: terminalLinkParameters,
+      execute: async ({ command } = {}, config, context) => {
         const runtime = resolveExecutionRuntime(config, context);
         runtime.signal?.throwIfAborted?.();
-        return fetchTerminalLink(runtime.config, runtime.signal);
+        return fetchTerminalLink(runtime.config, runtime.signal, command);
       },
     }),
     tool({
@@ -219,12 +233,12 @@ plugin.register = (api) => {
     nativeNames: { default: "tinyhat_terminal" },
     description: "Open a secure Tinyhat terminal.",
     channels: ["telegram"],
-    acceptsArgs: false,
+    acceptsArgs: true,
     agentPromptGuidance: [
-      "Use /tinyhat_terminal when an agent admin asks to open a secure terminal for this Computer.",
+      "Use /tinyhat_terminal when an agent admin asks to open a secure terminal for this Computer. If a command follows the command name, the Mini App will show it for explicit admin approval before running it.",
     ],
-    handler: async () => {
-      const payload = await fetchTerminalLink(platformConfig);
+    handler: async (ctx) => {
+      const payload = await fetchTerminalLink(platformConfig, undefined, ctx.args);
       return formatTerminalReply(payload);
     },
   });
@@ -408,11 +422,15 @@ async function fetchSecretStatuses(config, signal) {
   );
 }
 
-async function fetchTerminalLink(config, signal) {
+async function fetchTerminalLink(config, signal, command) {
+  const normalizedCommand = normalizeString(command);
+  const init = normalizedCommand
+    ? { method: "POST", body: JSON.stringify({ command: normalizedCommand }) }
+    : { method: "POST" };
   return callTinyhat(
     config,
     "/hapi/v1/computers/me/terminal/open-link",
-    { method: "POST" },
+    init,
     signal,
   );
 }
