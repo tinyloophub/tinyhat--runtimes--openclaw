@@ -36,13 +36,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         ca-certificates \
+        tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Install OpenClaw at the same npm package the prod bootstrap does.
 # The dev image pins ``latest`` deliberately — local dev wants the
-# version a fresh prod Computer would install today. The
-# ``platform_repo_seeds/runtimes/openclaw/VERSION`` file in the
-# monorepo records the resolved version for any given prod boot.
+# version a fresh prod Computer would install today. The runtime
+# ``VERSION`` file records the published runtime payload version.
 #
 # ``openclaw --version`` immediately after install is the build-time
 # smoke check: if the runtime's Node base falls behind OpenClaw's
@@ -55,20 +55,22 @@ RUN npm install -g openclaw@latest \
 # Non-root runtime user (``tinyhat:tinyhat``). The state dir lives
 # under this user's home so the supervisor can write
 # ``openclaw.json``, ``workspace/``, and ``openclaw-gateway.log``
-# without root.
+# without root. The Tinyhat SecretRef file intentionally uses the
+# prod path under /etc/openclaw, so dev mode owns that one directory
+# without making the whole container run as root.
 RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
         --home-dir /home/tinyhat --shell /usr/sbin/nologin tinyhat \
-    && mkdir -p /home/tinyhat/runtime \
-    && chown -R tinyhat:tinyhat /home/tinyhat
+    && mkdir -p /home/tinyhat/runtime /etc/openclaw \
+    && chown -R tinyhat:tinyhat /home/tinyhat /etc/openclaw
 
 WORKDIR /opt/tinyhat-runtime
 
-# Copy the supervisor + bootstrap.sh. The supervisor is the only
-# Python file we actually run; bootstrap.sh is copied for parity
-# with the prod layout (and so the seed comparison ``diff
-# platform_repo_seeds/runtimes/openclaw/`` stays clean).
+# Copy the supervisor, bootstrap.sh, and bundled OpenClaw plugins. The
+# supervisor is the only Python file we actually run; bootstrap.sh is
+# copied for parity with the production runtime layout.
 COPY supervisor.py bootstrap.sh VERSION README.md ./
+COPY plugins ./plugins
 RUN chmod +x supervisor.py bootstrap.sh \
     && chown -R tinyhat:tinyhat /opt/tinyhat-runtime
 
