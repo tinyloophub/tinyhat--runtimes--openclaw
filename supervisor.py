@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -83,6 +84,9 @@ TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
 TINYHAT_PLUGIN_ID = "tinyhat"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
+PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
+    "/var/lib/tinyhat-private-access/bootstrap-status.json"
+)
 
 # Instance-metadata keys the platform writes at insert time and can
 # update later via ``compute.instances.setMetadata``. Both are
@@ -337,6 +341,97 @@ def get_json(path: str) -> dict:
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def private_access_report() -> dict | None:
+    """Return optional non-secret private-access status for heartbeat."""
+    if not os.path.exists(PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH):
+        return None
+    bootstrap_status: dict = {}
+    try:
+        with open(PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH, encoding="utf-8") as fh:
+            payload = json.load(fh)
+            if isinstance(payload, dict):
+                bootstrap_status = payload
+    except Exception as exc:
+        log.warning("could not read private access bootstrap status: %s", exc)
+
+    if bootstrap_status.get("provider") != "tailscale":
+        return None
+    report = {
+        "provider": "tailscale",
+        "state": str(bootstrap_status.get("state") or "unreachable"),
+    }
+    if shutil.which("tailscale") is None:
+        report.update(
+            {
+                "state": "not_installed",
+                "diagnostic_code": "tailscale_cli_missing",
+                "diagnostic": "tailscale CLI is not installed on this Computer",
+            }
+        )
+        return report
+
+    try:
+        status = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as exc:
+        report.update(
+            {
+                "state": "error",
+                "diagnostic_code": "tailscale_status_failed",
+                "diagnostic": str(exc)[:500],
+            }
+        )
+        return report
+
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout or "").strip()
+        report.update(
+            {
+                "state": "unreachable",
+                "diagnostic_code": "tailscale_status_failed",
+                "diagnostic": detail[:500] or "tailscale status failed",
+            }
+        )
+        return report
+
+    try:
+        status_payload = json.loads(status.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        report.update(
+            {
+                "state": "error",
+                "diagnostic_code": "tailscale_status_json_invalid",
+                "diagnostic": str(exc)[:500],
+            }
+        )
+        return report
+
+    self_node = status_payload.get("Self") or {}
+    if not isinstance(self_node, dict):
+        self_node = {}
+    ips = self_node.get("TailscaleIPs") or []
+    tailnet_ip = ""
+    if isinstance(ips, list):
+        tailnet_ip = next((str(ip) for ip in ips if str(ip).startswith("100.")), "")
+    node_name = str(self_node.get("HostName") or "").strip()
+    backend_state = str(status_payload.get("BackendState") or "").strip()
+    report.update(
+        {
+            "state": "ready" if tailnet_ip else "unreachable",
+            "node_name": node_name,
+            "tailnet_ip": tailnet_ip,
+            "diagnostic_code": "ready" if tailnet_ip else "missing_tailnet_ip",
+            "diagnostic": backend_state or "tailscale status read",
+        }
+    )
+    return report
 
 
 def _tinyhat_plugin_version() -> str:
@@ -1378,6 +1473,9 @@ def _run_one_binding_cycle() -> int:
                 "gateway_alive": gateway_alive,
                 "supervisor_uptime_seconds": int(time.time()),
             }
+            private_access = private_access_report()
+            if private_access is not None:
+                metrics["private_access"] = private_access
             try:
                 heartbeat = post_json(
                     "/hapi/v1/computers/me/heartbeat", {"metrics": metrics}
