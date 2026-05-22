@@ -9,6 +9,8 @@ runtime's published `VERSION` on each new Computer row.
 
 ### Added
 
+- MIT license so operators can use, copy, modify, and redistribute the
+  public runtime payload with clear permission.
 - Heartbeats now include non-secret private-access diagnostics when
   the platform bootstrap enrolled Tailscale on the Computer. The
   report contains provider/state/node/IP diagnostics only, never auth
