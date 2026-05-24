@@ -41,7 +41,7 @@ environment-specific.
 | File | Purpose |
 | --- | --- |
 | `supervisor.py` | The platform-communication supervisor (state, binding, heartbeat, gateway monitor, OpenClaw config writer). Reads `tinyhat-backend-audience` and `tinyhat-platform-base-url` from instance metadata. |
-| `bootstrap.sh` | The runtime's install command. Writes the supervisor + gateway systemd units and starts the supervisor. Invoked by the VM's thin startup script after this repo is cloned and the framework is installed. |
+| `bootstrap.sh` | The runtime's install command. Installs generic Computer dependencies, optional private access, the requested framework package, and the supervisor + gateway systemd units after the VM's thin startup script clones this repo. |
 | `plugins/tinyhat/` | Dependency-free OpenClaw plugin that exposes Tinyhat credential helper tools and the `/tinyhat_secrets` skill command. |
 | `VERSION` | The runtime version published by this repo; recorded per Computer alongside the resolved commit SHA. |
 | `dev/` | Local-development container that runs the supervisor + real OpenClaw against a dev backend without GCE provisioning. See [`dev/README.md`](dev/README.md). |
@@ -60,12 +60,21 @@ the trust boundary and the build/run recipe.
 
 The VM's GCE startup script is a thin bootstrap:
 
-1. install base OS dependencies (`git`, `python3`, Node.js, …);
+1. install only the minimal packages needed to clone this repo;
 2. `git clone` this repository and `git checkout` the configured
    ref/tag/SHA;
-3. install the configured framework (OpenClaw) at the configured
-   version (`npm install -g openclaw@<version>`);
+3. export per-Computer config/auth material for the runtime
+   bootstrap;
 4. run this repo's `bootstrap.sh`.
+
+This repo's `bootstrap.sh` owns the generic Computer provisioning
+after clone: base OS packages, Node.js, the configured framework
+(OpenClaw) version (`npm install -g openclaw@<version>`), optional
+private access enrollment, and the supervisor/gateway systemd units.
+If the platform does not pass `TINYHAT_FRAMEWORK_INSTALL_SPEC`, the
+bootstrap does not install `openclaw@latest`; it expects an existing
+OpenClaw binary from a legacy platform bootstrap and fails loudly when
+none is available.
 
 The framework (OpenClaw) is installed from npm and is **not** vendored
 here — only a package/version pin is recorded. A separate
