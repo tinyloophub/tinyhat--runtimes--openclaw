@@ -5,6 +5,22 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.7.0
+
+### Changed
+
+- `bootstrap.sh` now owns generic Computer provisioning after the
+  platform startup script clones this repo. It installs base OS
+  packages, Node.js, the requested OpenClaw package, and optional
+  Tailscale private access before starting the supervisor. Tinyloop's
+  GCE startup script can stay focused on cloning the runtime repo and
+  passing per-Computer config/auth material.
+- The runtime bootstrap now fails loudly if OpenClaw cannot be
+  installed or found, avoids an `openclaw@latest` fallback when the
+  platform does not pass a framework spec, and keeps one-time
+  Tailscale auth keys out of the process list by using an auth-key
+  file.
+
 ## 0.6.0
 
 ### Added
