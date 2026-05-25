@@ -101,9 +101,11 @@ BINDING_POLL_BASE_SECONDS = 3
 BINDING_POLL_IDLE_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
-OPENCLAW_SECRETS_RELOAD_ATTEMPTS = 3
 OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS = 12
-OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (1, 2)
+OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (5, 10, 20, 30, 30)
+OPENCLAW_SECRETS_RELOAD_ATTEMPTS = (
+    len(OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS) + 1
+)
 
 # Marker bearer used in dev mode so the request reaches the
 # Computer-authenticated platform routes. The platform's verifier
@@ -671,10 +673,11 @@ def _diagnostic_from_exception(exc: Exception, secrets: dict[str, str]) -> str:
 
 def _openclaw_reload_retryable(detail: str) -> bool:
     lowered = detail.lower()
-    return (
-        "gateway did not respond" in lowered
-        or "secrets runtime snapshot is not active" in lowered
-    )
+    return "gateway did not respond" in lowered
+
+
+def _openclaw_reload_snapshot_inactive(detail: str) -> bool:
+    return "secrets runtime snapshot is not active" in detail.lower()
 
 
 def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
@@ -733,6 +736,15 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
             (result.stderr or result.stdout or "").strip(),
             secrets,
         )
+        if last_detail and _openclaw_reload_snapshot_inactive(last_detail):
+            log.info(
+                "openclaw secrets reload skipped because no active secret "
+                "snapshot exists yet; file provider config is synced"
+            )
+            return {
+                "skipped": True,
+                "reason": "secrets_runtime_snapshot_inactive",
+            }
         if (
             attempt < OPENCLAW_SECRETS_RELOAD_ATTEMPTS
             and _openclaw_reload_retryable(last_detail)
@@ -748,6 +760,16 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
             time.sleep(delay_seconds)
             continue
         break
+
+    if last_detail and _openclaw_reload_snapshot_inactive(last_detail):
+        log.info(
+            "openclaw secrets reload skipped because no active secret "
+            "snapshot exists yet; file provider config is synced"
+        )
+        return {
+            "skipped": True,
+            "reason": "secrets_runtime_snapshot_inactive",
+        }
 
     raise RuntimeError(
         "openclaw secrets reload failed"
