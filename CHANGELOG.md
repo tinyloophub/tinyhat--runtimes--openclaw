@@ -14,6 +14,9 @@ runtime's published `VERSION` on each new Computer row.
   has written the Tinyhat file provider and OpenClaw config. This lets a
   newly saved Computer runtime secret become available without forcing
   the admin to replace the value.
+- Keep retrying `openclaw secrets reload` through the slow initial
+  gateway settle window so a first save immediately after activation
+  does not fail before OpenClaw finishes provider prewarm.
 
 ## 0.7.0
 
