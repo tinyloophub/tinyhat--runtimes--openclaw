@@ -36,7 +36,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         ca-certificates \
+        curl \
+        gnupg \
+        gosu \
         tmux \
+    && curl -fsSL https://tailscale.com/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install OpenClaw at the same npm package the prod bootstrap does.
@@ -60,7 +64,7 @@ RUN npm install -g openclaw@latest \
 # without making the whole container run as root.
 RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
-        --home-dir /home/tinyhat --shell /usr/sbin/nologin tinyhat \
+        --home-dir /home/tinyhat --shell /bin/bash tinyhat \
     && mkdir -p /home/tinyhat/runtime /etc/openclaw \
     && chown -R tinyhat:tinyhat /home/tinyhat /etc/openclaw
 
@@ -70,11 +74,16 @@ WORKDIR /opt/tinyhat-runtime
 # supervisor is the only Python file we actually run; bootstrap.sh is
 # copied for parity with the production runtime layout.
 COPY supervisor.py bootstrap.sh VERSION README.md ./
+COPY dev/entrypoint.sh ./dev-entrypoint.sh
 COPY plugins ./plugins
-RUN chmod +x supervisor.py bootstrap.sh \
+RUN chmod +x supervisor.py bootstrap.sh dev-entrypoint.sh \
     && chown -R tinyhat:tinyhat /opt/tinyhat-runtime
 
-USER tinyhat
+# No ``USER tinyhat``: the dev entrypoint starts as root so it can bring
+# up tailscaled + Tailscale SSH (which execs login shells and needs
+# root), then drops to the unprivileged tinyhat user via gosu for the
+# supervisor + OpenClaw. With no Tailscale env it drops to tinyhat
+# immediately, so the runtime stays unprivileged either way.
 
 # Dev-mode env that the supervisor reads. ``TINYHAT_DEV_RUNTIME=1``
 # is what flips off the systemd / metadata-server paths. The two
@@ -84,4 +93,4 @@ ENV TINYHAT_DEV_RUNTIME=1 \
     TINYHAT_RUNTIME_HOME=/home/tinyhat/runtime \
     PYTHONUNBUFFERED=1
 
-CMD ["python3", "/opt/tinyhat-runtime/supervisor.py"]
+ENTRYPOINT ["/opt/tinyhat-runtime/dev-entrypoint.sh"]
