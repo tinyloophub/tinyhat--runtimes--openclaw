@@ -677,6 +677,10 @@ def _openclaw_reload_retryable(detail: str) -> bool:
     )
 
 
+def _openclaw_reload_snapshot_inactive(detail: str) -> bool:
+    return "secrets runtime snapshot is not active" in detail.lower()
+
+
 def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
     """Ask the running gateway to refresh its SecretRef snapshot."""
     cmd = [
@@ -748,6 +752,16 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
             time.sleep(delay_seconds)
             continue
         break
+
+    if last_detail and _openclaw_reload_snapshot_inactive(last_detail):
+        log.info(
+            "openclaw secrets reload skipped because no active secret "
+            "snapshot exists yet; file provider config is synced"
+        )
+        return {
+            "skipped": True,
+            "reason": "secrets_runtime_snapshot_inactive",
+        }
 
     raise RuntimeError(
         "openclaw secrets reload failed"
