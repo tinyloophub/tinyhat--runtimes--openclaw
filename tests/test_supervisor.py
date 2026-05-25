@@ -69,8 +69,30 @@ class ReloadOpenClawSecretsTests(unittest.TestCase):
         )
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
-            [5, 10, 20, 30, 30],
+            [],
         )
+
+    def test_non_retryable_reload_failure_raises(self) -> None:
+        secret_value = "sk-test-secret-value"
+        failed_reload = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=f"Error: invalid secret value {secret_value}",
+        )
+
+        with (
+            patch.object(supervisor, "_openclaw_cli_env", return_value={}),
+            patch.object(supervisor.subprocess, "run", return_value=failed_reload),
+            patch.object(supervisor.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                supervisor.reload_openclaw_secrets({"TEST": secret_value})
+
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [])
+        message = str(raised.exception)
+        self.assertIn("openclaw secrets reload failed", message)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn(secret_value, message)
 
 
 if __name__ == "__main__":

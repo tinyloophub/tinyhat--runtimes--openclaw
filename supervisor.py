@@ -673,10 +673,7 @@ def _diagnostic_from_exception(exc: Exception, secrets: dict[str, str]) -> str:
 
 def _openclaw_reload_retryable(detail: str) -> bool:
     lowered = detail.lower()
-    return (
-        "gateway did not respond" in lowered
-        or "secrets runtime snapshot is not active" in lowered
-    )
+    return "gateway did not respond" in lowered
 
 
 def _openclaw_reload_snapshot_inactive(detail: str) -> bool:
@@ -739,6 +736,15 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
             (result.stderr or result.stdout or "").strip(),
             secrets,
         )
+        if last_detail and _openclaw_reload_snapshot_inactive(last_detail):
+            log.info(
+                "openclaw secrets reload skipped because no active secret "
+                "snapshot exists yet; file provider config is synced"
+            )
+            return {
+                "skipped": True,
+                "reason": "secrets_runtime_snapshot_inactive",
+            }
         if (
             attempt < OPENCLAW_SECRETS_RELOAD_ATTEMPTS
             and _openclaw_reload_retryable(last_detail)

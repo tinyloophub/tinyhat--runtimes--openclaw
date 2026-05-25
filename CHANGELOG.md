@@ -10,10 +10,11 @@ runtime's published `VERSION` on each new Computer row.
 ### Fixed
 
 - Treat OpenClaw's first-save "secrets runtime snapshot is not active"
-  reload response as a synced runtime-secret apply after the supervisor
-  has written the Tinyhat file provider and OpenClaw config. This lets a
-  newly saved Computer runtime secret become available without forcing
-  the admin to replace the value.
+  reload response as a fast synced runtime-secret apply after the
+  supervisor has written the Tinyhat file provider and OpenClaw config.
+  This lets a newly saved Computer runtime secret become available
+  without forcing the admin to replace the value or blocking heartbeat
+  processing through the gateway-settle retry window.
 - Keep retrying `openclaw secrets reload` through the slow initial
   gateway settle window so a first save immediately after activation
   does not fail before OpenClaw finishes provider prewarm.
