@@ -5,6 +5,23 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.7.2
+
+### Added
+
+- Let the local dev container optionally join Tailscale in userspace
+  networking mode with Tailscale SSH enabled, so a dev Computer can be
+  reached by SSH / the managed terminal like a managed cloud Computer.
+  The entrypoint still starts the supervisor as the unprivileged
+  `tinyhat` user when private access is disabled.
+
+### Fixed
+
+- Mirror production private-access bootstrap status reporting in the
+  dev entrypoint. It now writes `ready`, `error`, or `config_missing`
+  status JSON before the supervisor starts, allowing heartbeats to
+  report Tailscale readiness or diagnostics back to Tinyhat.
+
 ## 0.7.1
 
 ### Fixed
