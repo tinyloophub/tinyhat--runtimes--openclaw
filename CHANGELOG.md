@@ -5,6 +5,16 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.9.0
+
+### Changed
+
+- Install the Tinyhat OpenClaw plugin from the public repo/ref passed
+  by the platform provisioning manifest instead of vendoring the plugin
+  implementation inside the runtime repo. The runtime now owns only
+  plugin pinning/install and keeps tool/default-skill implementation in
+  `tinyhat-ai/tinyhat`.
+
 ## 0.8.0
 
 ### Added

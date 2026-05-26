@@ -52,12 +52,15 @@ docker build -f dev/Dockerfile -t tinyhat-openclaw-runtime:dev .
 ```
 
 The image is `node:22-slim` (OpenClaw declares `engines.node
->=22.19`) + the latest `openclaw` npm package + `supervisor.py` +
-a non-root `tinyhat` user. `openclaw --version` runs immediately
-after the `npm install -g openclaw@latest` step as a build-time
-smoke check, so a future engine-floor bump fails the build instead
-of the first `docker run`. First build is slow (~600MB, ~2min);
-subsequent builds cache the npm layer.
+>=22.19`) + git + the latest `openclaw` npm package + `supervisor.py`
+and a non-root `tinyhat` user. The Tinyhat OpenClaw plugin is cloned
+from the public repo/ref in `TINYHAT_PLATFORM_PLUGIN_REPO_URL` /
+`TINYHAT_PLATFORM_PLUGIN_REPO_REF` when the supervisor installs the
+gateway config; it is not bundled in this image. `openclaw --version`
+runs immediately after the `npm install -g openclaw@latest` step as a
+build-time smoke check, so a future engine-floor bump fails the build
+instead of the first `docker run`. First build is slow (~600MB,
+~2min); subsequent builds cache the npm layer.
 
 ## Run
 
@@ -78,6 +81,9 @@ docker run --rm -it \
 - `TINYHAT_BACKEND_AUDIENCE` — usually the same string. Some
   backends configure a separate JWT audience claim; in dev they
   match.
+- `TINYHAT_PLATFORM_PLUGIN_REPO_URL` / `TINYHAT_PLATFORM_PLUGIN_REPO_REF`
+  — optional. Defaults to the public `tinyhat-ai/tinyhat` plugin repo
+  at `main`.
 - The platform must have a `tinyhat_computers` row in `state=ready`
   with `DEV_AUTO_COMPUTER_ID=<that row id>` in its environment.
 
