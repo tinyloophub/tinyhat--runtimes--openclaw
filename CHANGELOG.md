@@ -5,6 +5,23 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.8.0
+
+### Added
+
+- Consume Tinyhat's OpenRouter model package when writing OpenClaw
+  config. Paid bindings now expose the enabled model catalog, use the
+  package default as the primary model, and include the cheap model as
+  fallback for the default paid role.
+
+### Fixed
+
+- Treat `openrouter_model_package` changes as binding-signature changes
+  so the supervisor rewrites `openclaw.json` after a platform-side
+  package update or rebind.
+- Keep no-credit OpenRouter bindings isolated on the free-demo model
+  instead of inheriting the paid catalog.
+
 ## 0.7.2
 
 ### Added
