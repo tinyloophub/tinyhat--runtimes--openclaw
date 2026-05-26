@@ -9,7 +9,7 @@ Canonical repo-local development skills live under [`.agents/skills`](.agents/sk
 Claude-facing adapters under [`.claude/skills`](.claude/skills) are symlinks back to that canonical directory.
 
 When this repo is checked out under the Tinyloop monorepo at `platform_repos/runtimes/openclaw`, skills that name a parent Tinyloop skill should read the parent file first, then apply this repo's override.
-The default parent path is `../../../.agents/skills`; set `TINYLOOP_PARENT_REPO` when working from a standalone clone.
+From the repo root, the default parent path is `../../../.agents/skills`; from inside an adapter `SKILL.md`, use the parent skill root described here or set `TINYLOOP_PARENT_REPO` when working from a standalone clone.
 
 ## Contribution Rules
 

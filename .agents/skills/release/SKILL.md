@@ -5,7 +5,7 @@ description: Cut or verify a release of the public Tinyhat OpenClaw runtime repo
 
 # release - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, skim `../../../.agents/skills/release/SKILL.md` for the current Tinyloop release discipline.
+Parent alignment: when this standalone repo is nested under Tinyloop, skim the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 This repo releases the runtime package itself.
 
 ## Before Release

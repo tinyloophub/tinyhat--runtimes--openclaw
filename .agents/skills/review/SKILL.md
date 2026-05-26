@@ -5,7 +5,7 @@ description: Review PRs in the public Tinyhat OpenClaw runtime repo, using paren
 
 # review - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, first read `../../../.agents/skills/review/SKILL.md` for review depth, posted-review expectations, and finding format.
+Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 Apply the runtime-specific risk checklist below.
 
 ## Runtime Checklist

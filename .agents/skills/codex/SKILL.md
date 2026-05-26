@@ -5,13 +5,13 @@ description: Codex conventions for the public Tinyhat OpenClaw runtime repo. Use
 
 # codex - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, first read `../../../.agents/skills/codex/SKILL.md` for the current Codex writeback contract.
+Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 Apply the overrides below for `tinyloophub/tinyhat--runtimes--openclaw`.
 
 ## Rules
 
-- Codex-authored GitHub comments and reviews use `tinyloop-farid-codex`.
-- Restore `gh` to `farid-tinyloop` after the write and verify with `gh auth status`.
+- Codex-authored GitHub comments and reviews use the configured Codex bot identity when one is available.
+- Restore `gh` to the maintainer account after the write and verify with `gh auth status`.
 - End every Codex-authored GitHub comment/review body with:
 
 ```text

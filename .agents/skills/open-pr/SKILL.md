@@ -5,7 +5,7 @@ description: Open a PR for the public Tinyhat OpenClaw runtime repo. Use parent 
 
 # open-pr - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, first read `../../../.agents/skills/open-pr/SKILL.md` for the current scope-check and reviewer-facing evidence contract.
+Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 Apply this repo's target, checks, and release boundary below.
 
 ## Scope Check
@@ -33,7 +33,7 @@ Create PRs against:
 tinyloophub/tinyhat--runtimes--openclaw
 ```
 
-Use `tinyloop-farid-codex` for Codex-authored PRs, then restore `gh` to `farid-tinyloop`.
+Use the configured Codex bot identity for Codex-authored PRs when available, then restore `gh` to the maintainer account.
 
 The PR body should include:
 

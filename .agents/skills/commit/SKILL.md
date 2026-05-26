@@ -5,7 +5,7 @@ description: Commit changes in the public Tinyhat OpenClaw runtime repo. Use par
 
 # commit - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, first read `../../../.agents/skills/commit/SKILL.md` for the current atomicity and commit-message rules.
+Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 Apply the runtime-specific checks below instead of the monorepo `./scripts/pre-commit.sh` gate.
 
 ## Steps

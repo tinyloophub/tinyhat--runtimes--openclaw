@@ -5,7 +5,7 @@ description: Pick the right verification set for changes in the public Tinyhat O
 
 # define-tests - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, skim `../../../.agents/skills/define-tests/SKILL.md` for the current test-selection mindset.
+Parent alignment: when this standalone repo is nested under Tinyloop, skim the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
 Use this repo-specific matrix for actual commands.
 
 ## Matrix

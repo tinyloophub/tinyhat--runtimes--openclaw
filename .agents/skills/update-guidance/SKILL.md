@@ -5,7 +5,7 @@ description: Edit AGENTS.md, CLAUDE adapters, or SKILL.md files in the public Ti
 
 # update-guidance - runtime repo adapter
 
-Parent alignment: when this repo is nested under Tinyloop, skim `../../../.agents/skills/sharpen-skill/SKILL.md` and the parent guidance files before changing skill shape.
+Parent alignment: when this standalone repo is nested under Tinyloop, skim the same-named skill from the parent skill root described in `AGENTS.md` and the parent guidance files before changing skill shape.
 
 ## Rules
 
