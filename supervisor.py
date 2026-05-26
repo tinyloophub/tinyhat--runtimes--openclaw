@@ -819,17 +819,70 @@ def write_openclaw_config(
     openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
 
     def openrouter_model_ref(raw: str) -> str:
-        model = (raw or "openai/gpt-oss-20b:free").strip()
+        model = (raw or "deepseek/deepseek-v4-flash:free").strip()
         if model.startswith("openrouter/"):
             return model
         return "openrouter/" + model.lstrip("/")
 
+    def openrouter_model_package() -> dict:
+        package = binding.get("openrouter_model_package")
+        return package if isinstance(package, dict) else {}
+
+    def openrouter_model_refs_by_role(package: dict) -> dict[str, str]:
+        models = package.get("models")
+        if not isinstance(models, dict):
+            return {}
+        refs: dict[str, str] = {}
+        for role, model in models.items():
+            if not isinstance(role, str) or not isinstance(model, str):
+                continue
+            refs[role] = openrouter_model_ref(model)
+        return refs
+
+    def openrouter_enabled_model_catalog(package: dict) -> dict:
+        refs_by_role = openrouter_model_refs_by_role(package)
+        enabled_roles = package.get("enabled_roles")
+        if not isinstance(enabled_roles, list) or not refs_by_role:
+            return {primary_model: {"alias": "default"}}
+        catalog: dict[str, dict[str, str]] = {}
+        for role in enabled_roles:
+            if not isinstance(role, str):
+                continue
+            ref = refs_by_role.get(role)
+            if not ref:
+                continue
+            catalog[ref] = {"alias": role.replace("_", "-")}
+        catalog.setdefault(primary_model, {"alias": "default"})
+        return catalog
+
+    def openrouter_model_fallbacks(package: dict) -> list[str]:
+        refs_by_role = openrouter_model_refs_by_role(package)
+        enabled_roles = set(package.get("enabled_roles") or [])
+        default_role = str(package.get("default_role") or "")
+        if default_role == "power":
+            candidates = ("default", "cheap")
+        elif default_role == "default":
+            candidates = ("cheap",)
+        else:
+            candidates = ()
+        return [
+            refs_by_role[role]
+            for role in candidates
+            if role in enabled_roles and refs_by_role.get(role) != primary_model
+        ]
+
     openrouter_enabled = bool(openrouter_key and openrouter_base)
+    model_package = openrouter_model_package() if openrouter_enabled else {}
     primary_model = (
         openrouter_model_ref(openrouter_model)
         if openrouter_enabled
         else OPENCLAW_DEFAULT_MODEL
     )
+    text_model_config: dict[str, object] = {"primary": primary_model}
+    if openrouter_enabled:
+        fallbacks = openrouter_model_fallbacks(model_package)
+        if fallbacks:
+            text_model_config["fallbacks"] = fallbacks
     openai_plugin = {"enabled": True}
     plugin_entries = {
         "telegram": {"enabled": True},
@@ -856,7 +909,7 @@ def write_openclaw_config(
         "agents": {
             "defaults": {
                 "workspace": workspace_dir,
-                "model": {"primary": primary_model},
+                "model": text_model_config,
                 "agentRuntime": {"id": "pi"},
             },
         },
@@ -878,6 +931,10 @@ def write_openclaw_config(
         "session": {"dmScope": "per-channel-peer"},
     }
     _ensure_tinyhat_secret_provider_config(config)
+    if openrouter_enabled:
+        config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
+            model_package
+        )
     current_secrets = read_tinyhat_secrets_file()
     _sync_openai_api_key_ref(config, current_secrets)
     if openrouter_enabled:
@@ -1233,6 +1290,7 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_api_key") or ""),
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
+        json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
     )
 
 
