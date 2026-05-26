@@ -11,8 +11,8 @@ communication between the Computer and the Tinyhat platform:
 - starting and monitoring the framework **gateway** under systemd;
 - **heartbeat** while active, plus rebind / unassign detection;
 - runtime config apply for Computer-scoped secrets;
-- bundled OpenClaw platform tools for metadata-only credential
-  listing and add-secret Mini App links.
+- installing the public Tinyhat OpenClaw plugin from the repo/ref
+  pinned by the platform provisioning manifest.
 
 ## Why this is its own repository
 
@@ -42,7 +42,6 @@ environment-specific.
 | --- | --- |
 | `supervisor.py` | The platform-communication supervisor (state, binding, heartbeat, gateway monitor, OpenClaw config writer). Reads `tinyhat-backend-audience` and `tinyhat-platform-base-url` from instance metadata. |
 | `bootstrap.sh` | The runtime's install command. Installs generic Computer dependencies, optional private access, the requested framework package, and the supervisor + gateway systemd units after the VM's thin startup script clones this repo. |
-| `plugins/tinyhat/` | Dependency-free OpenClaw plugin that exposes Tinyhat credential helper tools and the `/tinyhat_secrets` skill command. |
 | `VERSION` | The runtime version published by this repo; recorded per Computer alongside the resolved commit SHA. |
 | `dev/` | Local-development container that runs the supervisor + real OpenClaw against a dev backend without GCE provisioning. See [`dev/README.md`](dev/README.md). |
 | `CHANGELOG.md` | What changed between published versions. |
@@ -80,6 +79,20 @@ The framework (OpenClaw) is installed from npm and is **not** vendored
 here — only a package/version pin is recorded. A separate
 framework-reference repository would only be introduced if a
 framework needed a lifecycle that npm cannot express.
+
+## Tinyhat plugin support
+
+The Tinyhat OpenClaw plugin is not vendored in this runtime repo. The
+platform passes `TINYHAT_PLATFORM_PLUGIN_REPO_URL` and
+`TINYHAT_PLATFORM_PLUGIN_REPO_REF` from the provisioning manifest, and
+the supervisor clones that public repo into local runtime state before
+installing it with `openclaw plugins install`.
+
+By default the plugin source is
+[`tinyhat-ai/tinyhat`](https://github.com/tinyhat-ai/tinyhat). That repo
+owns default skills, router/tool implementation, and Telegram
+presentation. This runtime owns only boot, supervision, config apply,
+diagnostics, and pinning/installing the plugin source.
 
 ## Framework support
 

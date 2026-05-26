@@ -218,5 +218,180 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         )
 
 
+class TinyhatPluginInstallTests(unittest.TestCase):
+    def test_install_clones_public_repo_and_records_marker(self) -> None:
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "refs/tags/v0.5.0"
+        plugin_sha = "abc123def4567890"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = os.path.join(tmpdir, "tinyhat-plugin")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if cmd == ["git", "clone", repo_url, plugin_dir]:
+                    os.makedirs(os.path.join(plugin_dir, ".git"))
+                    with open(
+                        os.path.join(plugin_dir, "openclaw.plugin.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fh:
+                        json.dump({"id": "tinyhat"}, fh)
+                    with open(
+                        os.path.join(plugin_dir, "package.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fh:
+                        json.dump({"version": "0.5.0"}, fh)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f"{plugin_sha}\n",
+                        stderr="",
+                    )
+                if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                self.fail(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
+            self.assertIn(["git", "clone", repo_url, plugin_dir], calls)
+            self.assertIn(["openclaw", "plugins", "install", plugin_dir, "--force"], calls)
+            with open(
+                os.path.join(tmpdir, "tinyhat-plugin.version"),
+                encoding="utf-8",
+            ) as fh:
+                marker = json.load(fh)
+            self.assertEqual(
+                marker,
+                {
+                    "repo_ref": repo_ref,
+                    "repo_url": repo_url,
+                    "resolved_commit_sha": plugin_sha,
+                    "version": "0.5.0",
+                },
+            )
+
+    def test_installed_marker_skips_openclaw_install_after_fetch(self) -> None:
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "main"
+        plugin_sha = "fedcba9876543210"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = os.path.join(tmpdir, "tinyhat-plugin")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            with open(
+                os.path.join(plugin_dir, "openclaw.plugin.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(plugin_dir, "package.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"version": "0.5.0"}, fh)
+            os.makedirs(os.path.join(tmpdir, "extensions", "tinyhat"))
+            with open(
+                os.path.join(
+                    tmpdir,
+                    "extensions",
+                    "tinyhat",
+                    "openclaw.plugin.json",
+                ),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(tmpdir, "tinyhat-plugin.version"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump(
+                    {
+                        "repo_ref": repo_ref,
+                        "repo_url": repo_url,
+                        "resolved_commit_sha": plugin_sha,
+                        "version": "0.5.0",
+                    },
+                    fh,
+                )
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(list(cmd))
+                if cmd == ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "fetch",
+                    "--tags",
+                    "--prune",
+                    "origin",
+                ]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f"{plugin_sha}\n",
+                        stderr="",
+                    )
+                self.fail(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
+            self.assertEqual(
+                calls,
+                [
+                    ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],
+                    [
+                        "git",
+                        "-C",
+                        plugin_dir,
+                        "fetch",
+                        "--tags",
+                        "--prune",
+                        "origin",
+                    ],
+                    ["git", "-C", plugin_dir, "checkout", repo_ref],
+                    ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

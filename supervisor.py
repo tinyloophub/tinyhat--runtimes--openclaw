@@ -83,6 +83,10 @@ TINYHAT_SECRETS_PROVIDER = "tinyhat"
 TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
 TINYHAT_PLUGIN_ID = "tinyhat"
+TINYHAT_PLUGIN_REPO_URL_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_URL"
+TINYHAT_PLUGIN_REPO_REF_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_REF"
+TINYHAT_PLUGIN_REPO_URL_DEFAULT = "https://github.com/tinyhat-ai/tinyhat.git"
+TINYHAT_PLUGIN_REPO_REF_DEFAULT = "main"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
 PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
     "/var/lib/tinyhat-private-access/bootstrap-status.json"
@@ -173,8 +177,12 @@ def runtime_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def tinyhat_plugin_dir() -> str:
-    return os.path.join(runtime_dir(), "plugins", TINYHAT_PLUGIN_ID)
+def tinyhat_plugin_checkout_dir() -> str:
+    """Local checkout of the public Tinyhat OpenClaw plugin repo."""
+    configured = (os.environ.get("TINYHAT_PLUGIN_CHECKOUT_DIR") or "").strip()
+    if configured:
+        return configured
+    return os.path.join(openclaw_state_dir(), "platform-plugins", TINYHAT_PLUGIN_ID)
 
 
 def _openclaw_cli_env() -> dict[str, str]:
@@ -436,15 +444,29 @@ def private_access_report() -> dict | None:
     return report
 
 
-def _tinyhat_plugin_version() -> str:
-    package_json = os.path.join(tinyhat_plugin_dir(), "package.json")
+def _tinyhat_plugin_source() -> tuple[str, str]:
+    """Return the public plugin repo/ref pinned by the platform manifest."""
+    repo_url = (
+        os.environ.get(TINYHAT_PLUGIN_REPO_URL_ENV) or TINYHAT_PLUGIN_REPO_URL_DEFAULT
+    ).strip()
+    repo_ref = (
+        os.environ.get(TINYHAT_PLUGIN_REPO_REF_ENV) or TINYHAT_PLUGIN_REPO_REF_DEFAULT
+    ).strip()
+    return repo_url, repo_ref
+
+
+def _tinyhat_plugin_version(plugin_dir: str) -> str:
+    package_json = os.path.join(plugin_dir, "package.json")
     try:
         with open(package_json, encoding="utf-8") as fh:
             payload = json.load(fh)
     except FileNotFoundError:
-        raise RuntimeError(
-            f"Tinyhat plugin package is missing at {package_json}"
-        )
+        version_txt = os.path.join(plugin_dir, "version.txt")
+        try:
+            with open(version_txt, encoding="utf-8") as fh:
+                return fh.read().strip() or "unknown"
+        except FileNotFoundError:
+            return "unknown"
     return str(payload.get("version") or "unknown")
 
 
@@ -453,18 +475,80 @@ def _tinyhat_plugin_marker_path() -> str:
 
 
 def ensure_tinyhat_plugin_installed() -> bool:
-    """Install the bundled Tinyhat tool plugin into OpenClaw.
+    """Install the public Tinyhat tool plugin into OpenClaw.
 
-    The plugin is shipped in the runtime repo and installed locally so
-    OpenClaw can expose the Computer-scoped credential tools at
-    gateway startup. It contains no Tinyhat credentials; requests
-    authenticate with the same GCE Computer identity token boundary as
-    the supervisor.
+    The runtime repo does not own the plugin implementation. It only
+    clones the public ``tinyhat-ai/tinyhat`` source pinned by the
+    platform manifest and asks OpenClaw to install that checkout.
+    The plugin contains no Tinyhat credentials; requests authenticate
+    with the same Computer identity-token boundary as the supervisor.
     """
-    plugin_dir = tinyhat_plugin_dir()
-    if not os.path.isdir(plugin_dir):
-        raise RuntimeError(f"Tinyhat plugin not found at {plugin_dir}")
-    version = _tinyhat_plugin_version()
+    repo_url, repo_ref = _tinyhat_plugin_source()
+    plugin_dir = tinyhat_plugin_checkout_dir()
+    os.makedirs(os.path.dirname(plugin_dir), mode=0o700, exist_ok=True)
+    if os.path.isdir(os.path.join(plugin_dir, ".git")):
+        remote = subprocess.run(
+            ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if remote.returncode != 0:
+            detail = (remote.stderr or remote.stdout or "").strip()
+            raise RuntimeError(f"Tinyhat plugin git remote update failed: {detail}")
+        fetch = subprocess.run(
+            ["git", "-C", plugin_dir, "fetch", "--tags", "--prune", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if fetch.returncode != 0:
+            detail = (fetch.stderr or fetch.stdout or "").strip()
+            raise RuntimeError(f"Tinyhat plugin git fetch failed: {detail}")
+    else:
+        if os.path.exists(plugin_dir):
+            shutil.rmtree(plugin_dir)
+        clone = subprocess.run(
+            ["git", "clone", repo_url, plugin_dir],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if clone.returncode != 0:
+            detail = (clone.stderr or clone.stdout or "").strip()
+            raise RuntimeError(f"Tinyhat plugin git clone failed: {detail}")
+
+    checkout = subprocess.run(
+        ["git", "-C", plugin_dir, "checkout", repo_ref],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if checkout.returncode != 0:
+        detail = (checkout.stderr or checkout.stdout or "").strip()
+        raise RuntimeError(f"Tinyhat plugin git checkout failed: {detail}")
+
+    rev_parse = subprocess.run(
+        ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if rev_parse.returncode != 0:
+        detail = (rev_parse.stderr or rev_parse.stdout or "").strip()
+        raise RuntimeError(f"Tinyhat plugin revision lookup failed: {detail}")
+    plugin_sha = (rev_parse.stdout or "").strip()
+    manifest_path = os.path.join(plugin_dir, "openclaw.plugin.json")
+    if not os.path.exists(manifest_path):
+        raise RuntimeError(f"Tinyhat plugin manifest is missing at {manifest_path}")
+
+    version = _tinyhat_plugin_version(plugin_dir)
+    marker_payload = {
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "resolved_commit_sha": plugin_sha,
+        "version": version,
+    }
     marker = _tinyhat_plugin_marker_path()
     installed_manifest = os.path.join(
         openclaw_state_dir(),
@@ -474,11 +558,16 @@ def ensure_tinyhat_plugin_installed() -> bool:
     )
     try:
         with open(marker, encoding="utf-8") as fh:
-            marker_version = fh.read().strip()
-    except FileNotFoundError:
-        marker_version = ""
-    if marker_version == version and os.path.exists(installed_manifest):
-        log.info("Tinyhat plugin already installed (version=%s)", version)
+            marker_json = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        marker_json = {}
+    if marker_json == marker_payload and os.path.exists(installed_manifest):
+        log.info(
+            "Tinyhat plugin already installed (ref=%s sha=%s version=%s)",
+            repo_ref,
+            plugin_sha[:12],
+            version,
+        )
         return True
 
     cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
@@ -494,8 +583,15 @@ def ensure_tinyhat_plugin_installed() -> bool:
         raise RuntimeError(f"Tinyhat plugin install failed: {detail}")
     os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
     with open(marker, "w", encoding="utf-8") as fh:
-        fh.write(version + "\n")
-    log.info("installed Tinyhat plugin (version=%s)", version)
+        json.dump(marker_payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    log.info(
+        "installed Tinyhat plugin (repo=%s ref=%s sha=%s version=%s)",
+        repo_url,
+        repo_ref,
+        plugin_sha[:12],
+        version,
+    )
     return True
 
 
@@ -598,7 +694,7 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> None:
 
 
 def _tinyhat_plugin_config() -> dict:
-    """Return non-secret config for the bundled OpenClaw tool plugin."""
+    """Return non-secret config for the public OpenClaw tool plugin."""
     plugin_config: dict = {"devMode": _dev_mode()}
     base_url = get_backend_base_url()
     if base_url:

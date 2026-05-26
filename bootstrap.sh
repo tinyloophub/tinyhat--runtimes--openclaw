@@ -16,6 +16,8 @@
 #   TINYHAT_BACKEND_AUDIENCE   — JWT audience for the identity token
 #   TINYHAT_PLATFORM_BASE_URL  — platform origin for /me/* calls
 #   TINYHAT_FRAMEWORK_INSTALL_SPEC — npm package spec, e.g. openclaw@2026.5.19
+#   TINYHAT_PLATFORM_PLUGIN_REPO_URL — public Tinyhat OpenClaw plugin repo
+#   TINYHAT_PLATFORM_PLUGIN_REPO_REF — public Tinyhat plugin ref/SHA to install
 #
 # Optional private-access material is passed by the platform startup
 # script through env and consumed here:
@@ -138,6 +140,8 @@ fi
 {
   echo "TINYHAT_BACKEND_AUDIENCE=${TINYHAT_BACKEND_AUDIENCE:-}"
   echo "TINYHAT_PLATFORM_BASE_URL=${TINYHAT_PLATFORM_BASE_URL:-}"
+  echo "TINYHAT_PLATFORM_PLUGIN_REPO_URL=${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}"
+  echo "TINYHAT_PLATFORM_PLUGIN_REPO_REF=${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}"
 } > "${RUNTIME_ENV_FILE}"
 chmod 0644 "${RUNTIME_ENV_FILE}"
 
