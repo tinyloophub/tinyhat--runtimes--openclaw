@@ -82,6 +82,12 @@ OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 TINYHAT_SECRETS_PROVIDER = "tinyhat"
 TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
+TINYHAT_OPENROUTER_API_KEY_NAME = "OPENROUTER_API_KEY"
+# Env-block keys whose runtime values come from the binding payload (not the
+# user-managed runtime-secrets vault). They are preserved across runtime-
+# secret apply cycles so a Mini App entry can't accidentally shadow the
+# platform-issued credential, and runtime-secret deletes never strip them.
+BINDING_MANAGED_ENV_KEYS = frozenset({TINYHAT_OPENROUTER_API_KEY_NAME})
 TINYHAT_PLUGIN_ID = "tinyhat"
 TINYHAT_PLUGIN_REPO_URL_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_URL"
 TINYHAT_PLUGIN_REPO_REF_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_REF"
@@ -674,8 +680,99 @@ def _sync_openai_api_key_ref(config: dict, secrets: dict[str, str]) -> None:
         del config["models"]
 
 
-def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> None:
-    """Update openclaw.json with Tinyhat's file SecretRef surfaces."""
+def _runtime_secret_env_entries(secrets: dict[str, str]) -> dict[str, str]:
+    """Return the subset of runtime secrets that should land in ``config["env"]``.
+
+    OpenClaw populates the gateway's ``process.env`` from plaintext
+    ``config["env"]`` entries at boot via ``applyConfigEnvVars`` — that
+    is the same lever the bash tool then reads for its child shells. Any
+    user-saved runtime secret that the agent shell should be able to read
+    (e.g. ``EXA_API_KEY``, third-party tokens) must therefore appear here.
+
+    Two classes of names are filtered out:
+
+    - ``OPENAI_API_KEY`` is wired into ``models.providers.openai.apiKey``
+      as a file SecretRef. The OpenAI provider resolves it through the
+      Tinyhat file provider — no plaintext env entry is needed, and adding
+      one would shadow the SecretRef wiring.
+    - Anything in :data:`BINDING_MANAGED_ENV_KEYS` (currently
+      ``OPENROUTER_API_KEY``) comes from the platform-issued binding
+      payload, not from the user. The binding-derived value is layered
+      back on top in :func:`_apply_runtime_secret_env_block` so a user
+      can't accidentally shadow it with a Mini App entry.
+    """
+    filtered: dict[str, str] = {}
+    for raw_name, raw_value in (secrets or {}).items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if name == TINYHAT_OPENAI_API_KEY_NAME:
+            continue
+        if name in BINDING_MANAGED_ENV_KEYS:
+            continue
+        value = str(raw_value or "")
+        if not value.strip():
+            continue
+        filtered[name] = value
+    return filtered
+
+
+def _apply_runtime_secret_env_block(
+    config: dict, secrets: dict[str, str]
+) -> None:
+    """Mirror user-managed runtime secrets into ``config["env"]``.
+
+    Binding-managed keys (see :data:`BINDING_MANAGED_ENV_KEYS`) that
+    already live in ``config["env"]`` are preserved verbatim — those
+    values are owned by :func:`write_openclaw_config` and reflect the
+    latest binding payload from the platform. All other prior entries
+    are treated as stale runtime secrets and dropped, so a deleted Mini
+    App secret actually disappears from the gateway env on next boot.
+    """
+    existing = config.get("env") or {}
+    preserved = {
+        key: existing[key]
+        for key in BINDING_MANAGED_ENV_KEYS
+        if isinstance(existing.get(key), str) and existing[key].strip()
+    }
+    secret_entries = _runtime_secret_env_entries(secrets)
+    # Binding-managed wins on conflict so a user-set OPENROUTER_API_KEY in
+    # the Mini App never overrides the platform-issued one.
+    merged = {**secret_entries, **preserved}
+    if merged:
+        config["env"] = merged
+    else:
+        config.pop("env", None)
+
+
+def _signal_rebind_for_secrets() -> None:
+    """Ask the supervisor's main loop to restart the gateway.
+
+    ``applyConfigEnvVars`` only runs at OpenClaw gateway boot, so a
+    change to ``config["env"]`` does not reach the bash tool's
+    ``process.env`` until the gateway restarts. Reuse the existing
+    rebind machinery (stop → poll ``/me/binding`` → fresh config → fresh
+    gateway) rather than inventing a parallel restart path; the binding
+    watchdog and gateway-health probe already understand that flow.
+    """
+    log.info(
+        "runtime-secret env block changed; signaling gateway rebind so "
+        "applyConfigEnvVars picks up the new keys"
+    )
+    _stop_holder["rebind"] = True
+    _stop_holder["stop"] = True
+
+
+def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> bool:
+    """Update openclaw.json with Tinyhat's file SecretRef surfaces.
+
+    Returns ``True`` if the runtime-secret entries in ``config["env"]``
+    changed (a gateway restart is required for ``applyConfigEnvVars`` to
+    re-populate ``process.env``), ``False`` otherwise. Changes that only
+    affect SecretRef-resolved fields like ``models.providers.openai.apiKey``
+    are handled by ``openclaw secrets reload`` without a restart and
+    return ``False``.
+    """
     config_path = openclaw_config_path()
     try:
         with open(config_path, encoding="utf-8") as fh:
@@ -683,14 +780,22 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> None:
     except FileNotFoundError:
         config = {}
 
+    previous_env = dict(config.get("env") or {})
     _ensure_tinyhat_secret_provider_config(config)
     _sync_openai_api_key_ref(config, secrets)
+    _apply_runtime_secret_env_block(config, secrets)
+    current_env = dict(config.get("env") or {})
     _atomic_write_json(config_path, config)
+    env_block_changed = previous_env != current_env
     log.info(
-        "synced OpenClaw SecretRef config (provider=%s openai_ref=%s)",
+        "synced OpenClaw SecretRef config (provider=%s openai_ref=%s "
+        "env_block_changed=%s env_keys=%d)",
         TINYHAT_SECRETS_PROVIDER,
         "yes" if (secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip() else "no",
+        "yes" if env_block_changed else "no",
+        len(current_env),
     )
+    return env_block_changed
 
 
 def _tinyhat_plugin_config() -> dict:
@@ -874,14 +979,24 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
 
 
 def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
-    """Apply one latest runtime-secret revision to OpenClaw."""
+    """Apply one latest runtime-secret revision to OpenClaw.
+
+    ``env_block_changed`` is returned alongside the reload result so the
+    caller can decide whether a gateway restart is needed. Runtime
+    secrets that show up in the gateway's ``process.env`` only land
+    there at boot (via OpenClaw's ``applyConfigEnvVars``), so any change
+    to ``config["env"]`` requires :func:`_signal_rebind_for_secrets`.
+    Pure SecretRef changes (e.g. an ``OPENAI_API_KEY``-only edit) leave
+    ``env_block_changed`` false and the gateway keeps running.
+    """
     write_tinyhat_secrets_file(secrets)
-    sync_openclaw_secret_ref_config(secrets)
+    env_block_changed = sync_openclaw_secret_ref_config(secrets)
     reload_result = reload_openclaw_secrets(secrets)
     return {
         "revision": revision,
         "secret_count": len(secrets or {}),
         "reload": reload_result,
+        "env_block_changed": env_block_changed,
     }
 
 
@@ -1033,8 +1148,11 @@ def write_openclaw_config(
         )
     current_secrets = read_tinyhat_secrets_file()
     _sync_openai_api_key_ref(config, current_secrets)
+    # Seed binding-managed env entries first so they are preserved when
+    # runtime secrets are layered on top — see _apply_runtime_secret_env_block.
     if openrouter_enabled:
-        config["env"] = {"OPENROUTER_API_KEY": openrouter_key}
+        config["env"] = {TINYHAT_OPENROUTER_API_KEY_NAME: openrouter_key}
+    _apply_runtime_secret_env_block(config, current_secrets)
     _atomic_write_json(config_path, config)
     # Log only non-secret summary; never log the API key.
     log.info(
@@ -1474,10 +1592,20 @@ def handle_apply_config_command(command: dict) -> None:
         _config_apply_state["failed_diagnostic"] = None
         _config_apply_state["failed_reported"] = False
         log.info(
-            "apply_config revision=%d applied (keys=%d)",
+            "apply_config revision=%d applied (keys=%d env_changed=%s)",
             revision,
             result["secret_count"],
+            "yes" if result.get("env_block_changed") else "no",
         )
+        # The platform now knows the new revision is applied. Restart the
+        # gateway so OpenClaw's applyConfigEnvVars picks up the new env
+        # block; otherwise the agent shell tool's process.env stays stale
+        # and a user-added secret like EXA_API_KEY never reaches `$EXA_API_KEY`.
+        # Skip the restart when only SecretRef-backed config changed (e.g.
+        # an OPENAI_API_KEY-only edit) since `openclaw secrets reload`
+        # already refreshed the runtime snapshot for that path.
+        if result.get("env_block_changed"):
+            _signal_rebind_for_secrets()
     except Exception as exc:
         diagnostic = _diagnostic_from_exception(exc, secrets)
         _config_apply_state["failed_revision"] = revision

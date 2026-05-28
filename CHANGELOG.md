@@ -5,6 +5,24 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.9.1
+
+### Fixed
+
+- Mirror user-managed runtime secrets into `openclaw.json`'s `env`
+  block so OpenClaw's `applyConfigEnvVars` populates the gateway
+  `process.env` (and therefore the bash tool's child shells) at boot.
+  Previously the apply path only wired `OPENAI_API_KEY` into a
+  `models.providers.openai.apiKey` SecretRef and registered the file
+  provider, leaving non-OpenAI keys like `EXA_API_KEY` reachable to
+  OpenClaw's SecretRef snapshot but absent from the agent shell's
+  environment. `OPENAI_API_KEY` keeps the SecretRef path and
+  `OPENROUTER_API_KEY` is preserved as binding-managed; everything
+  else lands in `config["env"]` as plaintext, matching the existing
+  OpenRouter pattern. `apply_runtime_secret_map` now signals a gateway
+  rebind only when the env block actually changed; OpenAI-only edits
+  still resolve through `openclaw secrets reload` without a restart.
+
 ## 0.9.0
 
 ### Changed

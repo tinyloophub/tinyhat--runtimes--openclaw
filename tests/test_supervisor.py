@@ -393,5 +393,330 @@ class TinyhatPluginInstallTests(unittest.TestCase):
             )
 
 
+class RuntimeSecretEnvBlockTests(unittest.TestCase):
+    """Regression coverage for the runtime-secret env injection contract.
+
+    The promise the secret-management UX makes ("saved values are available
+    to OpenClaw processes on that Computer") only holds if user-added
+    runtime secrets land in the agent shell's `process.env`. OpenClaw's
+    `applyConfigEnvVars` is the only path that populates `process.env`
+    from the on-disk config at gateway boot, and it walks plaintext
+    `config["env"]` entries only. These tests pin that the supervisor's
+    apply path actually fills `config["env"]` for arbitrary user-saved
+    secrets while leaving the binding-managed entries and the OpenAI
+    SecretRef wiring alone.
+    """
+
+    def test_write_config_mirrors_runtime_secrets_into_env(self) -> None:
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_token": "123456:ABC",
+            "telegram_bot_username": "Tinychattestbot",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "EXA_API_KEY": "exa-test-key",
+                        "TEST_SECRET": "shh",
+                    },
+                    fh,
+                )
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(binding)
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertEqual(
+            config.get("env"),
+            {"EXA_API_KEY": "exa-test-key", "TEST_SECRET": "shh"},
+        )
+
+    def test_openai_api_key_stays_on_secret_ref_not_in_env(self) -> None:
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_token": "123456:ABC",
+            "telegram_bot_username": "Tinychattestbot",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "OPENAI_API_KEY": "sk-openai-test",
+                        "EXA_API_KEY": "exa-test-key",
+                    },
+                    fh,
+                )
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(binding)
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        # OpenAI is the only key wired into the model SecretRef.
+        self.assertEqual(
+            config["models"]["providers"]["openai"]["apiKey"],
+            {
+                "source": "file",
+                "provider": supervisor.TINYHAT_SECRETS_PROVIDER,
+                "id": supervisor.TINYHAT_OPENAI_API_KEY_POINTER,
+            },
+        )
+        # Plain-text env block carries everything else, but NOT OPENAI_API_KEY:
+        # surfacing both would shadow the SecretRef.
+        self.assertEqual(config.get("env"), {"EXA_API_KEY": "exa-test-key"})
+
+    def test_binding_openrouter_wins_over_user_runtime_secret(self) -> None:
+        package = {
+            "default_model": "deepseek/deepseek-v4-pro",
+            "default_role": "default",
+            "enabled_roles": ["cheap", "default"],
+            "models": {
+                "cheap": "deepseek/deepseek-v4-flash",
+                "default": "deepseek/deepseek-v4-pro",
+            },
+        }
+        binding = _openrouter_binding(package)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        # User tried to override the platform-issued key
+                        # through the Mini App. The binding's value must
+                        # still win.
+                        "OPENROUTER_API_KEY": "sk-or-v1-user-attempt",
+                        "EXA_API_KEY": "exa-test-key",
+                    },
+                    fh,
+                )
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(binding)
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertEqual(
+            config["env"],
+            {
+                "OPENROUTER_API_KEY": "sk-or-v1-child",  # binding-issued
+                "EXA_API_KEY": "exa-test-key",
+            },
+        )
+
+    def test_sync_secret_ref_config_updates_env_and_flags_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # Seed openclaw.json with a binding-managed OPENROUTER_API_KEY
+                # so we can prove _apply_runtime_secret_env_block preserves it.
+                config_path = supervisor.openclaw_config_path()
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {"env": {"OPENROUTER_API_KEY": "sk-or-v1-child"}},
+                        fh,
+                    )
+                changed = supervisor.sync_openclaw_secret_ref_config(
+                    {"EXA_API_KEY": "exa-test-key", "OPENAI_API_KEY": "sk"}
+                )
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertTrue(changed, "EXA_API_KEY add should flag env_block_changed")
+        self.assertEqual(
+            config["env"],
+            {
+                "OPENROUTER_API_KEY": "sk-or-v1-child",  # preserved
+                "EXA_API_KEY": "exa-test-key",
+            },
+        )
+        self.assertEqual(
+            config["models"]["providers"]["openai"]["apiKey"],
+            {
+                "source": "file",
+                "provider": supervisor.TINYHAT_SECRETS_PROVIDER,
+                "id": supervisor.TINYHAT_OPENAI_API_KEY_POINTER,
+            },
+        )
+
+    def test_sync_secret_ref_config_openai_only_does_not_flag_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # Empty config; only OPENAI_API_KEY changes after sync.
+                changed = supervisor.sync_openclaw_secret_ref_config(
+                    {"OPENAI_API_KEY": "sk-openai"}
+                )
+
+        # An OpenAI-only edit lands on the SecretRef wiring and on disk via
+        # `openclaw secrets reload`; the env block stays empty so we don't
+        # need to restart the gateway.
+        self.assertFalse(changed)
+
+    def test_deleting_runtime_secret_drops_it_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                config_path = supervisor.openclaw_config_path()
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "env": {
+                                "OPENROUTER_API_KEY": "sk-or-v1-child",
+                                "EXA_API_KEY": "exa-test-key",
+                                "STALE_SECRET": "old",
+                            }
+                        },
+                        fh,
+                    )
+                # User deleted both EXA_API_KEY and STALE_SECRET; only the
+                # binding-managed key remains.
+                changed = supervisor.sync_openclaw_secret_ref_config({})
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            config["env"],
+            {"OPENROUTER_API_KEY": "sk-or-v1-child"},
+        )
+
+    def test_apply_runtime_secret_map_returns_env_block_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "reload_openclaw_secrets",
+                    return_value={"ok": True},
+                ),
+            ):
+                result = supervisor.apply_runtime_secret_map(
+                    revision=42,
+                    secrets={"EXA_API_KEY": "exa-test-key"},
+                )
+
+        self.assertEqual(result["revision"], 42)
+        self.assertEqual(result["secret_count"], 1)
+        self.assertTrue(result["env_block_changed"])
+
+    def test_handle_apply_config_signals_rebind_on_env_change(self) -> None:
+        # Reset the module-level rebind flags so the test is order-independent.
+        supervisor._stop_holder["rebind"] = False
+        supervisor._stop_holder["stop"] = False
+        supervisor._config_apply_state["failed_revision"] = None
+        supervisor._config_apply_state["failed_diagnostic"] = None
+        supervisor._config_apply_state["failed_reported"] = False
+
+        with (
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={
+                    "revision": 5,
+                    "secrets": {"EXA_API_KEY": "exa-test-key"},
+                },
+            ),
+            patch.object(
+                supervisor,
+                "apply_runtime_secret_map",
+                return_value={
+                    "revision": 5,
+                    "secret_count": 1,
+                    "reload": {"ok": True},
+                    "env_block_changed": True,
+                },
+            ),
+            patch.object(supervisor, "_post_config_apply_result") as posted,
+        ):
+            supervisor.handle_apply_config_command({"type": "apply_config", "revision": 5})
+
+        self.assertTrue(supervisor._stop_holder["rebind"])
+        self.assertTrue(supervisor._stop_holder["stop"])
+        posted.assert_called_once()
+        self.assertEqual(posted.call_args.kwargs["revision"], 5)
+        self.assertEqual(posted.call_args.kwargs["status"], "applied")
+
+        # Cleanup so unrelated tests are not affected.
+        supervisor._stop_holder["rebind"] = False
+        supervisor._stop_holder["stop"] = False
+
+    def test_handle_apply_config_skips_rebind_when_env_unchanged(self) -> None:
+        supervisor._stop_holder["rebind"] = False
+        supervisor._stop_holder["stop"] = False
+        supervisor._config_apply_state["failed_revision"] = None
+        supervisor._config_apply_state["failed_diagnostic"] = None
+        supervisor._config_apply_state["failed_reported"] = False
+
+        with (
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={
+                    "revision": 6,
+                    "secrets": {"OPENAI_API_KEY": "sk-openai"},
+                },
+            ),
+            patch.object(
+                supervisor,
+                "apply_runtime_secret_map",
+                return_value={
+                    "revision": 6,
+                    "secret_count": 1,
+                    "reload": {"ok": True},
+                    "env_block_changed": False,
+                },
+            ),
+            patch.object(supervisor, "_post_config_apply_result"),
+        ):
+            supervisor.handle_apply_config_command({"type": "apply_config", "revision": 6})
+
+        # OpenAI-only edits resolve through the SecretRef snapshot already
+        # refreshed by `openclaw secrets reload`; the gateway must NOT restart.
+        self.assertFalse(supervisor._stop_holder["rebind"])
+        self.assertFalse(supervisor._stop_holder["stop"])
+
+
 if __name__ == "__main__":
     unittest.main()
