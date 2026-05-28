@@ -1664,9 +1664,14 @@ def _binding_signature(binding: dict) -> tuple:
     re-assigned the same VPS (different bot, different account,
     different owner, or new vault row with a fresh token, or an
     OpenRouter child key + base URL + default model that appeared
-    after a transient vault miss on the first poll). The supervisor
-    must drop its in-memory state and re-run Phase B so openclaw.json
-    gets rewritten with the now-present provider config.
+    after a transient vault miss on the first poll), OR the owner
+    flipped the LLM auth mode (issue #23 — adding
+    ``llm_auth_mode`` / ``llm_model_ref`` so a platform-credits ->
+    chatgpt_subscription flip triggers rebind and the supervisor
+    rewrites openclaw.json instead of keeping the old
+    ``pi`` + OpenRouter config running). The supervisor must drop
+    its in-memory state and re-run Phase B so openclaw.json gets
+    rewritten with the now-present provider config.
     """
     return (
         str(binding.get("telegram_bot_user_id") or ""),
@@ -1678,7 +1683,64 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
         json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
+        # ChatGPT BYO subscription (issue #23) — mode/model_ref live
+        # on the binding so the watchdog notices a flip and triggers
+        # a rebind (otherwise write_openclaw_config never runs after
+        # the platform changes the auth mode).
+        str(binding.get("llm_auth_mode") or "platform_credits"),
+        str(binding.get("llm_model_ref") or ""),
     )
+
+
+def _owner_identity_signature(binding: dict) -> tuple:
+    """Owner-identity subset of the binding signature (issue #23).
+
+    Same shape as ``_binding_signature`` but trimmed to the fields
+    that change ONLY on owner-identity changes — i.e. an admin
+    reassign / unassign / recycle hands the Computer to a different
+    user. Mode flips (``llm_auth_mode`` / ``llm_model_ref``) and
+    OpenRouter key rotation for the SAME owner do not move this
+    tuple, so they don't trigger the per-agent OAuth auth-store
+    wipe — only owner-identity changes do (issue #23 wipe contract).
+    """
+    return (
+        str(binding.get("telegram_bot_user_id") or ""),
+        str(binding.get("telegram_bot_username") or ""),
+        str(binding.get("telegram_owner_user_id") or ""),
+        str(binding.get("account_handle") or ""),
+    )
+
+
+def _wipe_on_owner_release(*, reason: str) -> None:
+    """Wipe the per-agent OAuth auth-store when the Computer changes hands.
+
+    Issue #23 — admin-driven unassign / reassign / recycle must not
+    leak the previous owner's OAuth credential to the next owner. The
+    watchdog calls this from both the ``assigned=false`` branch
+    (platform-driven unassign) and the owner-identity-changed branch
+    (admin reassign to a different account/owner).
+
+    Logs only the non-secret profile id list (e.g.
+    ``["openai-codex:owner@example.com"]``) so the operator can see
+    which credential was dropped. Failures are warning-logged but
+    never raised — the rebind path must continue even if the auth
+    store is temporarily unreachable.
+    """
+    try:
+        removed = wipe_chatgpt_subscription_profile()
+    except Exception as exc:
+        log.warning(
+            "binding watchdog: subscription auth-store wipe failed on %s: %s",
+            reason,
+            exc,
+        )
+        return
+    if removed:
+        log.info(
+            "binding watchdog: wiped subscription auth-store on %s (profiles=%s)",
+            reason,
+            removed,
+        )
 
 
 def _command_revision(command: dict) -> int | None:
@@ -1928,8 +1990,12 @@ def _run_one_binding_cycle() -> int:
 
     # Stamp this cycle's binding signature so the watchdog thread
     # can detect a fast unassign + reassign that lands inside the
-    # heartbeat window.
+    # heartbeat window. The owner-identity subset is stamped
+    # separately so the watchdog can decide whether to wipe the
+    # per-agent OAuth auth-store on rebind (issue #23 — owner
+    # change = wipe; mode flip for the same owner = don't wipe).
     _stop_holder["signature"] = _binding_signature(binding)
+    _stop_holder["owner_signature"] = _owner_identity_signature(binding)
     log.info(
         "phase D: binding signature locked (bot=@%s owner=%s)",
         binding.get("telegram_bot_username"),
@@ -1980,6 +2046,13 @@ def _run_one_binding_cycle() -> int:
                         "binding watchdog: platform reports assigned=false; "
                         "triggering rebind"
                     )
+                    # Issue #23: platform-driven unassign hands the
+                    # Computer back to the pool. Wipe the previous
+                    # owner's per-agent OAuth credential before the
+                    # supervisor releases control, so the next owner
+                    # can't inherit a linked-subscription state from
+                    # the prior binding.
+                    _wipe_on_owner_release(reason="unassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
                     return
@@ -1993,6 +2066,17 @@ def _run_one_binding_cycle() -> int:
                         new_binding.get("telegram_bot_username"),
                         new_binding.get("telegram_owner_user_id"),
                     )
+                    # Issue #23: only wipe when the OWNER changed,
+                    # not when the same owner flipped llm_auth_mode
+                    # or rotated their OpenRouter key. A mode flip
+                    # for the same owner triggers a rebind (so the
+                    # supervisor rewrites openclaw.json) but the
+                    # OAuth credential they just linked should
+                    # survive into the next config.
+                    new_owner_sig = _owner_identity_signature(new_binding)
+                    cached_owner_sig = _stop_holder.get("owner_signature")
+                    if cached_owner_sig and new_owner_sig != cached_owner_sig:
+                        _wipe_on_owner_release(reason="reassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
                     return

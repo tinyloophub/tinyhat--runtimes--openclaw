@@ -907,5 +907,166 @@ class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
                 self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
 
 
+class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
+    """Issue #23 / PR #24 review #1 — signature must move on a mode flip."""
+
+    def _base_binding(self) -> dict:
+        return {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_user_id": "999",
+            "telegram_bot_username": "Tinychattestbot",
+            "telegram_bot_token": "123456:ABC",
+            "account_handle": "test-account",
+            "openrouter_api_key": "sk-or-v1-child",
+            "openrouter_base_url": "https://openrouter.ai/api/v1",
+            "openrouter_default_model": "openai/gpt-5.5",
+        }
+
+    def test_signature_moves_when_llm_auth_mode_flips(self) -> None:
+        before = self._base_binding()  # implicit platform_credits
+        after = dict(before, llm_auth_mode="chatgpt_subscription")
+        self.assertNotEqual(
+            supervisor._binding_signature(before),
+            supervisor._binding_signature(after),
+        )
+
+    def test_signature_moves_when_llm_model_ref_changes(self) -> None:
+        before = dict(
+            self._base_binding(), llm_auth_mode="chatgpt_subscription"
+        )
+        after = dict(before, llm_model_ref="openai/gpt-5.5")
+        self.assertNotEqual(
+            supervisor._binding_signature(before),
+            supervisor._binding_signature(after),
+        )
+
+    def test_owner_signature_stable_across_mode_flip(self) -> None:
+        """Mode flip for the same owner must NOT change the owner-
+        identity tuple — otherwise the wipe would fire on every flip
+        and drop the OAuth credential the user just linked."""
+        before = self._base_binding()
+        after = dict(
+            before,
+            llm_auth_mode="chatgpt_subscription",
+            llm_model_ref="openai/gpt-5.5",
+        )
+        self.assertEqual(
+            supervisor._owner_identity_signature(before),
+            supervisor._owner_identity_signature(after),
+        )
+
+    def test_owner_signature_moves_on_owner_change(self) -> None:
+        before = self._base_binding()
+        after = dict(before, telegram_owner_user_id="987654")
+        self.assertNotEqual(
+            supervisor._owner_identity_signature(before),
+            supervisor._owner_identity_signature(after),
+        )
+
+
+class WipeOnOwnerReleaseTests(unittest.TestCase):
+    """Issue #23 / PR #24 review #2 — production wipe wiring."""
+
+    def test_wipe_helper_logs_removed_profiles(self) -> None:
+        """``_wipe_on_owner_release`` must call into the actual wipe."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                # Helper is a thin wrapper — no return value, just
+                # delegates + logs. Verify the file got wiped after.
+                supervisor._wipe_on_owner_release(reason="reassign")
+                path = supervisor.openclaw_auth_profiles_path()
+                with open(path, encoding="utf-8") as fh:
+                    after = json.load(fh)
+                self.assertEqual(after["profiles"], {})
+
+    def test_wipe_helper_is_safe_when_no_profile_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # No file on disk — must not raise.
+                supervisor._wipe_on_owner_release(reason="unassign")
+
+    def test_wipe_helper_swallows_unexpected_errors(self) -> None:
+        """A flaky filesystem must not break the rebind path."""
+        with patch.object(
+            supervisor,
+            "wipe_chatgpt_subscription_profile",
+            side_effect=OSError("disk gremlin"),
+        ):
+            # Must not raise — the watchdog needs the rebind path to
+            # keep moving even if the auth-store is temporarily
+            # unreachable.
+            supervisor._wipe_on_owner_release(reason="reassign")
+
+
+class StaleProfileCarryoverGuardTests(unittest.TestCase):
+    """Issue #23 / PR #24 review #2 — stale-profile carryover regression test.
+
+    Simulates the failure mode Codex called out: an admin-driven
+    unassign leaves the previous owner's openai-codex profile on
+    disk; a later subscription-mode binding for a different owner
+    would then make ``write_openclaw_config`` treat the stale
+    profile as valid and run against the prior user's subscription.
+    This test pins that the wipe-on-release helper clears the
+    profile so the next binding starts from a clean slate.
+    """
+
+    def test_unassign_clears_profile_so_next_binding_starts_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # Phase 1: previous owner had a linked subscription.
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                self.assertIsNotNone(
+                    supervisor.read_chatgpt_subscription_profile()
+                )
+
+                # Phase 2: platform unassigns the Computer. The
+                # watchdog calls _wipe_on_owner_release.
+                supervisor._wipe_on_owner_release(reason="unassign")
+
+                # Phase 3: a NEW owner takes over and the platform
+                # later flips their binding to chatgpt_subscription.
+                # write_openclaw_config must NOT pick up the prior
+                # profile — it should fall back to the default
+                # OpenRouter path because no profile exists on disk
+                # for this owner yet.
+                new_owner_binding = {
+                    "telegram_owner_user_id": "987654",  # different owner!
+                    "telegram_bot_token": "987654:DEF",
+                    "telegram_bot_username": "OtherTestbot",
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                    "openrouter_api_key": "sk-or-v1-other",
+                    "openrouter_base_url": "https://openrouter.ai/api/v1",
+                    "openrouter_default_model": "openai/gpt-5.2",
+                }
+                supervisor.write_openclaw_config(new_owner_binding)
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+                defaults = config["agents"]["defaults"]
+                # New owner without a profile yet → STAYS on `pi` +
+                # OpenRouter (the opted-in-without-profile branch).
+                # The critical assertion: the prior owner's profile
+                # did NOT survive to make the supervisor flip to
+                # subscription mode for the new owner.
+                self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+                self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
+
+
 if __name__ == "__main__":
     unittest.main()
