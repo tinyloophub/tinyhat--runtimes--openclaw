@@ -79,6 +79,20 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
+
+# ChatGPT BYO subscription (issue #23): when an `openai-codex` OAuth
+# profile is present in this Computer's per-agent auth store, the
+# supervisor swaps the default `pi`+OpenRouter config for the native
+# Codex app-server harness pointed at `openai/gpt-5.5`. The OAuth
+# credential is born on the Computer (either from the Mini App-driven
+# heartbeat-command flow OR from the chat-driven plugin tool running
+# the device-code CLI in-sandbox); the supervisor only reads the
+# resulting file shape on disk.
+CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
+CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+# Default agent id mirrors the platform's single-agent assumption today.
+# The auth store is per-agent inside the per-Computer OpenClaw state dir.
+DEFAULT_OPENCLAW_AGENT_ID = "main"
 TINYHAT_SECRETS_PROVIDER = "tinyhat"
 TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
@@ -1000,6 +1014,111 @@ def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
     }
 
 
+def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> str:
+    """Resolve the per-agent OAuth auth-store path inside this Computer.
+
+    Mirrors OpenClaw's own layout: under ``OPENCLAW_STATE_DIR`` (the
+    supervisor resolves this to ``/var/lib/tinyhat-openclaw`` in
+    production, or the per-worktree dev dir when ``--dev`` is in
+    effect), each agent has its own ``agents/<id>/agent/`` directory
+    with an ``auth-profiles.json`` file (mode 0600) that stores OAuth
+    bundles per provider id. The chat-driven device-code login (via
+    the Tinyhat plugin's ``tinyhat_open_chatgpt_subscription_link``
+    tool) writes here; the Mini App-driven flow also writes here once
+    the supervisor's PTY subprocess completes its poll. Per-agent
+    isolation means a reassign / recycle of the Computer wipes this
+    file (issue #23).
+    """
+    return os.path.join(
+        openclaw_state_dir(), "agents", agent_id, "agent", "auth-profiles.json"
+    )
+
+
+def read_chatgpt_subscription_profile(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> dict | None:
+    """Return the ``openai-codex:*`` profile entry, if present.
+
+    Returns the first matching profile dict from
+    ``auth-profiles.json`` (typically there's exactly one — OpenClaw's
+    profile id is ``openai-codex:<email>`` and the device-code flow
+    only mints one per Computer). Returns ``None`` when the file is
+    missing, malformed, or has no ``openai-codex:*`` entries.
+
+    The OAuth token fields (``access``, ``refresh``, ``id``) ARE present
+    in the returned dict — callers must NOT log them. The supervisor's
+    own use of this function is metadata-only (presence check + email
+    for logging); the actual OAuth refresh is OpenClaw's own concern.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile_id, str) or not isinstance(profile, dict):
+            continue
+        if profile_id.startswith(f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"):
+            # Return a shallow copy with the profile id so callers can
+            # log it without re-reading.
+            out = dict(profile)
+            out["__profile_id"] = profile_id
+            return out
+    return None
+
+
+def wipe_chatgpt_subscription_profile(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> list[str]:
+    """Delete the ``openai-codex:*`` entries from the per-agent auth store.
+
+    Used on unassign / reassign / recycle (the chat plugin's
+    ``tinyhat_revert_to_platform_credits`` tool also performs this
+    wipe directly from inside the sandbox; the supervisor's path here
+    is the admin-driven case where the platform tells the Computer to
+    drop the credential without the agent being involved).
+
+    Returns the list of profile ids removed (empty when no matching
+    profile existed). Preserves any non-``openai-codex`` profiles in
+    the file. Writes atomically via a ``.tmp`` rename so a partial
+    write can't strand other-provider entries.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    removed: list[str] = []
+    for profile_id in list(profiles.keys()):
+        if isinstance(profile_id, str) and profile_id.startswith(
+            f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"
+        ):
+            del profiles[profile_id]
+            removed.append(profile_id)
+    if not removed:
+        return []
+    version = data.get("version") if isinstance(data.get("version"), int) else 1
+    next_data = {"version": version, "profiles": profiles}
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(next_data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    return removed
+
+
 def write_openclaw_config(
     binding: dict,
     *,
@@ -1084,16 +1203,50 @@ def write_openclaw_config(
 
     openrouter_enabled = bool(openrouter_key and openrouter_base)
     model_package = openrouter_model_package() if openrouter_enabled else {}
-    primary_model = (
-        openrouter_model_ref(openrouter_model)
-        if openrouter_enabled
-        else OPENCLAW_DEFAULT_MODEL
+
+    # ── ChatGPT BYO subscription branch (issue #23) ─────────────────
+    # The platform may advertise `llm_auth_mode = chatgpt_subscription`
+    # on the binding to signal "the owner has opted in" (Mini App
+    # path), but the source of truth for "is a credential actually
+    # present" is the per-agent OAuth auth store on disk. The chat
+    # plugin's tool writes there directly; the Mini App's
+    # heartbeat-command flow has the supervisor write there. Either
+    # way, the supervisor flips to subscription-mode config only when
+    # the credential is on disk — otherwise an opted-in but
+    # not-yet-linked Computer would lose its OpenRouter fallback
+    # before the user has even approved.
+    binding_llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits")
+    binding_llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
+    subscription_profile = read_chatgpt_subscription_profile()
+    use_chatgpt_subscription = (
+        binding_llm_auth_mode == "chatgpt_subscription"
+        and subscription_profile is not None
     )
+
+    if use_chatgpt_subscription:
+        primary_model = binding_llm_model_ref or CHATGPT_SUBSCRIPTION_MODEL
+    else:
+        primary_model = (
+            openrouter_model_ref(openrouter_model)
+            if openrouter_enabled
+            else OPENCLAW_DEFAULT_MODEL
+        )
     text_model_config: dict[str, object] = {"primary": primary_model}
-    if openrouter_enabled:
+    if openrouter_enabled and not use_chatgpt_subscription:
         fallbacks = openrouter_model_fallbacks(model_package)
         if fallbacks:
             text_model_config["fallbacks"] = fallbacks
+    elif use_chatgpt_subscription and openrouter_enabled:
+        # Cross-provider fallback when the platform-credits OpenRouter
+        # rail is still available on the binding — covers the case
+        # where the subscription hits a per-account rate window
+        # (5h / weekly) and the agent should keep replying via the
+        # funded path instead of going dark. Tinyloop's preflight
+        # spike confirmed OpenClaw's `models.*.fallbacks` accepts
+        # cross-provider refs as a pure config field, no runtime
+        # controller required.
+        text_model_config["fallbacks"] = [openrouter_model_ref(openrouter_model)]
+
     openai_plugin = {"enabled": True}
     plugin_entries = {
         "telegram": {"enabled": True},
@@ -1109,6 +1262,20 @@ def write_openclaw_config(
             "Tinyhat credential tools are disabled for this OpenClaw boot"
         )
 
+    agents_defaults: dict[str, object] = {
+        "workspace": workspace_dir,
+        "model": text_model_config,
+    }
+    # The `pi` agent runtime is the v0.5.x default — used for OpenRouter
+    # / API-key routes. Subscription mode (openai/gpt-5.5 + the
+    # native Codex app-server harness) is selected automatically by
+    # OpenClaw when an `openai-codex` profile is present, so we drop
+    # the explicit `pi` pin here — pinning it would force OpenClaw's
+    # built-in runtime instead of the Codex harness and silently
+    # negate the linked subscription.
+    if not use_chatgpt_subscription:
+        agents_defaults["agentRuntime"] = {"id": "pi"}
+
     config = {
         "gateway": {
             "mode": "local",
@@ -1117,13 +1284,7 @@ def write_openclaw_config(
             "auth": {"mode": "none"},
             "tailscale": {"mode": "off"},
         },
-        "agents": {
-            "defaults": {
-                "workspace": workspace_dir,
-                "model": text_model_config,
-                "agentRuntime": {"id": "pi"},
-            },
-        },
+        "agents": {"defaults": agents_defaults},
         "channels": {
             "telegram": {
                 "enabled": True,
@@ -1142,26 +1303,38 @@ def write_openclaw_config(
         "session": {"dmScope": "per-channel-peer"},
     }
     _ensure_tinyhat_secret_provider_config(config)
-    if openrouter_enabled:
+    if openrouter_enabled and not use_chatgpt_subscription:
         config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
             model_package
         )
     current_secrets = read_tinyhat_secrets_file()
-    _sync_openai_api_key_ref(config, current_secrets)
+    if not use_chatgpt_subscription:
+        # Subscription mode owns its auth via the per-agent
+        # `auth-profiles.json`; we explicitly leave the
+        # OpenAI-API-key SecretRef out so OpenClaw doesn't try to
+        # bypass the OAuth profile with a stale API key.
+        _sync_openai_api_key_ref(config, current_secrets)
     # Seed binding-managed env entries first so they are preserved when
     # runtime secrets are layered on top — see _apply_runtime_secret_env_block.
     if openrouter_enabled:
+        # Keep OPENROUTER_API_KEY in env even in subscription mode so
+        # the cross-provider fallback above has a working auth path.
         config["env"] = {TINYHAT_OPENROUTER_API_KEY_NAME: openrouter_key}
     _apply_runtime_secret_env_block(config, current_secrets)
     _atomic_write_json(config_path, config)
-    # Log only non-secret summary; never log the API key.
+    # Log only non-secret summary; never log the API key or OAuth token.
     log.info(
         "wrote OpenClaw config to %s "
-        "(bot=@%s owner=%s model=%s openrouter=%s openai_ref=%s)",
+        "(bot=@%s owner=%s model=%s subscription=%s openrouter=%s openai_ref=%s)",
         config_path,
         binding.get("telegram_bot_username"),
         owner_id,
         primary_model,
+        (
+            subscription_profile.get("__profile_id", "yes")
+            if use_chatgpt_subscription and subscription_profile
+            else "no"
+        ),
         "yes" if openrouter_enabled else "no",
         (
             "yes"

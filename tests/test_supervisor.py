@@ -718,5 +718,194 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         self.assertFalse(supervisor._stop_holder["stop"])
 
 
+def _subscription_binding(*, with_openrouter: bool) -> dict:
+    """Binding for a Computer opted into the ChatGPT BYO subscription."""
+    base = {
+        "telegram_owner_user_id": "123456",
+        "telegram_bot_token": "123456:ABC",
+        "telegram_bot_username": "Tinychattestbot",
+        "llm_auth_mode": "chatgpt_subscription",
+        "llm_model_ref": "openai/gpt-5.5",
+    }
+    if with_openrouter:
+        base.update(
+            {
+                "openrouter_api_key": "sk-or-v1-child",
+                "openrouter_base_url": "https://openrouter.ai/api/v1",
+                "openrouter_default_model": "openai/gpt-5.5",
+            }
+        )
+    return base
+
+
+def _seed_auth_profile(state_dir: str) -> None:
+    """Drop an openai-codex profile into the agent's auth store."""
+    path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": 1,
+                "profiles": {
+                    "openai-codex:owner@example.com": {
+                        "type": "oauth",
+                        "provider": "openai-codex",
+                        "access": "redacted-access",
+                        "refresh": "redacted-refresh",
+                        "expires": 9999999999999,
+                        "email": "owner@example.com",
+                    }
+                },
+            },
+            fh,
+        )
+
+
+def _seed_other_provider_profile(state_dir: str) -> None:
+    """Drop a non-openai-codex profile to test the wipe preserves it."""
+    path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "profiles": {}}, fh)
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["profiles"]["xai:other@example.com"] = {
+        "type": "oauth",
+        "provider": "xai",
+        "access": "x-redacted",
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+
+
+class ChatgptSubscriptionBranchTests(unittest.TestCase):
+    """Issue #23 — supervisor branches on auth-profile presence."""
+
+    def test_opted_in_with_profile_writes_subscription_config(self) -> None:
+        """auth-profile present + llm_auth_mode=chatgpt_subscription on
+        binding → openai/gpt-5.5, no `pi` runtime pin, no openai SecretRef,
+        cross-provider fallback to OpenRouter when its key is present."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+        defaults = config["agents"]["defaults"]
+        self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        # No `pi` pin — let OpenClaw auto-select the Codex harness.
+        self.assertNotIn("agentRuntime", defaults)
+        # No openai SecretRef — the OAuth profile owns auth.
+        self.assertNotIn("models", defaults.get("models", {}))
+        providers = (config.get("models") or {}).get("providers") or {}
+        self.assertNotIn("apiKey", providers.get("openai", {}))
+        # Cross-provider fallback to OpenRouter for rate-window relief.
+        self.assertEqual(
+            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
+        )
+        # OpenRouter env stays set so the fallback has an auth path.
+        self.assertEqual(
+            config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
+        )
+
+    def test_opted_in_without_profile_stays_on_default_config(self) -> None:
+        """llm_auth_mode=chatgpt_subscription but NO auth-profile yet →
+        default-mode (pi + OpenRouter) so the agent keeps replying while
+        the device-code flow is in flight or before the user has approved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # NO auth-profile file. Binding still says opted-in.
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+        defaults = config["agents"]["defaults"]
+        # Stays on `pi` because the credential isn't on disk yet.
+        self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+        self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
+
+    def test_default_binding_unchanged(self) -> None:
+        """Non-subscription Computers — the existing path stays
+        completely unaffected by this branch (regression guard)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # No auth-profile, no llm_auth_mode override.
+                supervisor.write_openclaw_config(
+                    _openrouter_binding(
+                        {
+                            "default_model": "openai/gpt-5.2",
+                            "default_role": "default",
+                            "enabled_roles": ["default"],
+                            "models": {"default": "openai/gpt-5.2"},
+                        }
+                    )
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+        defaults = config["agents"]["defaults"]
+        self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+
+
+class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
+    """Issue #23 — admin-driven wipe of the per-agent OAuth credential."""
+
+    def test_wipe_removes_openai_codex_and_preserves_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                state_dir = supervisor.openclaw_state_dir()
+                _seed_auth_profile(state_dir)
+                _seed_other_provider_profile(state_dir)
+
+                removed = supervisor.wipe_chatgpt_subscription_profile()
+                self.assertEqual(removed, ["openai-codex:owner@example.com"])
+
+                # File still exists with the non-openai-codex profile.
+                path = supervisor.openclaw_auth_profiles_path()
+                with open(path, encoding="utf-8") as fh:
+                    after = json.load(fh)
+                self.assertNotIn(
+                    "openai-codex:owner@example.com", after["profiles"]
+                )
+                self.assertIn("xai:other@example.com", after["profiles"])
+
+                # Second call is a no-op (idempotent).
+                self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
+
+    def test_wipe_on_missing_file_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
