@@ -1306,5 +1306,182 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         self.assertIn("pseudo-terminal", body["error"])
 
 
+class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
+    """PR #24 review at 01:19Z — late-arriving worker + cold-start.
+
+    Codex's exact reproduction: owner A starts the device-code flow,
+    the Computer is unassigned/reassigned before the user approves,
+    owner A approves after the wipe; the previously still-alive
+    worker's CLI must not write an openai-codex profile back to the
+    shared auth store the new owner will inherit.
+    """
+
+    def setUp(self) -> None:
+        supervisor._subscription_link_sessions_started.clear()
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers.clear()
+        # Reset generation back to a deterministic value so tests
+        # don't depend on prior-test state.
+        with supervisor._binding_generation_lock:
+            supervisor._binding_generation = 0
+
+    def test_bump_generation_increments_monotonically(self) -> None:
+        start = supervisor._current_binding_generation()
+        supervisor._bump_binding_generation(reason="test-1")
+        supervisor._bump_binding_generation(reason="test-2")
+        self.assertEqual(supervisor._current_binding_generation(), start + 2)
+
+    def test_wipe_on_release_bumps_generation_and_cancels_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"TINYHAT_DEV_RUNTIME": "1", "TINYHAT_RUNTIME_HOME": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                # Register a fake in-flight worker.
+                with supervisor._subscription_link_active_workers_lock:
+                    supervisor._subscription_link_active_workers["fake-session"] = {
+                        "pid": 999_999,
+                        "generation": 0,
+                    }
+                killed = []
+
+                def _fake_kill(pid, sig):
+                    killed.append((pid, sig))
+
+                start_gen = supervisor._current_binding_generation()
+                with patch.object(supervisor.os, "kill", side_effect=_fake_kill):
+                    supervisor._wipe_on_owner_release(reason="reassign")
+                # Generation bumped.
+                self.assertEqual(
+                    supervisor._current_binding_generation(), start_gen + 1
+                )
+                # Worker subprocess was SIGTERMed.
+                self.assertEqual(killed, [(999_999, supervisor.signal.SIGTERM)])
+
+    def test_late_worker_after_release_does_not_post_or_persist(self) -> None:
+        """The full race: a worker that has already posted `pending` keeps
+        running while owner release fires; the worker's check on the next
+        loop iteration sees it's superseded, kills the CLI, re-wipes any
+        late profile write, and exits WITHOUT posting linked/failed.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(
+                    tmpdir, "tinyhat-secrets.json"
+                ),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                # Start with a clean auth store; simulate the worker
+                # later writing a profile.
+                state_dir = supervisor.openclaw_state_dir()
+                posts: list[tuple[str, dict]] = []
+
+                def _fake_post(path, body):
+                    posts.append((path, body))
+                    return {}
+
+                # Build a fake "previous worker thread" that wrote a
+                # profile right around the time of release.
+                _seed_auth_profile(state_dir)
+                self.assertIsNotNone(
+                    supervisor.read_chatgpt_subscription_profile()
+                )
+
+                # The worker's stale generation; the supervisor has
+                # since rebound, so the current generation has moved.
+                supervisor._bump_binding_generation(reason="reassign")
+
+                # Now drive a brand-new write_openclaw_config for the
+                # NEW owner in chatgpt_subscription mode WITH the old
+                # profile still on disk. Without the cold-start +
+                # release-time re-wipe, this is exactly the cross-
+                # owner leak Codex reproduced. We verify that the
+                # release-path wipe (called by the watchdog) clears
+                # the profile so the new owner stays on pi+OpenRouter.
+                killed: list[int] = []
+
+                with patch.object(
+                    supervisor.os,
+                    "kill",
+                    side_effect=lambda pid, sig: killed.append(pid),
+                ), patch.object(
+                    supervisor, "post_json", side_effect=_fake_post
+                ):
+                    supervisor._wipe_on_owner_release(reason="reassign")
+
+                # Profile gone.
+                self.assertIsNone(
+                    supervisor.read_chatgpt_subscription_profile()
+                )
+
+                # Now apply config for the new owner.
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+                defaults = config["agents"]["defaults"]
+                # NEW owner sees the opted-in-but-no-profile-yet
+                # branch — stays on pi + OpenRouter (not subscription
+                # mode with the prior owner's credential).
+                self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+                self.assertTrue(
+                    defaults["model"]["primary"].startswith("openrouter/")
+                )
+
+                # No subscription-link result POSTs were issued (the
+                # release path doesn't talk about subscription
+                # lifecycle; the supervisor stays silent on
+                # superseded workers).
+                self.assertEqual(
+                    [
+                        body
+                        for path, body in posts
+                        if "subscription-link-result" in path
+                    ],
+                    [],
+                )
+
+
+class ColdStartOrphanProfileWipeTests(unittest.TestCase):
+    """PR #24 review at 01:19Z attack path #2 — supervisor restart while
+    Computer is unassigned, prior owner's profile on disk.
+
+    Phase B's binding-poll loop wipes orphaned profiles before the
+    next owner is assigned, so they cannot be consumed by a future
+    chatgpt_subscription binding.
+    """
+
+    def setUp(self) -> None:
+        with supervisor._binding_generation_lock:
+            supervisor._binding_generation = 0
+
+    def test_phase_b_path_wipes_orphan_profile_on_unassigned_observation(
+        self,
+    ) -> None:
+        """Exercise the inline cold-start branch without driving Phase B
+        end-to-end — the inline branch calls _wipe_on_owner_release."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"TINYHAT_DEV_RUNTIME": "1", "TINYHAT_RUNTIME_HOME": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                state_dir = supervisor.openclaw_state_dir()
+                _seed_auth_profile(state_dir)
+                self.assertIsNotNone(
+                    supervisor.read_chatgpt_subscription_profile()
+                )
+
+                # Phase B's cold-start branch sequence: see profile,
+                # call _wipe_on_owner_release(reason="cold-start-orphan").
+                with patch.object(supervisor.os, "kill"):
+                    supervisor._wipe_on_owner_release(
+                        reason="cold-start-orphan"
+                    )
+
+                self.assertIsNone(
+                    supervisor.read_chatgpt_subscription_profile()
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

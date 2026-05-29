@@ -1721,14 +1721,28 @@ def _wipe_on_owner_release(*, reason: str) -> None:
     leak the previous owner's OAuth credential to the next owner. The
     watchdog calls this from both the ``assigned=false`` branch
     (platform-driven unassign) and the owner-identity-changed branch
-    (admin reassign to a different account/owner).
+    (admin reassign to a different account/owner). Phase B also calls
+    it on cold-start when it observes ``assigned=false`` with an
+    orphaned profile on disk (PR #24 review at 01:19Z — second
+    attack path).
 
-    Logs only the non-secret profile id list (e.g.
-    ``["openai-codex:owner@example.com"]``) so the operator can see
-    which credential was dropped. Failures are warning-logged but
-    never raised — the rebind path must continue even if the auth
-    store is temporarily unreachable.
+    Three operations, in order:
+
+    1. **Bump the binding generation** so any in-flight device-code
+       worker thread under the previous binding observes the change
+       on its next loop iteration and exits without posting.
+    2. **SIGTERM any active CLI subprocesses** so a late OAuth-profile
+       write from the previous owner's worker cannot survive into the
+       next owner's auth store.
+    3. **Wipe the auth-profiles file** itself.
+
+    Steps 1+2 are the late-arriving-worker fix from the 01:19Z review.
+    Step 3 is the original wipe (issue #23 / step #2 of the prior
+    review). All three are best-effort: failures are warning-logged
+    but never raised so the rebind path keeps moving.
     """
+    _bump_binding_generation(reason=reason)
+    _cancel_active_subscription_link_workers()
     try:
         removed = wipe_chatgpt_subscription_profile()
     except Exception as exc:
@@ -1788,6 +1802,106 @@ def _report_cached_failed_revision() -> None:
 # restart, which is the right behavior — after restart the platform
 # can re-trigger and we'll spawn a fresh CLI for the same session id.
 _subscription_link_sessions_started: set[str] = set()
+
+# Cross-owner credential-leak guard (PR #24 review at 01:19Z).
+#
+# Two failure modes Codex reproduced on the prior head:
+#
+# 1. **Late-arriving worker writes profile after wipe.** Owner A
+#    starts the device-code flow; the daemon worker keeps polling
+#    auth.openai.com after the supervisor wipes for an
+#    unassign/reassign; owner A approves 30s later; the still-alive
+#    worker's CLI subprocess writes the OAuth profile back to the
+#    auth store the next owner is about to inherit.
+#
+# 2. **Cold-start picks up an orphaned profile.** A previous owner
+#    left a profile on disk, the supervisor restarted while the row
+#    was unassigned, Phase B sleeps on ``assigned=false`` without
+#    wiping, the next assigned owner's first
+#    ``write_openclaw_config`` picks up the prior profile.
+#
+# Both are real cross-owner credential leaks. The shared guard is a
+# monotonically increasing ``binding generation``: a new generation
+# is minted on every "the owner changed under us" event — Phase D's
+# initial binding lock-in, the watchdog's reassign / unassign
+# branches, and Phase B's cold-start observation of
+# ``assigned=false`` (which retroactively orphans whatever profile
+# is on disk).
+#
+# Active workers stamp their starting generation and check it before
+# every POST + at every loop iteration. If the supervisor's current
+# generation has moved past the worker's, the worker SIGTERMs its
+# CLI subprocess and exits without posting any terminal status (the
+# wipe path is the one that talks to the platform about owner
+# release; the worker bowing out silently is the right shape).
+_binding_generation: int = 0
+_binding_generation_lock = threading.Lock()
+# Registry: session_id -> (pid, generation) so the wipe path can
+# SIGTERM in-flight CLI subprocesses too. Cleared by the worker
+# itself on exit.
+_subscription_link_active_workers: dict[str, dict[str, int]] = {}
+_subscription_link_active_workers_lock = threading.Lock()
+
+
+def _current_binding_generation() -> int:
+    with _binding_generation_lock:
+        return _binding_generation
+
+
+def _bump_binding_generation(*, reason: str) -> int:
+    """Move the supervisor to a fresh binding generation.
+
+    Called on every owner-release / new-owner event. Any in-flight
+    subscription-link worker thread that started under an older
+    generation will exit on its next loop iteration without posting
+    a terminal status, so a late OAuth-profile write from the
+    previous owner's CLI cannot survive into the next owner's
+    auth-profiles.json.
+    """
+    global _binding_generation
+    with _binding_generation_lock:
+        _binding_generation += 1
+        new_gen = _binding_generation
+    log.info(
+        "binding generation bumped to %d (reason=%s)", new_gen, reason
+    )
+    return new_gen
+
+
+def _cancel_active_subscription_link_workers() -> None:
+    """SIGTERM any in-flight device-code CLIs.
+
+    Paired with ``_bump_binding_generation()`` on owner-release paths
+    (PR #24 review). Killing the CLI prevents it from writing an
+    OAuth profile after we've wiped the file, and the generation
+    bump ensures any worker that's about to call ``_post_failed`` /
+    ``_post_linked`` skips the POST instead of confusing the platform
+    with a status update on the previous owner's session.
+    """
+    with _subscription_link_active_workers_lock:
+        snapshot = list(_subscription_link_active_workers.items())
+    for session_id, info in snapshot:
+        pid = info.get("pid")
+        if not pid:
+            continue
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            log.info(
+                "subscription-link: SIGTERM in-flight CLI on owner release "
+                "session_id=%s pid=%s",
+                session_id,
+                pid,
+            )
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            log.warning(
+                "subscription-link: failed to SIGTERM in-flight CLI "
+                "session_id=%s pid=%s: %s",
+                session_id,
+                pid,
+                exc,
+            )
 
 
 def _strip_ansi_for_cli_capture(text: str) -> str:
@@ -1924,6 +2038,28 @@ def _run_chatgpt_device_code_login_in_thread(
     terminal_posted = False
     child_exit_code: int | None = None
 
+    # Cross-owner credential-leak guard (PR #24 review at 01:19Z).
+    # Capture the binding generation at worker spawn time; on each
+    # loop iteration we check whether the supervisor has moved past
+    # us (owner release / reassign / cold-start orphan-wipe) — if so
+    # we kill the CLI and exit silently without posting a terminal
+    # status. The wipe path is the one talking to the platform about
+    # owner release; the worker bowing out silently is the right
+    # shape (a stale linked/failed POST under the old session_id
+    # would be ignored by the platform's session-id check anyway, but
+    # silence is cleaner).
+    starting_generation = _current_binding_generation()
+
+    def _is_superseded() -> bool:
+        return _current_binding_generation() != starting_generation
+
+    # Register so _cancel_active_subscription_link_workers can find us.
+    with _subscription_link_active_workers_lock:
+        _subscription_link_active_workers[session_id] = {
+            "pid": pid,
+            "generation": starting_generation,
+        }
+
     def _child_alive() -> bool:
         nonlocal child_exit_code
         try:
@@ -1944,6 +2080,16 @@ def _run_chatgpt_device_code_login_in_thread(
         nonlocal terminal_posted
         if terminal_posted:
             return
+        if _is_superseded():
+            # Owner released or rebound under us; the wipe path is the
+            # one talking to the platform about this transition.
+            log.info(
+                "subscription-link: skipping failed POST — superseded "
+                "session_id=%s",
+                session_id,
+            )
+            terminal_posted = True
+            return
         _post_subscription_link_result(
             session_id=session_id, status="failed", error=reason
         )
@@ -1952,6 +2098,14 @@ def _run_chatgpt_device_code_login_in_thread(
     def _post_linked() -> None:
         nonlocal terminal_posted
         if terminal_posted:
+            return
+        if _is_superseded():
+            log.info(
+                "subscription-link: skipping linked POST — superseded "
+                "session_id=%s",
+                session_id,
+            )
+            terminal_posted = True
             return
         _post_subscription_link_result(session_id=session_id, status="linked")
         terminal_posted = True
@@ -1969,6 +2123,43 @@ def _run_chatgpt_device_code_login_in_thread(
     try:
         while True:
             elapsed = _time.monotonic() - started_at
+
+            # PR #24 review at 01:19Z: bail out fast on supersession
+            # so a late OAuth-profile write from this worker's CLI
+            # cannot survive into the next owner's auth store.
+            # The wipe path bumps the generation BEFORE wiping the
+            # file, then SIGTERMs our child; observing the bump here
+            # is the latest chance to also re-wipe in case the CLI
+            # managed to write a profile in the gap between the
+            # generation bump and SIGTERM landing.
+            if _is_superseded():
+                log.info(
+                    "subscription-link: worker superseded by binding rebind "
+                    "session_id=%s; killing CLI and exiting",
+                    session_id,
+                )
+                _kill_child()
+                # Re-wipe defensively in case the CLI raced the
+                # SIGTERM and wrote the OAuth profile just before
+                # dying.
+                try:
+                    removed = wipe_chatgpt_subscription_profile()
+                    if removed:
+                        log.info(
+                            "subscription-link: re-wiped late profile from "
+                            "superseded worker session_id=%s profiles=%s",
+                            session_id,
+                            removed,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "subscription-link: late re-wipe failed for "
+                        "superseded worker session_id=%s: %s",
+                        session_id,
+                        exc,
+                    )
+                terminal_posted = True  # short-circuit terminal POSTs
+                break
 
             # Overall window — OpenAI device codes expire after 15min.
             if elapsed > overall_timeout_s:
@@ -2116,6 +2307,8 @@ def _run_chatgpt_device_code_login_in_thread(
             f"Internal supervisor error while running the device-code login: {exc}"
         )
     finally:
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
         try:
             os.close(fd)
         except OSError:
@@ -2327,6 +2520,11 @@ def _run_one_binding_cycle() -> int:
     poll = BINDING_POLL_BASE_SECONDS
     empty_count = 0
     binding = None
+    # PR #24 review at 01:19Z — cold-start guard: a profile on disk
+    # without a current owner is orphaned by definition. Wipe at most
+    # once per Phase B entry to avoid pummeling the filesystem on
+    # every poll iteration of an idle Computer.
+    cold_start_wipe_attempted = False
     while binding is None and not _stop_holder["stop"]:
         try:
             resp = get_json("/hapi/v1/computers/me/binding")
@@ -2337,6 +2535,26 @@ def _run_one_binding_cycle() -> int:
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
             break
+        # Cold-start orphan-profile wipe (Codex 01:19Z attack path
+        # #2). If the supervisor restarted while the Computer was
+        # unassigned, any prior owner's openai-codex profile is now
+        # orphaned — wipe before the next assignment so the
+        # next owner cannot consume the stale credential. Runs at
+        # most once per Phase B entry; subsequent polls don't
+        # re-touch the filesystem.
+        if not cold_start_wipe_attempted:
+            cold_start_wipe_attempted = True
+            try:
+                if read_chatgpt_subscription_profile() is not None:
+                    log.info(
+                        "phase B cold-start: wiping orphaned openai-codex "
+                        "profile (no current owner)"
+                    )
+                    _wipe_on_owner_release(reason="cold-start-orphan")
+            except Exception as exc:
+                log.warning(
+                    "phase B cold-start orphan-wipe check failed: %s", exc
+                )
         empty_count += 1
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS
