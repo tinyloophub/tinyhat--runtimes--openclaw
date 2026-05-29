@@ -1232,5 +1232,79 @@ class PostSubscriptionLinkResultShapeTests(unittest.TestCase):
             )
 
 
+class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
+    """PR #24 review (Codex 00:29Z) — child exits before URL/code emit.
+
+    Reproduces Codex's exact case (`openclaw_bin='/bin/false'`) and
+    pins that the worker thread POSTs a terminal status=failed instead
+    of leaving the platform row stuck in pending forever.
+    """
+
+    def setUp(self) -> None:
+        supervisor._subscription_link_sessions_started.clear()
+
+    def test_quick_exit_posts_terminal_failed(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def _fake_post_json(path: str, body: dict) -> dict:
+            calls.append((path, body))
+            return {}
+
+        with patch.object(supervisor, "post_json", side_effect=_fake_post_json):
+            supervisor._run_chatgpt_device_code_login_in_thread(
+                session_id="quick-exit-test",
+                openclaw_bin="/bin/false",
+                url_emit_timeout_s=2.0,
+                overall_timeout_s=5.0,
+            )
+
+        # Exactly one POST, of type failed, with the standard endpoint.
+        self.assertEqual(len(calls), 1, f"expected 1 POST, got: {calls}")
+        path, body = calls[0]
+        self.assertEqual(
+            path, "/hapi/v1/computers/me/subscription-link-result"
+        )
+        self.assertEqual(body["session_id"], "quick-exit-test")
+        self.assertEqual(body["status"], "failed")
+        # The non-secret diagnostic should mention the security-settings
+        # hint AND include the CLI tail / exit code.
+        self.assertIn("device-code", body["error"].lower())
+        self.assertIn("exit code", body["error"].lower())
+
+    def test_quick_exit_posts_once_even_with_late_drain(self) -> None:
+        """No double-post: only ONE terminal status per invocation."""
+        calls: list[tuple[str, dict]] = []
+        with patch.object(
+            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
+        ):
+            supervisor._run_chatgpt_device_code_login_in_thread(
+                session_id="dup-guard-test",
+                openclaw_bin="/bin/false",
+                url_emit_timeout_s=2.0,
+                overall_timeout_s=5.0,
+            )
+        # Only one terminal post, not two.
+        terminal_posts = [b for _, b in calls if b.get("status") in ("linked", "failed")]
+        self.assertEqual(len(terminal_posts), 1, f"got {terminal_posts}")
+
+    def test_pty_fork_failure_posts_terminal_failed(self) -> None:
+        """If we can't even allocate a PTY, the platform still hears
+        about it (failed) instead of waiting indefinitely."""
+        calls: list[tuple[str, dict]] = []
+        import pty as pty_mod
+
+        with patch.object(
+            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
+        ), patch.object(pty_mod, "fork", side_effect=OSError("no ptys")):
+            supervisor._run_chatgpt_device_code_login_in_thread(
+                session_id="pty-fail-test",
+                openclaw_bin="/bin/false",
+            )
+        self.assertEqual(len(calls), 1)
+        path, body = calls[0]
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("pseudo-terminal", body["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

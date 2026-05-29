@@ -1845,30 +1845,34 @@ def _run_chatgpt_device_code_login_in_thread(
     user approves at auth.openai.com it emits ``OpenAI device code
     complete`` and writes the OAuth profile to disk.
 
-    The supervisor POSTs three lifecycle states back to the platform:
+    The supervisor POSTs **exactly one terminal lifecycle state** back
+    to the platform per invocation:
 
-    - ``pending`` once URL+code are parsed (so the Mini App / chat
-      tool can render them);
-    - ``linked`` once the CLI exits cleanly OR the auth-profile
-      shows up on disk for this provider;
-    - ``failed`` on timeout / non-zero exit / unparseable output,
-      with a non-secret diagnostic.
+    - ``linked`` once the CLI prints the success marker, OR the
+      auth-profile shows up on disk after the child exits;
+    - ``failed`` for: CLI exits before URL/code (Codex review on
+      PR #24), no URL/code by the URL-emit deadline, child exits
+      after URL/code but no profile written, overall 15-min window
+      expires.
+
+    Plus ``pending`` once URL+code are parsed (so the Mini App / chat
+    tool can render them) — that's not terminal; the terminal POST
+    follows later.
 
     Runs in a thread because the heartbeat loop must return within
     a few seconds — the device-code flow takes minutes (the user has
-    to open a browser and tap Approve).
+    to open a browser and tap Approve). The terminal POST clears
+    ``model_auth_status=pending`` on the backend so the platform
+    stops re-emitting the heartbeat command and the user can retry.
     """
+    import pty
+    import select
+    import time as _time
+
     log.info(
         "subscription-link: starting device-code login subprocess session_id=%s",
         session_id,
     )
-
-    # pty.fork is the simplest cross-Linux path; the child execs the
-    # openclaw CLI inside the controlling PTY. The parent reads stdout
-    # off the PTY fd.
-    import pty
-    import select
-    import time as _time
 
     try:
         pid, fd = pty.fork()
@@ -1883,9 +1887,7 @@ def _run_chatgpt_device_code_login_in_thread(
 
     if pid == 0:
         # Child: exec the CLI in the PTY. Env is inherited from the
-        # supervisor process — the supervisor was already running with
-        # the right OPENCLAW_STATE_DIR / OPENCLAW_CONFIG_PATH (see
-        # _openclaw_cli_env), so the resulting auth profile lands in
+        # supervisor process so the resulting auth profile lands in
         # this Computer's per-agent auth store.
         try:
             os.execvpe(
@@ -1910,7 +1912,8 @@ def _run_chatgpt_device_code_login_in_thread(
 
     # Parent: read stdout from the PTY in a loop. Match URL + Code,
     # POST pending. Then keep reading until "OpenAI device code
-    # complete" or the child exits.
+    # complete" or the child exits, and POST exactly one terminal
+    # result regardless of which way we exit the loop.
     started_at = _time.monotonic()
     buffer = ""
     url_line_re = re.compile(r"URL:\s*(https?://\S+)")
@@ -1918,18 +1921,56 @@ def _run_chatgpt_device_code_login_in_thread(
     url_value: str | None = None
     code_value: str | None = None
     pending_reported = False
-    linked_reported = False
+    terminal_posted = False
+    child_exit_code: int | None = None
 
     def _child_alive() -> bool:
+        nonlocal child_exit_code
         try:
-            wpid, _ = os.waitpid(pid, os.WNOHANG)
-            return wpid == 0
+            wpid, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             return False
+        if wpid == 0:
+            return True
+        # Decode the status — only the exit-code byte is non-secret
+        # diagnostic context we ever surface.
+        if os.WIFEXITED(status):
+            child_exit_code = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            child_exit_code = -os.WTERMSIG(status)
+        return False
+
+    def _post_failed(reason: str) -> None:
+        nonlocal terminal_posted
+        if terminal_posted:
+            return
+        _post_subscription_link_result(
+            session_id=session_id, status="failed", error=reason
+        )
+        terminal_posted = True
+
+    def _post_linked() -> None:
+        nonlocal terminal_posted
+        if terminal_posted:
+            return
+        _post_subscription_link_result(session_id=session_id, status="linked")
+        terminal_posted = True
+
+    def _kill_child() -> None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def _cli_tail() -> str:
+        stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
+        return stripped or "(empty)"
 
     try:
         while True:
             elapsed = _time.monotonic() - started_at
+
+            # Overall window — OpenAI device codes expire after 15min.
             if elapsed > overall_timeout_s:
                 log.info(
                     "subscription-link: device-code subprocess timed out after %.0fs "
@@ -1937,22 +1978,16 @@ def _run_chatgpt_device_code_login_in_thread(
                     elapsed,
                     session_id,
                 )
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                if not linked_reported:
-                    _post_subscription_link_result(
-                        session_id=session_id,
-                        status="failed",
-                        error="Device code timed out before the user approved at "
-                        "auth.openai.com (15-minute window). Ask to retry.",
-                    )
+                _kill_child()
+                _post_failed(
+                    "Device code timed out before the user approved at "
+                    "auth.openai.com (15-minute window). Ask to retry."
+                )
                 break
 
-            # If URL+code haven't arrived within the first 20s the
-            # CLI almost certainly errored before issuing the device
-            # code (network, OpenAI 4xx, disabled-for-account, etc.).
+            # No URL+code by the emit deadline — the CLI almost
+            # certainly errored before issuing the device code
+            # (network, OpenAI 4xx, disabled-for-account, etc.).
             if not pending_reported and elapsed > url_emit_timeout_s:
                 log.warning(
                     "subscription-link: no URL/code from CLI after %.0fs "
@@ -1960,21 +1995,15 @@ def _run_chatgpt_device_code_login_in_thread(
                     elapsed,
                     session_id,
                 )
-                stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
-                _post_subscription_link_result(
-                    session_id=session_id,
-                    status="failed",
-                    error=(
-                        "openclaw did not return a device code. Check that "
-                        "device-code login is enabled in your ChatGPT security "
-                        "settings (Settings -> Security -> Enable device code "
-                        "authorization for Codex). Recent CLI output: "
-                        f"{stripped or '(empty)'}"
-                    ),
+                _post_failed(
+                    "openclaw did not return a device code. Check that "
+                    "device-code login is enabled in your ChatGPT security "
+                    "settings (Settings -> Security -> Enable device code "
+                    "authorization for Codex). Recent CLI output: "
+                    f"{_cli_tail()}"
                 )
-                pending_reported = True  # don't loop on this
-                # Keep reading until the child exits so we drain its
-                # output and call wait() properly.
+                _kill_child()
+                break
 
             ready, _, _ = select.select([fd], [], [], 0.5)
             if fd in ready:
@@ -2008,7 +2037,7 @@ def _run_chatgpt_device_code_login_in_thread(
                                 user_code=code_value,
                             )
                             pending_reported = True
-                    if not linked_reported and (
+                    if not terminal_posted and (
                         "OpenAI device code complete" in buffer
                         or "Auth profile: openai-codex:" in buffer
                     ):
@@ -2017,14 +2046,13 @@ def _run_chatgpt_device_code_login_in_thread(
                             "session_id=%s; posting linked",
                             session_id,
                         )
-                        _post_subscription_link_result(
-                            session_id=session_id,
-                            status="linked",
-                        )
-                        linked_reported = True
+                        _post_linked()
+                        # Let the CLI exit naturally so the auth-
+                        # profile write finishes before we close the
+                        # PTY in the finally block.
 
             if not _child_alive():
-                # Drain any remaining stdout before bailing.
+                # Drain any remaining stdout before deciding.
                 try:
                     rest = os.read(fd, 4096)
                 except OSError:
@@ -2033,35 +2061,60 @@ def _run_chatgpt_device_code_login_in_thread(
                     buffer += _strip_ansi_for_cli_capture(
                         rest.decode("utf-8", errors="replace")
                     )
-                # Final decision: if we already posted linked we're
-                # done. If we posted pending but never saw success,
-                # we treat as failure with the CLI tail. If neither
-                # was posted, we already posted failed above.
-                if not linked_reported and pending_reported:
-                    # Re-check the on-disk auth profile as a fallback
-                    # — the CLI may have exited before our stdout
-                    # poll caught the success marker.
-                    profile = read_chatgpt_subscription_profile()
-                    if profile is not None:
+                # If we already posted linked we're done. Otherwise
+                # decide based on whether URL/code ever made it out:
+                if terminal_posted:
+                    break
+                if pending_reported:
+                    # CLI exited after issuing URL/code but before we
+                    # caught the success marker. Re-check disk —
+                    # OpenClaw may have finished writing the profile
+                    # in the gap.
+                    if read_chatgpt_subscription_profile() is not None:
                         log.info(
                             "subscription-link: CLI exited but auth-profile "
-                            "found on disk; posting linked session_id=%s",
+                            "present on disk; posting linked session_id=%s",
                             session_id,
                         )
-                        _post_subscription_link_result(
-                            session_id=session_id, status="linked"
-                        )
-                        linked_reported = True
+                        _post_linked()
                     else:
-                        stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
-                        _post_subscription_link_result(
-                            session_id=session_id,
-                            status="failed",
-                            error="Device-code login subprocess exited before "
-                            "the auth profile was written. Recent CLI output: "
-                            f"{stripped or '(empty)'}",
+                        _post_failed(
+                            "Device-code login subprocess exited before the "
+                            "auth profile was written "
+                            f"(exit code: {child_exit_code}). Recent CLI "
+                            f"output: {_cli_tail()}"
                         )
+                else:
+                    # Codex review on PR #24 — CLI exited BEFORE
+                    # URL/code were issued (broken openclaw_bin,
+                    # device-code disabled for the account, immediate
+                    # provider error). Must post a terminal failure
+                    # so the platform clears model_auth_status=pending
+                    # and the user can retry — otherwise the row stays
+                    # stuck and the in-memory session_id dedup blocks
+                    # the next heartbeat redelivery.
+                    log.warning(
+                        "subscription-link: CLI exited before issuing URL/code "
+                        "session_id=%s exit_code=%s",
+                        session_id,
+                        child_exit_code,
+                    )
+                    _post_failed(
+                        "The OpenClaw device-code login subprocess exited "
+                        f"before issuing a code (exit code: {child_exit_code}). "
+                        "Check that device-code login is enabled in your "
+                        "ChatGPT security settings (Settings -> Security -> "
+                        "Enable device code authorization for Codex), then "
+                        f"ask to retry. Recent CLI output: {_cli_tail()}"
+                    )
                 break
+    except Exception as exc:  # noqa: BLE001 — worker thread, must not crash silently
+        log.exception(
+            "subscription-link: worker thread crashed session_id=%s", session_id
+        )
+        _post_failed(
+            f"Internal supervisor error while running the device-code login: {exc}"
+        )
     finally:
         try:
             os.close(fd)
