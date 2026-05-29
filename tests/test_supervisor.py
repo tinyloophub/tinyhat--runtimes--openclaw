@@ -1537,5 +1537,142 @@ class ColdStartOrphanProfileWipeTests(unittest.TestCase):
         self.assertIn(424_242, killed_pids)
 
 
+class DispatcherCapturesGenerationSynchronouslyTests(unittest.TestCase):
+    """PR #24 review at 01:41Z — generation capture must precede thread spawn.
+
+    Codex's reproduction: stale `start_chatgpt_link` command lands;
+    dispatcher spawns thread; owner-release fires AFTER Thread.start()
+    but BEFORE the worker captures its `starting_generation`. With
+    the bug, the worker stamps the post-release generation as its
+    own and never observes supersession; with the fix, the
+    dispatcher captures synchronously and passes it in, so the
+    worker's first loop iteration immediately observes supersession.
+    """
+
+    def setUp(self) -> None:
+        supervisor._subscription_link_sessions_started.clear()
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers.clear()
+        with supervisor._binding_generation_lock:
+            supervisor._binding_generation = 0
+
+    def test_dispatcher_passes_starting_generation_explicitly(self) -> None:
+        """The handler must pass starting_generation as a kwarg, not let
+        the worker re-capture it. This pins the fix's contract: any
+        future refactor that drops the kwarg pass breaks this test."""
+        import threading as threading_mod
+
+        captured_kwargs: list[dict] = []
+
+        class _InlineThread:
+            def __init__(self, target, kwargs, name, daemon):
+                self._target = target
+                self._kwargs = kwargs
+
+            def start(self):
+                captured_kwargs.append(dict(self._kwargs))
+                # Don't actually run; we just want to inspect what
+                # the dispatcher would have passed.
+
+        with patch.object(
+            threading_mod, "Thread", _InlineThread
+        ):
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "race-test"}
+            )
+
+        self.assertEqual(len(captured_kwargs), 1)
+        kw = captured_kwargs[0]
+        self.assertEqual(kw["session_id"], "race-test")
+        self.assertIn("starting_generation", kw)
+        # And it matches the supervisor's current generation at
+        # dispatch time (since no race interposed in this test).
+        self.assertEqual(
+            kw["starting_generation"],
+            supervisor._current_binding_generation(),
+        )
+
+    def test_dispatcher_pre_registers_worker_before_thread_starts(self) -> None:
+        """The release path needs to see the worker registered even
+        before the thread runs, so a release in the dispatch-then-
+        thread-start gap can at least bump the generation and have
+        the worker observe it."""
+        import threading as threading_mod
+
+        observed_during_dispatch: list[dict[str, Any]] = []
+
+        class _ObservingThread:
+            def __init__(self, target, kwargs, name, daemon):
+                # Snapshot the registry as the dispatcher saw it just
+                # before Thread.start() — pre-registration MUST have
+                # already happened.
+                with supervisor._subscription_link_active_workers_lock:
+                    observed_during_dispatch.append(
+                        dict(supervisor._subscription_link_active_workers)
+                    )
+
+            def start(self):
+                pass  # don't run
+
+        with patch.object(
+            threading_mod, "Thread", _ObservingThread
+        ):
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "pre-reg-test"}
+            )
+
+        # By the time Thread() was constructed, the dispatcher had
+        # already pre-registered the worker entry (with pid=None).
+        self.assertIn("pre-reg-test", observed_during_dispatch[0])
+        entry = observed_during_dispatch[0]["pre-reg-test"]
+        self.assertIsNone(entry["pid"])  # forked PID not known yet
+        self.assertEqual(
+            entry["generation"], supervisor._current_binding_generation()
+        )
+
+    def test_worker_pre_fork_check_exits_silently_on_supersession(self) -> None:
+        """If owner-release fires between dispatcher and the worker
+        actually running, the worker's pre-fork check exits without
+        forking and without posting a terminal status."""
+        # Pre-register as the dispatcher would have.
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers["pre-fork-race"] = {
+                "pid": None,
+                "generation": 5,
+            }
+        # Simulate release: bump generation past 5.
+        with supervisor._binding_generation_lock:
+            supervisor._binding_generation = 10
+
+        # Patch pty.fork so the test FAILS LOUDLY if we somehow reach
+        # it (we shouldn't — the pre-fork check should bail first).
+        posts: list[tuple[str, dict]] = []
+        import pty as pty_mod
+
+        def _should_not_fork():
+            raise AssertionError(
+                "Pre-fork supersession check failed to short-circuit"
+            )
+
+        with patch.object(pty_mod, "fork", side_effect=_should_not_fork), \
+             patch.object(
+                 supervisor, "post_json",
+                 side_effect=lambda p, b: posts.append((p, b)) or {},
+             ):
+            supervisor._run_chatgpt_device_code_login_in_thread(
+                session_id="pre-fork-race",
+                starting_generation=5,  # stale!
+            )
+
+        # No fork was attempted; no terminal POST was issued.
+        self.assertEqual(posts, [])
+        # Registry was cleaned up.
+        with supervisor._subscription_link_active_workers_lock:
+            self.assertNotIn(
+                "pre-fork-race",
+                supervisor._subscription_link_active_workers,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

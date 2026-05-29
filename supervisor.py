@@ -1943,6 +1943,7 @@ def _post_subscription_link_result(
 def _run_chatgpt_device_code_login_in_thread(
     *,
     session_id: str,
+    starting_generation: int | None = None,
     openclaw_bin: str = "openclaw",
     url_emit_timeout_s: float = 20.0,
     overall_timeout_s: float = 900.0,  # 15 min = device-code expiry
@@ -1983,21 +1984,60 @@ def _run_chatgpt_device_code_login_in_thread(
     import select
     import time as _time
 
+    # PR #24 review at 01:41Z — defensive default + pre-fork check.
+    # If the dispatcher didn't pass `starting_generation` (legacy call
+    # path / direct test invocation), fall back to capturing now. The
+    # production dispatcher always passes it explicitly.
+    if starting_generation is None:
+        starting_generation = _current_binding_generation()
+
     log.info(
-        "subscription-link: starting device-code login subprocess session_id=%s",
+        "subscription-link: starting device-code login subprocess "
+        "session_id=%s starting_generation=%d",
         session_id,
+        starting_generation,
     )
+
+    # Pre-fork supersession check: if owner-release fired between
+    # dispatcher's Thread.start() and us actually running, bail out
+    # WITHOUT forking. Deregister so the active-workers map stays
+    # clean.
+    if _current_binding_generation() != starting_generation:
+        log.info(
+            "subscription-link: superseded before fork — exiting "
+            "session_id=%s (starting=%d current=%d)",
+            session_id,
+            starting_generation,
+            _current_binding_generation(),
+        )
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
+        return
 
     try:
         pid, fd = pty.fork()
     except OSError as exc:
         log.warning("pty.fork failed for session_id=%s: %s", session_id, exc)
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
         _post_subscription_link_result(
             session_id=session_id,
             status="failed",
             error=f"could not allocate a pseudo-terminal for the OpenClaw CLI: {exc}",
         )
         return
+
+    # Worker is past the fork; update the registry entry with the
+    # real PID so `_cancel_active_subscription_link_workers` can
+    # SIGTERM us if owner-release fires after this point. (Before
+    # this update the dispatcher pre-registered with pid=None; the
+    # cancellation helper skips those entries — the pre-fork check
+    # above and the main-loop check below are the safety nets for
+    # that brief window.)
+    with _subscription_link_active_workers_lock:
+        entry = _subscription_link_active_workers.get(session_id)
+        if entry is not None:
+            entry["pid"] = pid
 
     if pid == 0:
         # Child: exec the CLI in the PTY. Env is inherited from the
@@ -2038,27 +2078,22 @@ def _run_chatgpt_device_code_login_in_thread(
     terminal_posted = False
     child_exit_code: int | None = None
 
-    # Cross-owner credential-leak guard (PR #24 review at 01:19Z).
-    # Capture the binding generation at worker spawn time; on each
-    # loop iteration we check whether the supervisor has moved past
-    # us (owner release / reassign / cold-start orphan-wipe) — if so
-    # we kill the CLI and exit silently without posting a terminal
-    # status. The wipe path is the one talking to the platform about
-    # owner release; the worker bowing out silently is the right
-    # shape (a stale linked/failed POST under the old session_id
-    # would be ignored by the platform's session-id check anyway, but
-    # silence is cleaner).
-    starting_generation = _current_binding_generation()
+    # Cross-owner credential-leak guard (PR #24 reviews at 01:19Z +
+    # 01:41Z). The `starting_generation` parameter is the binding
+    # generation in effect when the dispatcher decided to spawn this
+    # worker — captured synchronously up there, NOT here, so a race
+    # between Thread.start() and this line can't let us stamp a
+    # post-release generation as our own. On each loop iteration we
+    # check whether the supervisor has moved past us (owner release /
+    # reassign / cold-start orphan-wipe) — if so we kill the CLI and
+    # exit silently without posting a terminal status. The wipe path
+    # is the one talking to the platform about owner release; the
+    # worker bowing out silently is the right shape (a stale linked/
+    # failed POST under the old session_id would be ignored by the
+    # platform's session-id check anyway, but silence is cleaner).
 
     def _is_superseded() -> bool:
         return _current_binding_generation() != starting_generation
-
-    # Register so _cancel_active_subscription_link_workers can find us.
-    with _subscription_link_active_workers_lock:
-        _subscription_link_active_workers[session_id] = {
-            "pid": pid,
-            "generation": starting_generation,
-        }
 
     def _child_alive() -> bool:
         nonlocal child_exit_code
@@ -2332,6 +2367,23 @@ def handle_start_chatgpt_link_command(command: dict) -> None:
     session_id within a supervisor lifetime — re-delivery of the same
     command (which the backend keeps emitting until ``status=pending``
     is reported) does NOT spawn a second CLI.
+
+    Captures the binding generation synchronously here (in the
+    dispatcher's thread) and passes it into the worker. The previous
+    version captured inside the worker, which left a race window
+    between thread.start() and the capture: if owner-release ran in
+    that gap, the worker would stamp the already-bumped generation
+    as its own and never observe supersession (PR #24 review at
+    01:41Z — Codex reproduced this by injecting a wipe between
+    pty.fork() and the worker's generation capture).
+
+    Also registers the worker in `_subscription_link_active_workers`
+    BEFORE Thread.start() so `_cancel_active_subscription_link_workers`
+    can at least see the entry exists, even though `pid` is unknown
+    until pty.fork() returns. The worker fills in `pid` once the
+    child is forked. SIGTERM is skipped on entries with `pid=None`
+    (the worker's pre-fork + main-loop supersession checks are the
+    backstop for that brief window).
     """
     import threading
 
@@ -2347,9 +2399,24 @@ def handle_start_chatgpt_link_command(command: dict) -> None:
         return
     _subscription_link_sessions_started.add(session_id)
 
+    # Stamp the binding generation we were dispatched under, and
+    # pre-register the worker (pid unknown — the forked child will
+    # update it). Doing this synchronously here means a release that
+    # fires between this point and the worker thread actually
+    # running will be observable via the captured generation.
+    starting_generation = _current_binding_generation()
+    with _subscription_link_active_workers_lock:
+        _subscription_link_active_workers[session_id] = {
+            "pid": None,
+            "generation": starting_generation,
+        }
+
     threading.Thread(
         target=_run_chatgpt_device_code_login_in_thread,
-        kwargs={"session_id": session_id},
+        kwargs={
+            "session_id": session_id,
+            "starting_generation": starting_generation,
+        },
         name=f"chatgpt-link-{session_id[:8]}",
         daemon=True,
     ).start()
