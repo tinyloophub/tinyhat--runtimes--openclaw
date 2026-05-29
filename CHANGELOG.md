@@ -5,6 +5,107 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.0
+
+### Added
+
+- Recognize a new `chatgpt_subscription` value on the `llm_auth_mode`
+  field of `/me/binding`. When the binding is in subscription mode AND
+  an `openai-codex:*` OAuth profile is present on disk under the
+  per-agent auth store, the supervisor writes a subscription-mode
+  `openclaw.json` for that agent: `models.<agent>` is set to
+  `openai/gpt-5.5` (configurable via the binding's `llm_model_ref`),
+  the `pi` `agentRuntime` pin is dropped so OpenClaw auto-selects the
+  native Codex app-server harness, the OpenAI-API-key SecretRef is
+  omitted (the OAuth profile owns auth), and a cross-provider
+  fallback to OpenRouter is configured when the binding still carries
+  one — covers per-account Codex rate-window hits without taking the
+  Computer offline. Non-subscription Computers keep today's `pi` +
+  OpenRouter path unchanged.
+- New `start_chatgpt_link` heartbeat command handler. When the
+  platform emits this command, the supervisor spawns
+  `openclaw models auth login --provider openai-codex --device-code`
+  inside a PTY (the CLI rejects non-TTY stdin even with
+  `--device-code`), reads stdout, regex-matches the `URL:` + `Code:`
+  lines from OpenClaw's device-code panel, and POSTs the URL +
+  9-character user code back via the existing
+  `/me/subscription-link-result` endpoint so the Mini App / chat tool
+  can render them. The subprocess keeps polling auth.openai.com in
+  the background; on success or failure the supervisor POSTs exactly
+  one terminal status (`linked` or `failed`) and falls back to the
+  on-disk auth-profile check as a belt-and-braces success signal.
+- New `read_chatgpt_subscription_profile()` and
+  `wipe_chatgpt_subscription_profile()` helpers that read / atomically
+  edit `${OPENCLAW_STATE_DIR}/agents/<agentId>/agent/auth-profiles.json`.
+  The wipe preserves any non-`openai-codex` profiles in the file
+  (`.tmp` + rename, mode `0600` on the replacement).
+
+### Changed
+
+- The watchdog's `_binding_signature()` now includes `llm_auth_mode`
+  + `llm_model_ref` so a `platform_credits` → subscription flip on
+  the same binding triggers a rebind. Owner-identity changes are
+  tracked separately on `_owner_identity_signature()` so a mode flip
+  for the same owner triggers a rebind without wiping the OAuth
+  credential they just linked.
+- The watchdog's owner-release path is now a single
+  `_wipe_on_owner_release(reason)` helper that performs three
+  operations in order: bump the binding generation, SIGTERM all
+  in-flight subscription-link CLI subprocesses, then wipe the
+  auth-profiles file. Wired into `assigned=false`, owner-identity-
+  change, and Phase B cold-start branches.
+
+### Fixed
+
+- Cross-owner credential-leak guard: a monotonically-increasing
+  `_binding_generation` counter + `_subscription_link_active_workers`
+  registry let the watchdog cancel in-flight device-code workers
+  before a late OAuth-profile write can land in the next owner's
+  auth store. The dispatcher captures `starting_generation`
+  synchronously and pre-registers the worker with `pid=None` so a
+  release that fires in the dispatch → thread-start gap is still
+  observable; the worker's pre-fork + main-loop supersession checks
+  exit silently (without posting `linked`/`failed`) when the
+  supervisor has moved past their captured generation. Defensive
+  late re-wipe inside the worker covers the SIGTERM-vs-CLI-write
+  race in the brief unregistered-pid window.
+- Quick-exit handling: when the device-code CLI exits before printing
+  URL + code (broken `openclaw_bin`, device-code disabled on the
+  user's ChatGPT account, immediate provider error), the supervisor
+  now POSTs exactly one terminal `failed` result with a non-secret
+  diagnostic (security-settings hint + child exit code) instead of
+  silently leaving the platform row stuck in `pending` forever.
+- Phase B's binding-poll loop runs `_wipe_on_owner_release` on the
+  first `assigned=false` observation per Phase B entry —
+  unconditionally, not gated on profile presence — so a device-code
+  worker that's still polling but hasn't yet written a profile gets
+  cancelled before the user approves.
+- The dispatcher now captures the binding generation synchronously
+  (before `Thread.start()`) and passes it into the worker as an
+  explicit kwarg. The worker no longer re-captures inside the
+  thread, closing the post-fork race where owner-release could fire
+  in the dispatch → in-worker-capture gap and the worker would stamp
+  the already-bumped generation as its own.
+
+### Coupled platform / plugin work
+
+This release wires the runtime side of a slice that spans two
+companion repos. Both must ship together for end-to-end behavior:
+
+- Tinyloop platform PR — adds the Computer-callable
+  `/me/subscription-link/{start,status,revert}` routes the chat-tool
+  body calls, plus the model-auth state on the Computer row.
+- `tinyhat-ai/tinyhat` plugin PR — adds the
+  `tinyhat_open_chatgpt_subscription_link` and
+  `tinyhat_revert_to_platform_credits` chat tools that drive the
+  three routes above. The plugin itself never spawns a subprocess
+  (OpenClaw's plugin install rejects `child_process`); the
+  subprocess work lives here in the runtime.
+
+The 0.10.0 supervisor is backward-compatible with bindings that omit
+`llm_auth_mode`: those continue on the existing `pi` + OpenRouter
+path unchanged.
+
 ## 0.9.1
 
 ### Fixed
