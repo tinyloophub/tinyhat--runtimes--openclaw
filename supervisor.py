@@ -59,14 +59,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from typing import Any
 
 # Path conventions on the VM. Pinned here so the gateway systemd
 # unit (written by bootstrap.sh) and this supervisor stay in
@@ -79,6 +82,20 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
+
+# ChatGPT BYO subscription (issue #23): when an `openai-codex` OAuth
+# profile is present in this Computer's per-agent auth store, the
+# supervisor swaps the default `pi`+OpenRouter config for the native
+# Codex app-server harness pointed at `openai/gpt-5.5`. The OAuth
+# credential is born on the Computer (either from the Mini App-driven
+# heartbeat-command flow OR from the chat-driven plugin tool running
+# the device-code CLI in-sandbox); the supervisor only reads the
+# resulting file shape on disk.
+CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
+CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+# Default agent id mirrors the platform's single-agent assumption today.
+# The auth store is per-agent inside the per-Computer OpenClaw state dir.
+DEFAULT_OPENCLAW_AGENT_ID = "main"
 TINYHAT_SECRETS_PROVIDER = "tinyhat"
 TINYHAT_OPENAI_API_KEY_NAME = "OPENAI_API_KEY"
 TINYHAT_OPENAI_API_KEY_POINTER = "/OPENAI_API_KEY"
@@ -1000,6 +1017,111 @@ def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
     }
 
 
+def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> str:
+    """Resolve the per-agent OAuth auth-store path inside this Computer.
+
+    Mirrors OpenClaw's own layout: under ``OPENCLAW_STATE_DIR`` (the
+    supervisor resolves this to ``/var/lib/tinyhat-openclaw`` in
+    production, or the per-worktree dev dir when ``--dev`` is in
+    effect), each agent has its own ``agents/<id>/agent/`` directory
+    with an ``auth-profiles.json`` file (mode 0600) that stores OAuth
+    bundles per provider id. The chat-driven device-code login (via
+    the Tinyhat plugin's ``tinyhat_open_chatgpt_subscription_link``
+    tool) writes here; the Mini App-driven flow also writes here once
+    the supervisor's PTY subprocess completes its poll. Per-agent
+    isolation means a reassign / recycle of the Computer wipes this
+    file (issue #23).
+    """
+    return os.path.join(
+        openclaw_state_dir(), "agents", agent_id, "agent", "auth-profiles.json"
+    )
+
+
+def read_chatgpt_subscription_profile(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> dict | None:
+    """Return the ``openai-codex:*`` profile entry, if present.
+
+    Returns the first matching profile dict from
+    ``auth-profiles.json`` (typically there's exactly one — OpenClaw's
+    profile id is ``openai-codex:<email>`` and the device-code flow
+    only mints one per Computer). Returns ``None`` when the file is
+    missing, malformed, or has no ``openai-codex:*`` entries.
+
+    The OAuth token fields (``access``, ``refresh``, ``id``) ARE present
+    in the returned dict — callers must NOT log them. The supervisor's
+    own use of this function is metadata-only (presence check + email
+    for logging); the actual OAuth refresh is OpenClaw's own concern.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile_id, str) or not isinstance(profile, dict):
+            continue
+        if profile_id.startswith(f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"):
+            # Return a shallow copy with the profile id so callers can
+            # log it without re-reading.
+            out = dict(profile)
+            out["__profile_id"] = profile_id
+            return out
+    return None
+
+
+def wipe_chatgpt_subscription_profile(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> list[str]:
+    """Delete the ``openai-codex:*`` entries from the per-agent auth store.
+
+    Used on unassign / reassign / recycle (the chat plugin's
+    ``tinyhat_revert_to_platform_credits`` tool also performs this
+    wipe directly from inside the sandbox; the supervisor's path here
+    is the admin-driven case where the platform tells the Computer to
+    drop the credential without the agent being involved).
+
+    Returns the list of profile ids removed (empty when no matching
+    profile existed). Preserves any non-``openai-codex`` profiles in
+    the file. Writes atomically via a ``.tmp`` rename so a partial
+    write can't strand other-provider entries.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    removed: list[str] = []
+    for profile_id in list(profiles.keys()):
+        if isinstance(profile_id, str) and profile_id.startswith(
+            f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"
+        ):
+            del profiles[profile_id]
+            removed.append(profile_id)
+    if not removed:
+        return []
+    version = data.get("version") if isinstance(data.get("version"), int) else 1
+    next_data = {"version": version, "profiles": profiles}
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(next_data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    return removed
+
+
 def write_openclaw_config(
     binding: dict,
     *,
@@ -1084,16 +1206,50 @@ def write_openclaw_config(
 
     openrouter_enabled = bool(openrouter_key and openrouter_base)
     model_package = openrouter_model_package() if openrouter_enabled else {}
-    primary_model = (
-        openrouter_model_ref(openrouter_model)
-        if openrouter_enabled
-        else OPENCLAW_DEFAULT_MODEL
+
+    # ── ChatGPT BYO subscription branch (issue #23) ─────────────────
+    # The platform may advertise `llm_auth_mode = chatgpt_subscription`
+    # on the binding to signal "the owner has opted in" (Mini App
+    # path), but the source of truth for "is a credential actually
+    # present" is the per-agent OAuth auth store on disk. The chat
+    # plugin's tool writes there directly; the Mini App's
+    # heartbeat-command flow has the supervisor write there. Either
+    # way, the supervisor flips to subscription-mode config only when
+    # the credential is on disk — otherwise an opted-in but
+    # not-yet-linked Computer would lose its OpenRouter fallback
+    # before the user has even approved.
+    binding_llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits")
+    binding_llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
+    subscription_profile = read_chatgpt_subscription_profile()
+    use_chatgpt_subscription = (
+        binding_llm_auth_mode == "chatgpt_subscription"
+        and subscription_profile is not None
     )
+
+    if use_chatgpt_subscription:
+        primary_model = binding_llm_model_ref or CHATGPT_SUBSCRIPTION_MODEL
+    else:
+        primary_model = (
+            openrouter_model_ref(openrouter_model)
+            if openrouter_enabled
+            else OPENCLAW_DEFAULT_MODEL
+        )
     text_model_config: dict[str, object] = {"primary": primary_model}
-    if openrouter_enabled:
+    if openrouter_enabled and not use_chatgpt_subscription:
         fallbacks = openrouter_model_fallbacks(model_package)
         if fallbacks:
             text_model_config["fallbacks"] = fallbacks
+    elif use_chatgpt_subscription and openrouter_enabled:
+        # Cross-provider fallback when the platform-credits OpenRouter
+        # rail is still available on the binding — covers the case
+        # where the subscription hits a per-account rate window
+        # (5h / weekly) and the agent should keep replying via the
+        # funded path instead of going dark. Tinyloop's preflight
+        # spike confirmed OpenClaw's `models.*.fallbacks` accepts
+        # cross-provider refs as a pure config field, no runtime
+        # controller required.
+        text_model_config["fallbacks"] = [openrouter_model_ref(openrouter_model)]
+
     openai_plugin = {"enabled": True}
     plugin_entries = {
         "telegram": {"enabled": True},
@@ -1109,6 +1265,20 @@ def write_openclaw_config(
             "Tinyhat credential tools are disabled for this OpenClaw boot"
         )
 
+    agents_defaults: dict[str, object] = {
+        "workspace": workspace_dir,
+        "model": text_model_config,
+    }
+    # The `pi` agent runtime is the v0.5.x default — used for OpenRouter
+    # / API-key routes. Subscription mode (openai/gpt-5.5 + the
+    # native Codex app-server harness) is selected automatically by
+    # OpenClaw when an `openai-codex` profile is present, so we drop
+    # the explicit `pi` pin here — pinning it would force OpenClaw's
+    # built-in runtime instead of the Codex harness and silently
+    # negate the linked subscription.
+    if not use_chatgpt_subscription:
+        agents_defaults["agentRuntime"] = {"id": "pi"}
+
     config = {
         "gateway": {
             "mode": "local",
@@ -1117,13 +1287,7 @@ def write_openclaw_config(
             "auth": {"mode": "none"},
             "tailscale": {"mode": "off"},
         },
-        "agents": {
-            "defaults": {
-                "workspace": workspace_dir,
-                "model": text_model_config,
-                "agentRuntime": {"id": "pi"},
-            },
-        },
+        "agents": {"defaults": agents_defaults},
         "channels": {
             "telegram": {
                 "enabled": True,
@@ -1142,26 +1306,38 @@ def write_openclaw_config(
         "session": {"dmScope": "per-channel-peer"},
     }
     _ensure_tinyhat_secret_provider_config(config)
-    if openrouter_enabled:
+    if openrouter_enabled and not use_chatgpt_subscription:
         config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
             model_package
         )
     current_secrets = read_tinyhat_secrets_file()
-    _sync_openai_api_key_ref(config, current_secrets)
+    if not use_chatgpt_subscription:
+        # Subscription mode owns its auth via the per-agent
+        # `auth-profiles.json`; we explicitly leave the
+        # OpenAI-API-key SecretRef out so OpenClaw doesn't try to
+        # bypass the OAuth profile with a stale API key.
+        _sync_openai_api_key_ref(config, current_secrets)
     # Seed binding-managed env entries first so they are preserved when
     # runtime secrets are layered on top — see _apply_runtime_secret_env_block.
     if openrouter_enabled:
+        # Keep OPENROUTER_API_KEY in env even in subscription mode so
+        # the cross-provider fallback above has a working auth path.
         config["env"] = {TINYHAT_OPENROUTER_API_KEY_NAME: openrouter_key}
     _apply_runtime_secret_env_block(config, current_secrets)
     _atomic_write_json(config_path, config)
-    # Log only non-secret summary; never log the API key.
+    # Log only non-secret summary; never log the API key or OAuth token.
     log.info(
         "wrote OpenClaw config to %s "
-        "(bot=@%s owner=%s model=%s openrouter=%s openai_ref=%s)",
+        "(bot=@%s owner=%s model=%s subscription=%s openrouter=%s openai_ref=%s)",
         config_path,
         binding.get("telegram_bot_username"),
         owner_id,
         primary_model,
+        (
+            subscription_profile.get("__profile_id", "yes")
+            if use_chatgpt_subscription and subscription_profile
+            else "no"
+        ),
         "yes" if openrouter_enabled else "no",
         (
             "yes"
@@ -1491,9 +1667,14 @@ def _binding_signature(binding: dict) -> tuple:
     re-assigned the same VPS (different bot, different account,
     different owner, or new vault row with a fresh token, or an
     OpenRouter child key + base URL + default model that appeared
-    after a transient vault miss on the first poll). The supervisor
-    must drop its in-memory state and re-run Phase B so openclaw.json
-    gets rewritten with the now-present provider config.
+    after a transient vault miss on the first poll), OR the owner
+    flipped the LLM auth mode (issue #23 — adding
+    ``llm_auth_mode`` / ``llm_model_ref`` so a platform-credits ->
+    chatgpt_subscription flip triggers rebind and the supervisor
+    rewrites openclaw.json instead of keeping the old
+    ``pi`` + OpenRouter config running). The supervisor must drop
+    its in-memory state and re-run Phase B so openclaw.json gets
+    rewritten with the now-present provider config.
     """
     return (
         str(binding.get("telegram_bot_user_id") or ""),
@@ -1505,7 +1686,78 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
         json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
+        # ChatGPT BYO subscription (issue #23) — mode/model_ref live
+        # on the binding so the watchdog notices a flip and triggers
+        # a rebind (otherwise write_openclaw_config never runs after
+        # the platform changes the auth mode).
+        str(binding.get("llm_auth_mode") or "platform_credits"),
+        str(binding.get("llm_model_ref") or ""),
     )
+
+
+def _owner_identity_signature(binding: dict) -> tuple:
+    """Owner-identity subset of the binding signature (issue #23).
+
+    Same shape as ``_binding_signature`` but trimmed to the fields
+    that change ONLY on owner-identity changes — i.e. an admin
+    reassign / unassign / recycle hands the Computer to a different
+    user. Mode flips (``llm_auth_mode`` / ``llm_model_ref``) and
+    OpenRouter key rotation for the SAME owner do not move this
+    tuple, so they don't trigger the per-agent OAuth auth-store
+    wipe — only owner-identity changes do (issue #23 wipe contract).
+    """
+    return (
+        str(binding.get("telegram_bot_user_id") or ""),
+        str(binding.get("telegram_bot_username") or ""),
+        str(binding.get("telegram_owner_user_id") or ""),
+        str(binding.get("account_handle") or ""),
+    )
+
+
+def _wipe_on_owner_release(*, reason: str) -> None:
+    """Wipe the per-agent OAuth auth-store when the Computer changes hands.
+
+    Issue #23 — admin-driven unassign / reassign / recycle must not
+    leak the previous owner's OAuth credential to the next owner. The
+    watchdog calls this from both the ``assigned=false`` branch
+    (platform-driven unassign) and the owner-identity-changed branch
+    (admin reassign to a different account/owner). Phase B also calls
+    it on cold-start when it observes ``assigned=false`` with an
+    orphaned profile on disk (PR #24 review at 01:19Z — second
+    attack path).
+
+    Three operations, in order:
+
+    1. **Bump the binding generation** so any in-flight device-code
+       worker thread under the previous binding observes the change
+       on its next loop iteration and exits without posting.
+    2. **SIGTERM any active CLI subprocesses** so a late OAuth-profile
+       write from the previous owner's worker cannot survive into the
+       next owner's auth store.
+    3. **Wipe the auth-profiles file** itself.
+
+    Steps 1+2 are the late-arriving-worker fix from the 01:19Z review.
+    Step 3 is the original wipe (issue #23 / step #2 of the prior
+    review). All three are best-effort: failures are warning-logged
+    but never raised so the rebind path keeps moving.
+    """
+    _bump_binding_generation(reason=reason)
+    _cancel_active_subscription_link_workers()
+    try:
+        removed = wipe_chatgpt_subscription_profile()
+    except Exception as exc:
+        log.warning(
+            "binding watchdog: subscription auth-store wipe failed on %s: %s",
+            reason,
+            exc,
+        )
+        return
+    if removed:
+        log.info(
+            "binding watchdog: wiped subscription auth-store on %s (profiles=%s)",
+            reason,
+            removed,
+        )
 
 
 def _command_revision(command: dict) -> int | None:
@@ -1541,6 +1793,633 @@ def _report_cached_failed_revision() -> None:
         diagnostic=diagnostic,
     )
     _config_apply_state["failed_reported"] = True
+
+
+# In-memory record of ChatGPT-subscription link sessions we've
+# already kicked off in this supervisor lifetime. Keeps idempotency
+# tight when the platform re-delivers the heartbeat command before
+# the result POST has landed (issue #23). Cleared on supervisor
+# restart, which is the right behavior — after restart the platform
+# can re-trigger and we'll spawn a fresh CLI for the same session id.
+_subscription_link_sessions_started: set[str] = set()
+
+# Cross-owner credential-leak guard (PR #24 review at 01:19Z).
+#
+# Two failure modes Codex reproduced on the prior head:
+#
+# 1. **Late-arriving worker writes profile after wipe.** Owner A
+#    starts the device-code flow; the daemon worker keeps polling
+#    auth.openai.com after the supervisor wipes for an
+#    unassign/reassign; owner A approves 30s later; the still-alive
+#    worker's CLI subprocess writes the OAuth profile back to the
+#    auth store the next owner is about to inherit.
+#
+# 2. **Cold-start picks up an orphaned profile.** A previous owner
+#    left a profile on disk, the supervisor restarted while the row
+#    was unassigned, Phase B sleeps on ``assigned=false`` without
+#    wiping, the next assigned owner's first
+#    ``write_openclaw_config`` picks up the prior profile.
+#
+# Both are real cross-owner credential leaks. The shared guard is a
+# monotonically increasing ``binding generation``: a new generation
+# is minted on every "the owner changed under us" event — Phase D's
+# initial binding lock-in, the watchdog's reassign / unassign
+# branches, and Phase B's cold-start observation of
+# ``assigned=false`` (which retroactively orphans whatever profile
+# is on disk).
+#
+# Active workers stamp their starting generation and check it before
+# every POST + at every loop iteration. If the supervisor's current
+# generation has moved past the worker's, the worker SIGTERMs its
+# CLI subprocess and exits without posting any terminal status (the
+# wipe path is the one that talks to the platform about owner
+# release; the worker bowing out silently is the right shape).
+_binding_generation: int = 0
+_binding_generation_lock = threading.Lock()
+# Registry: session_id -> (pid, generation) so the wipe path can
+# SIGTERM in-flight CLI subprocesses too. Cleared by the worker
+# itself on exit.
+_subscription_link_active_workers: dict[str, dict[str, int]] = {}
+_subscription_link_active_workers_lock = threading.Lock()
+
+
+def _current_binding_generation() -> int:
+    with _binding_generation_lock:
+        return _binding_generation
+
+
+def _bump_binding_generation(*, reason: str) -> int:
+    """Move the supervisor to a fresh binding generation.
+
+    Called on every owner-release / new-owner event. Any in-flight
+    subscription-link worker thread that started under an older
+    generation will exit on its next loop iteration without posting
+    a terminal status, so a late OAuth-profile write from the
+    previous owner's CLI cannot survive into the next owner's
+    auth-profiles.json.
+    """
+    global _binding_generation
+    with _binding_generation_lock:
+        _binding_generation += 1
+        new_gen = _binding_generation
+    log.info(
+        "binding generation bumped to %d (reason=%s)", new_gen, reason
+    )
+    return new_gen
+
+
+def _cancel_active_subscription_link_workers() -> None:
+    """SIGTERM any in-flight device-code CLIs.
+
+    Paired with ``_bump_binding_generation()`` on owner-release paths
+    (PR #24 review). Killing the CLI prevents it from writing an
+    OAuth profile after we've wiped the file, and the generation
+    bump ensures any worker that's about to call ``_post_failed`` /
+    ``_post_linked`` skips the POST instead of confusing the platform
+    with a status update on the previous owner's session.
+    """
+    with _subscription_link_active_workers_lock:
+        snapshot = list(_subscription_link_active_workers.items())
+    for session_id, info in snapshot:
+        pid = info.get("pid")
+        if not pid:
+            continue
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            log.info(
+                "subscription-link: SIGTERM in-flight CLI on owner release "
+                "session_id=%s pid=%s",
+                session_id,
+                pid,
+            )
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            log.warning(
+                "subscription-link: failed to SIGTERM in-flight CLI "
+                "session_id=%s pid=%s: %s",
+                session_id,
+                pid,
+                exc,
+            )
+
+
+def _strip_ansi_for_cli_capture(text: str) -> str:
+    """Strip ANSI / OSC sequences from CLI output for URL/code matching."""
+    cleaned = _ANSI_CSI_RE.sub("", text)
+    cleaned = _ANSI_OSC_RE.sub("", cleaned)
+    return cleaned.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _post_subscription_link_result(
+    *,
+    session_id: str,
+    status: str,
+    verification_url: str | None = None,
+    user_code: str | None = None,
+    expires_at: str | None = None,
+    error: str | None = None,
+) -> None:
+    body: dict[str, Any] = {"session_id": session_id, "status": status}
+    if verification_url:
+        body["verification_url"] = verification_url
+    if user_code:
+        body["user_code"] = user_code
+    if expires_at:
+        body["expires_at"] = expires_at
+    if error:
+        body["error"] = error[:1023]
+    try:
+        post_json("/hapi/v1/computers/me/subscription-link-result", body)
+    except Exception as exc:
+        log.warning(
+            "subscription-link-result POST failed (session_id=%s status=%s): %s",
+            session_id,
+            status,
+            exc,
+        )
+
+
+def _run_chatgpt_device_code_login_in_thread(
+    *,
+    session_id: str,
+    starting_generation: int | None = None,
+    openclaw_bin: str = "openclaw",
+    url_emit_timeout_s: float = 20.0,
+    overall_timeout_s: float = 900.0,  # 15 min = device-code expiry
+) -> None:
+    """Worker thread: spawn the device-code CLI in a PTY + report progress.
+
+    Issue #23 — runtime half of the chat / Mini App ChatGPT BYO flow.
+    The OpenClaw CLI's ``models auth login --device-code`` requires an
+    interactive TTY even with the headless flag (preflight memo §Q1),
+    so we spawn it under a PTY via ``pty.fork`` and read the bytes
+    OpenClaw would have written to a real terminal. The CLI emits
+    a panel containing ``URL: <auth.openai.com/...>`` and
+    ``Code: XXXX-YYYYY`` once the device-code request lands; once the
+    user approves at auth.openai.com it emits ``OpenAI device code
+    complete`` and writes the OAuth profile to disk.
+
+    The supervisor POSTs **exactly one terminal lifecycle state** back
+    to the platform per invocation:
+
+    - ``linked`` once the CLI prints the success marker, OR the
+      auth-profile shows up on disk after the child exits;
+    - ``failed`` for: CLI exits before URL/code (Codex review on
+      PR #24), no URL/code by the URL-emit deadline, child exits
+      after URL/code but no profile written, overall 15-min window
+      expires.
+
+    Plus ``pending`` once URL+code are parsed (so the Mini App / chat
+    tool can render them) — that's not terminal; the terminal POST
+    follows later.
+
+    Runs in a thread because the heartbeat loop must return within
+    a few seconds — the device-code flow takes minutes (the user has
+    to open a browser and tap Approve). The terminal POST clears
+    ``model_auth_status=pending`` on the backend so the platform
+    stops re-emitting the heartbeat command and the user can retry.
+    """
+    import pty
+    import select
+    import time as _time
+
+    # PR #24 review at 01:41Z — defensive default + pre-fork check.
+    # If the dispatcher didn't pass `starting_generation` (legacy call
+    # path / direct test invocation), fall back to capturing now. The
+    # production dispatcher always passes it explicitly.
+    if starting_generation is None:
+        starting_generation = _current_binding_generation()
+
+    log.info(
+        "subscription-link: starting device-code login subprocess "
+        "session_id=%s starting_generation=%d",
+        session_id,
+        starting_generation,
+    )
+
+    # Pre-fork supersession check: if owner-release fired between
+    # dispatcher's Thread.start() and us actually running, bail out
+    # WITHOUT forking. Deregister so the active-workers map stays
+    # clean.
+    if _current_binding_generation() != starting_generation:
+        log.info(
+            "subscription-link: superseded before fork — exiting "
+            "session_id=%s (starting=%d current=%d)",
+            session_id,
+            starting_generation,
+            _current_binding_generation(),
+        )
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
+        return
+
+    try:
+        pid, fd = pty.fork()
+    except OSError as exc:
+        log.warning("pty.fork failed for session_id=%s: %s", session_id, exc)
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
+        _post_subscription_link_result(
+            session_id=session_id,
+            status="failed",
+            error=f"could not allocate a pseudo-terminal for the OpenClaw CLI: {exc}",
+        )
+        return
+
+    # Worker is past the fork; update the registry entry with the
+    # real PID so `_cancel_active_subscription_link_workers` can
+    # SIGTERM us if owner-release fires after this point. (Before
+    # this update the dispatcher pre-registered with pid=None; the
+    # cancellation helper skips those entries — the pre-fork check
+    # above and the main-loop check below are the safety nets for
+    # that brief window.)
+    with _subscription_link_active_workers_lock:
+        entry = _subscription_link_active_workers.get(session_id)
+        if entry is not None:
+            entry["pid"] = pid
+
+    if pid == 0:
+        # Child: exec the CLI in the PTY. Env is inherited from the
+        # supervisor process so the resulting auth profile lands in
+        # this Computer's per-agent auth store.
+        try:
+            os.execvpe(
+                openclaw_bin,
+                [
+                    openclaw_bin,
+                    "models",
+                    "auth",
+                    "login",
+                    "--provider",
+                    "openai-codex",
+                    "--device-code",
+                ],
+                {**os.environ, **_openclaw_cli_env()},
+            )
+        except OSError as exc:
+            # exec failed; print so the parent's stdout-reader can
+            # see the message, then exit non-zero.
+            sys.stderr.write(f"openclaw exec failed: {exc}\n")
+            os._exit(127)
+        os._exit(0)
+
+    # Parent: read stdout from the PTY in a loop. Match URL + Code,
+    # POST pending. Then keep reading until "OpenAI device code
+    # complete" or the child exits, and POST exactly one terminal
+    # result regardless of which way we exit the loop.
+    started_at = _time.monotonic()
+    buffer = ""
+    url_line_re = re.compile(r"URL:\s*(https?://\S+)")
+    code_line_re = re.compile(r"Code:\s*([A-Za-z0-9]{4,5}-[A-Za-z0-9]{4,6})")
+    url_value: str | None = None
+    code_value: str | None = None
+    pending_reported = False
+    terminal_posted = False
+    child_exit_code: int | None = None
+
+    # Cross-owner credential-leak guard (PR #24 reviews at 01:19Z +
+    # 01:41Z). The `starting_generation` parameter is the binding
+    # generation in effect when the dispatcher decided to spawn this
+    # worker — captured synchronously up there, NOT here, so a race
+    # between Thread.start() and this line can't let us stamp a
+    # post-release generation as our own. On each loop iteration we
+    # check whether the supervisor has moved past us (owner release /
+    # reassign / cold-start orphan-wipe) — if so we kill the CLI and
+    # exit silently without posting a terminal status. The wipe path
+    # is the one talking to the platform about owner release; the
+    # worker bowing out silently is the right shape (a stale linked/
+    # failed POST under the old session_id would be ignored by the
+    # platform's session-id check anyway, but silence is cleaner).
+
+    def _is_superseded() -> bool:
+        return _current_binding_generation() != starting_generation
+
+    def _child_alive() -> bool:
+        nonlocal child_exit_code
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        if wpid == 0:
+            return True
+        # Decode the status — only the exit-code byte is non-secret
+        # diagnostic context we ever surface.
+        if os.WIFEXITED(status):
+            child_exit_code = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            child_exit_code = -os.WTERMSIG(status)
+        return False
+
+    def _post_failed(reason: str) -> None:
+        nonlocal terminal_posted
+        if terminal_posted:
+            return
+        if _is_superseded():
+            # Owner released or rebound under us; the wipe path is the
+            # one talking to the platform about this transition.
+            log.info(
+                "subscription-link: skipping failed POST — superseded "
+                "session_id=%s",
+                session_id,
+            )
+            terminal_posted = True
+            return
+        _post_subscription_link_result(
+            session_id=session_id, status="failed", error=reason
+        )
+        terminal_posted = True
+
+    def _post_linked() -> None:
+        nonlocal terminal_posted
+        if terminal_posted:
+            return
+        if _is_superseded():
+            log.info(
+                "subscription-link: skipping linked POST — superseded "
+                "session_id=%s",
+                session_id,
+            )
+            terminal_posted = True
+            return
+        _post_subscription_link_result(session_id=session_id, status="linked")
+        terminal_posted = True
+
+    def _kill_child() -> None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def _cli_tail() -> str:
+        stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
+        return stripped or "(empty)"
+
+    try:
+        while True:
+            elapsed = _time.monotonic() - started_at
+
+            # PR #24 review at 01:19Z: bail out fast on supersession
+            # so a late OAuth-profile write from this worker's CLI
+            # cannot survive into the next owner's auth store.
+            # The wipe path bumps the generation BEFORE wiping the
+            # file, then SIGTERMs our child; observing the bump here
+            # is the latest chance to also re-wipe in case the CLI
+            # managed to write a profile in the gap between the
+            # generation bump and SIGTERM landing.
+            if _is_superseded():
+                log.info(
+                    "subscription-link: worker superseded by binding rebind "
+                    "session_id=%s; killing CLI and exiting",
+                    session_id,
+                )
+                _kill_child()
+                # Re-wipe defensively in case the CLI raced the
+                # SIGTERM and wrote the OAuth profile just before
+                # dying.
+                try:
+                    removed = wipe_chatgpt_subscription_profile()
+                    if removed:
+                        log.info(
+                            "subscription-link: re-wiped late profile from "
+                            "superseded worker session_id=%s profiles=%s",
+                            session_id,
+                            removed,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "subscription-link: late re-wipe failed for "
+                        "superseded worker session_id=%s: %s",
+                        session_id,
+                        exc,
+                    )
+                terminal_posted = True  # short-circuit terminal POSTs
+                break
+
+            # Overall window — OpenAI device codes expire after 15min.
+            if elapsed > overall_timeout_s:
+                log.info(
+                    "subscription-link: device-code subprocess timed out after %.0fs "
+                    "session_id=%s",
+                    elapsed,
+                    session_id,
+                )
+                _kill_child()
+                _post_failed(
+                    "Device code timed out before the user approved at "
+                    "auth.openai.com (15-minute window). Ask to retry."
+                )
+                break
+
+            # No URL+code by the emit deadline — the CLI almost
+            # certainly errored before issuing the device code
+            # (network, OpenAI 4xx, disabled-for-account, etc.).
+            if not pending_reported and elapsed > url_emit_timeout_s:
+                log.warning(
+                    "subscription-link: no URL/code from CLI after %.0fs "
+                    "session_id=%s; reporting failed",
+                    elapsed,
+                    session_id,
+                )
+                _post_failed(
+                    "openclaw did not return a device code. Check that "
+                    "device-code login is enabled in your ChatGPT security "
+                    "settings (Settings -> Security -> Enable device code "
+                    "authorization for Codex). Recent CLI output: "
+                    f"{_cli_tail()}"
+                )
+                _kill_child()
+                break
+
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if fd in ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    buffer += _strip_ansi_for_cli_capture(
+                        chunk.decode("utf-8", errors="replace")
+                    )
+                    if not pending_reported:
+                        if not url_value:
+                            m = url_line_re.search(buffer)
+                            if m:
+                                url_value = m.group(1)
+                        if not code_value:
+                            m = code_line_re.search(buffer)
+                            if m:
+                                code_value = m.group(1)
+                        if url_value and code_value:
+                            log.info(
+                                "subscription-link: parsed URL+code for "
+                                "session_id=%s; posting pending",
+                                session_id,
+                            )
+                            _post_subscription_link_result(
+                                session_id=session_id,
+                                status="pending",
+                                verification_url=url_value,
+                                user_code=code_value,
+                            )
+                            pending_reported = True
+                    if not terminal_posted and (
+                        "OpenAI device code complete" in buffer
+                        or "Auth profile: openai-codex:" in buffer
+                    ):
+                        log.info(
+                            "subscription-link: detected device-code complete for "
+                            "session_id=%s; posting linked",
+                            session_id,
+                        )
+                        _post_linked()
+                        # Let the CLI exit naturally so the auth-
+                        # profile write finishes before we close the
+                        # PTY in the finally block.
+
+            if not _child_alive():
+                # Drain any remaining stdout before deciding.
+                try:
+                    rest = os.read(fd, 4096)
+                except OSError:
+                    rest = b""
+                if rest:
+                    buffer += _strip_ansi_for_cli_capture(
+                        rest.decode("utf-8", errors="replace")
+                    )
+                # If we already posted linked we're done. Otherwise
+                # decide based on whether URL/code ever made it out:
+                if terminal_posted:
+                    break
+                if pending_reported:
+                    # CLI exited after issuing URL/code but before we
+                    # caught the success marker. Re-check disk —
+                    # OpenClaw may have finished writing the profile
+                    # in the gap.
+                    if read_chatgpt_subscription_profile() is not None:
+                        log.info(
+                            "subscription-link: CLI exited but auth-profile "
+                            "present on disk; posting linked session_id=%s",
+                            session_id,
+                        )
+                        _post_linked()
+                    else:
+                        _post_failed(
+                            "Device-code login subprocess exited before the "
+                            "auth profile was written "
+                            f"(exit code: {child_exit_code}). Recent CLI "
+                            f"output: {_cli_tail()}"
+                        )
+                else:
+                    # Codex review on PR #24 — CLI exited BEFORE
+                    # URL/code were issued (broken openclaw_bin,
+                    # device-code disabled for the account, immediate
+                    # provider error). Must post a terminal failure
+                    # so the platform clears model_auth_status=pending
+                    # and the user can retry — otherwise the row stays
+                    # stuck and the in-memory session_id dedup blocks
+                    # the next heartbeat redelivery.
+                    log.warning(
+                        "subscription-link: CLI exited before issuing URL/code "
+                        "session_id=%s exit_code=%s",
+                        session_id,
+                        child_exit_code,
+                    )
+                    _post_failed(
+                        "The OpenClaw device-code login subprocess exited "
+                        f"before issuing a code (exit code: {child_exit_code}). "
+                        "Check that device-code login is enabled in your "
+                        "ChatGPT security settings (Settings -> Security -> "
+                        "Enable device code authorization for Codex), then "
+                        f"ask to retry. Recent CLI output: {_cli_tail()}"
+                    )
+                break
+    except Exception as exc:  # noqa: BLE001 — worker thread, must not crash silently
+        log.exception(
+            "subscription-link: worker thread crashed session_id=%s", session_id
+        )
+        _post_failed(
+            f"Internal supervisor error while running the device-code login: {exc}"
+        )
+    finally:
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+# ANSI / OSC regexes used by the device-code CLI capture path.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_ANSI_OSC_RE = re.compile(r"\x1b\][0-9;].*?(?:\x07|\x1b\\)")
+
+
+def handle_start_chatgpt_link_command(command: dict) -> None:
+    """Handle one heartbeat-delivered `start_chatgpt_link` command.
+
+    Spawns the device-code login subprocess in a worker thread so the
+    heartbeat loop returns within its normal window. Idempotent per
+    session_id within a supervisor lifetime — re-delivery of the same
+    command (which the backend keeps emitting until ``status=pending``
+    is reported) does NOT spawn a second CLI.
+
+    Captures the binding generation synchronously here (in the
+    dispatcher's thread) and passes it into the worker. The previous
+    version captured inside the worker, which left a race window
+    between thread.start() and the capture: if owner-release ran in
+    that gap, the worker would stamp the already-bumped generation
+    as its own and never observe supersession (PR #24 review at
+    01:41Z — Codex reproduced this by injecting a wipe between
+    pty.fork() and the worker's generation capture).
+
+    Also registers the worker in `_subscription_link_active_workers`
+    BEFORE Thread.start() so `_cancel_active_subscription_link_workers`
+    can at least see the entry exists, even though `pid` is unknown
+    until pty.fork() returns. The worker fills in `pid` once the
+    child is forked. SIGTERM is skipped on entries with `pid=None`
+    (the worker's pre-fork + main-loop supersession checks are the
+    backstop for that brief window).
+    """
+    import threading
+
+    session_id = str(command.get("session_id") or "").strip()
+    if not session_id:
+        log.warning("ignoring malformed start_chatgpt_link command: %r", command)
+        return
+    if session_id in _subscription_link_sessions_started:
+        log.info(
+            "start_chatgpt_link: session_id=%s already in flight; ignoring re-delivery",
+            session_id,
+        )
+        return
+    _subscription_link_sessions_started.add(session_id)
+
+    # Stamp the binding generation we were dispatched under, and
+    # pre-register the worker (pid unknown — the forked child will
+    # update it). Doing this synchronously here means a release that
+    # fires between this point and the worker thread actually
+    # running will be observable via the captured generation.
+    starting_generation = _current_binding_generation()
+    with _subscription_link_active_workers_lock:
+        _subscription_link_active_workers[session_id] = {
+            "pid": None,
+            "generation": starting_generation,
+        }
+
+    threading.Thread(
+        target=_run_chatgpt_device_code_login_in_thread,
+        kwargs={
+            "session_id": session_id,
+            "starting_generation": starting_generation,
+        },
+        name=f"chatgpt-link-{session_id[:8]}",
+        daemon=True,
+    ).start()
 
 
 def handle_apply_config_command(command: dict) -> None:
@@ -1708,6 +2587,11 @@ def _run_one_binding_cycle() -> int:
     poll = BINDING_POLL_BASE_SECONDS
     empty_count = 0
     binding = None
+    # PR #24 review at 01:19Z — cold-start guard: a profile on disk
+    # without a current owner is orphaned by definition. Wipe at most
+    # once per Phase B entry to avoid pummeling the filesystem on
+    # every poll iteration of an idle Computer.
+    cold_start_wipe_attempted = False
     while binding is None and not _stop_holder["stop"]:
         try:
             resp = get_json("/hapi/v1/computers/me/binding")
@@ -1718,6 +2602,42 @@ def _run_one_binding_cycle() -> int:
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
             break
+        # Cold-start owner-release (Codex 01:19Z + 01:32Z reviews —
+        # two attack paths that share the same root cause).
+        #
+        # Run UNCONDITIONALLY on the first ``assigned=false`` poll
+        # per Phase B entry — not just when a profile already exists.
+        # The 01:32Z review surfaced the remaining gap in the gated
+        # version: a device-code worker from the previous binding
+        # can be in-flight (the owner hasn't approved yet) when
+        # Phase B observes the unassign. Gating on profile presence
+        # would skip the bump+cancel here, the worker would keep
+        # polling auth.openai.com, and when the user finally
+        # approved the CLI would write ``openai-codex:old@example.com``
+        # to the same auth store the next owner is about to inherit.
+        #
+        # _wipe_on_owner_release is the right entry point for this:
+        # it bumps the binding generation (so any worker observing
+        # supersession exits silently on its next loop iteration),
+        # SIGTERMs in-flight CLI subprocesses (so a racing OAuth-
+        # profile write can't land in the gap), and only THEN wipes
+        # the file (a no-op when no profile is present, which is
+        # the common case here). Runs at most once per Phase B
+        # entry — subsequent polls of an idle Computer don't re-
+        # touch the filesystem or re-bump the generation.
+        if not cold_start_wipe_attempted:
+            cold_start_wipe_attempted = True
+            try:
+                log.info(
+                    "phase B cold-start: running owner-release path "
+                    "(supersedes any in-flight subscription workers, "
+                    "wipes any orphaned auth-profile)"
+                )
+                _wipe_on_owner_release(reason="cold-start-orphan")
+            except Exception as exc:
+                log.warning(
+                    "phase B cold-start owner-release failed: %s", exc
+                )
         empty_count += 1
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS
@@ -1755,8 +2675,12 @@ def _run_one_binding_cycle() -> int:
 
     # Stamp this cycle's binding signature so the watchdog thread
     # can detect a fast unassign + reassign that lands inside the
-    # heartbeat window.
+    # heartbeat window. The owner-identity subset is stamped
+    # separately so the watchdog can decide whether to wipe the
+    # per-agent OAuth auth-store on rebind (issue #23 — owner
+    # change = wipe; mode flip for the same owner = don't wipe).
     _stop_holder["signature"] = _binding_signature(binding)
+    _stop_holder["owner_signature"] = _owner_identity_signature(binding)
     log.info(
         "phase D: binding signature locked (bot=@%s owner=%s)",
         binding.get("telegram_bot_username"),
@@ -1785,8 +2709,12 @@ def _run_one_binding_cycle() -> int:
                     "/hapi/v1/computers/me/heartbeat", {"metrics": metrics}
                 )
                 command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
-                if isinstance(command, dict) and command.get("type") == "apply_config":
-                    handle_apply_config_command(command)
+                if isinstance(command, dict):
+                    cmd_type = command.get("type")
+                    if cmd_type == "apply_config":
+                        handle_apply_config_command(command)
+                    elif cmd_type == "start_chatgpt_link":
+                        handle_start_chatgpt_link_command(command)
             except Exception as exc:
                 log.warning("/me/heartbeat POST failed: %s", exc)
             # Watchdog: did the platform unassign us OR swap the
@@ -1807,6 +2735,13 @@ def _run_one_binding_cycle() -> int:
                         "binding watchdog: platform reports assigned=false; "
                         "triggering rebind"
                     )
+                    # Issue #23: platform-driven unassign hands the
+                    # Computer back to the pool. Wipe the previous
+                    # owner's per-agent OAuth credential before the
+                    # supervisor releases control, so the next owner
+                    # can't inherit a linked-subscription state from
+                    # the prior binding.
+                    _wipe_on_owner_release(reason="unassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
                     return
@@ -1820,6 +2755,17 @@ def _run_one_binding_cycle() -> int:
                         new_binding.get("telegram_bot_username"),
                         new_binding.get("telegram_owner_user_id"),
                     )
+                    # Issue #23: only wipe when the OWNER changed,
+                    # not when the same owner flipped llm_auth_mode
+                    # or rotated their OpenRouter key. A mode flip
+                    # for the same owner triggers a rebind (so the
+                    # supervisor rewrites openclaw.json) but the
+                    # OAuth credential they just linked should
+                    # survive into the next config.
+                    new_owner_sig = _owner_identity_signature(new_binding)
+                    cached_owner_sig = _stop_holder.get("owner_signature")
+                    if cached_owner_sig and new_owner_sig != cached_owner_sig:
+                        _wipe_on_owner_release(reason="reassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
                     return
