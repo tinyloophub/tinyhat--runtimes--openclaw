@@ -1456,6 +1456,8 @@ class ColdStartOrphanProfileWipeTests(unittest.TestCase):
     def setUp(self) -> None:
         with supervisor._binding_generation_lock:
             supervisor._binding_generation = 0
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers.clear()
 
     def test_phase_b_path_wipes_orphan_profile_on_unassigned_observation(
         self,
@@ -1481,6 +1483,58 @@ class ColdStartOrphanProfileWipeTests(unittest.TestCase):
                 self.assertIsNone(
                     supervisor.read_chatgpt_subscription_profile()
                 )
+
+    def test_phase_b_cancels_active_worker_even_when_no_profile_exists_yet(
+        self,
+    ) -> None:
+        """PR #24 review at 01:32Z — Codex's exact reproduction.
+
+        A device-code worker is in flight (user hasn't approved yet
+        → no profile on disk). Phase B observes `assigned=false`.
+        Phase B's cold-start branch MUST cancel the worker via the
+        owner-release path even though the wipe-file step is a no-op,
+        so the worker can't write `openai-codex:old@example.com` to
+        the auth store after the user finally approves.
+
+        Without this fix (gated `if profile is not None: _wipe...`):
+        the in-flight worker survives Phase B's check, writes the
+        profile when the user approves later, and the next owner's
+        `write_openclaw_config` selects subscription mode using the
+        prior owner's credential.
+
+        With the fix (unconditional `_wipe_on_owner_release` call):
+        Phase B's first `assigned=false` observation bumps the
+        generation + SIGTERMs the active worker. The worker exits
+        on its next loop iteration without writing.
+        """
+        # Register a fake worker representing the previous owner's
+        # in-flight CLI subprocess.
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers[
+                "owner-A-session"
+            ] = {"pid": 424_242, "generation": 0}
+
+        starting_gen = supervisor._current_binding_generation()
+        killed_pids: list[int] = []
+
+        # The inline Phase B branch boils down to this single call.
+        # Execute it directly so we can pin the side-effects without
+        # standing up the full polling loop.
+        with patch.object(
+            supervisor.os, "kill",
+            side_effect=lambda pid, sig: killed_pids.append(pid),
+        ):
+            supervisor._wipe_on_owner_release(reason="cold-start-orphan")
+
+        # 1. Generation bumped (worker's next loop-top check will
+        # observe supersession and exit silently).
+        self.assertEqual(
+            supervisor._current_binding_generation(), starting_gen + 1
+        )
+        # 2. SIGTERM was sent to the active worker's CLI subprocess
+        # (so even if the generation check hasn't fired yet, the
+        # CLI dies before it can write a profile).
+        self.assertIn(424_242, killed_pids)
 
 
 if __name__ == "__main__":

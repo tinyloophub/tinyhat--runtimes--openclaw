@@ -2535,25 +2535,41 @@ def _run_one_binding_cycle() -> int:
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
             break
-        # Cold-start orphan-profile wipe (Codex 01:19Z attack path
-        # #2). If the supervisor restarted while the Computer was
-        # unassigned, any prior owner's openai-codex profile is now
-        # orphaned — wipe before the next assignment so the
-        # next owner cannot consume the stale credential. Runs at
-        # most once per Phase B entry; subsequent polls don't
-        # re-touch the filesystem.
+        # Cold-start owner-release (Codex 01:19Z + 01:32Z reviews —
+        # two attack paths that share the same root cause).
+        #
+        # Run UNCONDITIONALLY on the first ``assigned=false`` poll
+        # per Phase B entry — not just when a profile already exists.
+        # The 01:32Z review surfaced the remaining gap in the gated
+        # version: a device-code worker from the previous binding
+        # can be in-flight (the owner hasn't approved yet) when
+        # Phase B observes the unassign. Gating on profile presence
+        # would skip the bump+cancel here, the worker would keep
+        # polling auth.openai.com, and when the user finally
+        # approved the CLI would write ``openai-codex:old@example.com``
+        # to the same auth store the next owner is about to inherit.
+        #
+        # _wipe_on_owner_release is the right entry point for this:
+        # it bumps the binding generation (so any worker observing
+        # supersession exits silently on its next loop iteration),
+        # SIGTERMs in-flight CLI subprocesses (so a racing OAuth-
+        # profile write can't land in the gap), and only THEN wipes
+        # the file (a no-op when no profile is present, which is
+        # the common case here). Runs at most once per Phase B
+        # entry — subsequent polls of an idle Computer don't re-
+        # touch the filesystem or re-bump the generation.
         if not cold_start_wipe_attempted:
             cold_start_wipe_attempted = True
             try:
-                if read_chatgpt_subscription_profile() is not None:
-                    log.info(
-                        "phase B cold-start: wiping orphaned openai-codex "
-                        "profile (no current owner)"
-                    )
-                    _wipe_on_owner_release(reason="cold-start-orphan")
+                log.info(
+                    "phase B cold-start: running owner-release path "
+                    "(supersedes any in-flight subscription workers, "
+                    "wipes any orphaned auth-profile)"
+                )
+                _wipe_on_owner_release(reason="cold-start-orphan")
             except Exception as exc:
                 log.warning(
-                    "phase B cold-start orphan-wipe check failed: %s", exc
+                    "phase B cold-start owner-release failed: %s", exc
                 )
         empty_count += 1
         if empty_count > 5:
