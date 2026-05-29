@@ -1068,5 +1068,169 @@ class StaleProfileCarryoverGuardTests(unittest.TestCase):
                 self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
 
 
+class HandleStartChatgptLinkCommandTests(unittest.TestCase):
+    """Issue #23 — supervisor's start_chatgpt_link heartbeat handler.
+
+    Tests the dispatch + idempotency layer. The actual subprocess
+    spawn is integration-tested via the live E2E walk; here we
+    intercept `_run_chatgpt_device_code_login_in_thread` so the
+    handler logic can be exercised without touching the OpenClaw CLI.
+    """
+
+    def setUp(self) -> None:
+        # Clear the in-memory idempotency set so test order doesn't matter.
+        supervisor._subscription_link_sessions_started.clear()
+
+    def test_handler_rejects_malformed_command(self) -> None:
+        captured = []
+        with patch.object(
+            supervisor,
+            "_run_chatgpt_device_code_login_in_thread",
+            side_effect=lambda **kw: captured.append(kw),
+        ):
+            supervisor.handle_start_chatgpt_link_command({"type": "start_chatgpt_link"})
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": ""}
+            )
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "   "}
+            )
+        self.assertEqual(captured, [])
+
+    def test_handler_is_idempotent_within_lifetime(self) -> None:
+        import threading as threading_mod
+
+        captured = []
+
+        def _fake_runner(**kw):
+            captured.append(kw["session_id"])
+
+        class _InlineThread:
+            """Run the target inline so the test can observe the call."""
+
+            def __init__(self, target, kwargs, name, daemon):
+                self._target = target
+                self._kwargs = kwargs
+
+            def start(self):
+                self._target(**self._kwargs)
+
+        with patch.object(
+            supervisor,
+            "_run_chatgpt_device_code_login_in_thread",
+            side_effect=_fake_runner,
+        ), patch.object(threading_mod, "Thread", _InlineThread):
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "sess-xyz"}
+            )
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "sess-xyz"}
+            )
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "other-sess"}
+            )
+
+        # Same session id only spawned once; different session id spawns.
+        self.assertEqual(captured, ["sess-xyz", "other-sess"])
+
+
+class StripAnsiForCliCaptureTests(unittest.TestCase):
+    """Issue #23 — ANSI cleanup so URL/Code regex matches OpenClaw's panel output."""
+
+    def test_strips_color_and_cursor_sequences(self) -> None:
+        raw = (
+            "\x1b[?25l\x1b[2K\x1b[1G"
+            "URL: https://auth.openai.com/codex/device\n"
+            "\x1b[33mCode:\x1b[0m RJOE-NOHMF\n"
+        )
+        out = supervisor._strip_ansi_for_cli_capture(raw)
+        self.assertIn("URL: https://auth.openai.com/codex/device", out)
+        self.assertIn("Code: RJOE-NOHMF", out)
+        # No raw ESC bytes survive.
+        self.assertNotIn("\x1b", out)
+
+    def test_normalizes_crlf_and_cr(self) -> None:
+        out = supervisor._strip_ansi_for_cli_capture("line\r\nother\rlast\n")
+        self.assertEqual(out, "line\nother\nlast\n")
+
+
+class PostSubscriptionLinkResultShapeTests(unittest.TestCase):
+    """Issue #23 — result POSTs must hit the documented endpoint shape."""
+
+    def test_pending_with_url_and_code(self) -> None:
+        calls = []
+
+        def _fake_post(path, body):
+            calls.append((path, body))
+            return {}
+
+        with patch.object(supervisor, "post_json", side_effect=_fake_post):
+            supervisor._post_subscription_link_result(
+                session_id="abc",
+                status="pending",
+                verification_url="https://auth.openai.com/codex/device",
+                user_code="RJOE-NOHMF",
+            )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "/hapi/v1/computers/me/subscription-link-result",
+                    {
+                        "session_id": "abc",
+                        "status": "pending",
+                        "verification_url": "https://auth.openai.com/codex/device",
+                        "user_code": "RJOE-NOHMF",
+                    },
+                )
+            ],
+        )
+
+    def test_linked_omits_url_code_keys(self) -> None:
+        calls = []
+        with patch.object(
+            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
+        ):
+            supervisor._post_subscription_link_result(
+                session_id="abc", status="linked"
+            )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "/hapi/v1/computers/me/subscription-link-result",
+                    {"session_id": "abc", "status": "linked"},
+                )
+            ],
+        )
+
+    def test_failed_carries_non_secret_reason(self) -> None:
+        calls = []
+        with patch.object(
+            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
+        ):
+            supervisor._post_subscription_link_result(
+                session_id="abc",
+                status="failed",
+                error="device-code login disabled on your ChatGPT account",
+            )
+        self.assertEqual(len(calls), 1)
+        path, body = calls[0]
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(
+            body["error"], "device-code login disabled on your ChatGPT account"
+        )
+
+    def test_post_failure_is_swallowed(self) -> None:
+        """Network errors must not crash the worker thread."""
+        with patch.object(
+            supervisor, "post_json", side_effect=OSError("network down")
+        ):
+            # Must not raise.
+            supervisor._post_subscription_link_result(
+                session_id="abc", status="pending"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
