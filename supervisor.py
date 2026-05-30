@@ -497,6 +497,153 @@ def _tinyhat_plugin_marker_path() -> str:
     return os.path.join(openclaw_state_dir(), "tinyhat-plugin.version")
 
 
+def _read_runtime_repo_version() -> str:
+    """Version string for this runtime checkout (the repo-root ``VERSION``).
+
+    Returns ``""`` when the file is missing so the caller omits the
+    runtime version rather than reporting a placeholder.
+    """
+    version_path = os.path.join(runtime_dir(), "VERSION")
+    try:
+        with open(version_path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _read_runtime_git_sha() -> str:
+    """Full git SHA of this runtime checkout, or ``""`` when not a git tree.
+
+    The production Computer clones the runtime repo at a pinned ref, so a
+    ``rev-parse HEAD`` resolves the exact commit. A non-git deployment
+    (e.g. a tarball drop) returns ``""`` and the caller sends a null sha.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", runtime_dir(), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _read_installed_plugin_marker() -> dict:
+    """Read the Tinyhat plugin install marker (written at install time).
+
+    Shape mirrors :func:`ensure_tinyhat_plugin_installed`'s payload:
+    ``{repo_url, repo_ref, resolved_commit_sha, version}``. Returns an
+    empty dict when the marker is missing or unreadable.
+    """
+    marker_path = _tinyhat_plugin_marker_path()
+    try:
+        with open(marker_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+_OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
+
+
+def _read_openclaw_framework_version() -> str:
+    """Installed OpenClaw (framework) version via ``openclaw --version``.
+
+    Best-effort: returns ``""`` when the CLI is absent or errors. The
+    framework is an npm package with no git checkout, so its component
+    sha is always ``None``.
+    """
+    try:
+        result = subprocess.run(
+            ["openclaw", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=_openclaw_cli_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    output = (result.stdout or result.stderr or "").strip()
+    match = _OPENCLAW_VERSION_RE.search(output)
+    if match:
+        return match.group(1)
+    return output.splitlines()[0].strip() if output else ""
+
+
+def collect_component_versions() -> dict:
+    """Best-effort snapshot of installed component versions for the heartbeat.
+
+    Returns the shape the platform ingests on ``POST /me/heartbeat``::
+
+        {"runtime":   {"version": <str|None>, "sha": <str|None>},
+         "plugin":    {"version": <str|None>, "sha": <str|None>},
+         "framework": {"version": <str|None>, "sha": None}}
+
+    Each component is resolved under its own ``try``/``except`` so one
+    failing source never suppresses the others, and the whole function
+    degrades to ``{}`` on any unexpected error — the heartbeat must never
+    throw because version collection failed. A component is omitted
+    entirely when neither its version nor its sha can be resolved; the
+    platform then falls back to its provisioning manifest for that
+    component.
+    """
+    components: dict[str, dict[str, Any]] = {}
+    try:
+        # runtime: this repo's VERSION file + the checkout's git SHA.
+        try:
+            runtime_version = _read_runtime_repo_version()
+            runtime_sha = _read_runtime_git_sha()
+            if runtime_version or runtime_sha:
+                components["runtime"] = {
+                    "version": runtime_version or None,
+                    "sha": runtime_sha or None,
+                }
+        except Exception as exc:
+            log.warning("could not collect runtime component version: %s", exc)
+
+        # plugin: read from the install marker the plugin installer wrote.
+        # A "unknown" version (no package.json/version.txt at install) is
+        # treated as not-reported so the platform uses its manifest value,
+        # while the real resolved sha is still surfaced.
+        try:
+            marker = _read_installed_plugin_marker()
+            plugin_version = str(marker.get("version") or "").strip()
+            if plugin_version.lower() == "unknown":
+                plugin_version = ""
+            plugin_sha = str(marker.get("resolved_commit_sha") or "").strip()
+            if plugin_version or plugin_sha:
+                components["plugin"] = {
+                    "version": plugin_version or None,
+                    "sha": plugin_sha or None,
+                }
+        except Exception as exc:
+            log.warning("could not collect plugin component version: %s", exc)
+
+        # framework: OpenClaw npm package version. No git sha for an npm pkg.
+        try:
+            framework_version = _read_openclaw_framework_version()
+            if framework_version:
+                components["framework"] = {
+                    "version": framework_version,
+                    "sha": None,
+                }
+        except Exception as exc:
+            log.warning("could not collect framework component version: %s", exc)
+    except Exception as exc:  # pragma: no cover - belt and suspenders
+        log.warning("component version collection failed entirely: %s", exc)
+        return {}
+    return components
+
+
 def ensure_tinyhat_plugin_installed() -> bool:
     """Install the public Tinyhat tool plugin into OpenClaw.
 
@@ -2706,7 +2853,11 @@ def _run_one_binding_cycle() -> int:
                 metrics["private_access"] = private_access
             try:
                 heartbeat = post_json(
-                    "/hapi/v1/computers/me/heartbeat", {"metrics": metrics}
+                    "/hapi/v1/computers/me/heartbeat",
+                    {
+                        "metrics": metrics,
+                        "component_versions": collect_component_versions(),
+                    },
                 )
                 command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
                 if isinstance(command, dict):

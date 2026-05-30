@@ -5,6 +5,12 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.1
+
+### Added
+
+- Report installed component versions (Tinyhat runtime, Tinyhat plugin, and OpenClaw framework) on each heartbeat so the platform can show what a Computer is actually running.
+
 ## 0.10.0
 
 ### Added
