@@ -5,6 +5,12 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.5
+
+### Fixed
+
+- On redelivery, repost the component-update result using the cached applied_versions from the persisted state instead of recomputing them live, so the reported result stays faithful to what was applied (especially across a restart or for a failed component).
+
 ## 0.10.4
 
 ### Fixed
