@@ -5,6 +5,14 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.6
+
+### Fixed
+
+- Cap OpenRouter completion tokens at 8192 on every model-catalog entry
+  so Kimi-style high-context routes do not request the provider's full
+  context window as output tokens (tinyloophub/tinyloop#567).
+
 ## 0.10.5
 
 ### Fixed
