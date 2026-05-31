@@ -1874,15 +1874,18 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self._env.start()
         os.environ.pop("TINYHAT_DEV_RUNTIME", None)
         # collect_component_versions hits git + the openclaw CLI; stub it for
-        # every test so the result POST has a deterministic payload.
+        # every test so the result POST has a deterministic payload. The same
+        # payload is cached into the dedupe-state record, so tests assert
+        # against self._versions_payload.
+        self._versions_payload = {
+            "runtime": {"version": "0.10.2", "sha": "rsha"},
+            "plugin": {"version": "1.2.3", "sha": "psha"},
+            "framework": {"version": "1.4.2", "sha": None},
+        }
         self._versions = patch.object(
             supervisor,
             "collect_component_versions",
-            return_value={
-                "runtime": {"version": "0.10.2", "sha": "rsha"},
-                "plugin": {"version": "1.2.3", "sha": "psha"},
-                "framework": {"version": "1.4.2", "sha": None},
-            },
+            return_value=self._versions_payload,
         )
         self._versions.start()
         # Never make a real network call from the result POST.
@@ -1895,6 +1898,34 @@ class UpdateComponentCommandTests(unittest.TestCase):
     def _read_state(self) -> dict:
         with open(self._state_path, encoding="utf-8") as fh:
             return json.load(fh)
+
+    def test_state_write_defaults_to_unreported_with_empty_cache(self) -> None:
+        # New state shape: reported defaults to False and the cached-result
+        # fields are present (empty / null when not supplied).
+        supervisor._write_component_update_state(7, "applied")
+        state = supervisor._read_component_update_state()
+        self.assertEqual(state["last_revision"], 7)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], {})
+        self.assertIsNone(state["diagnostic"])
+
+    def test_state_write_persists_reported_and_cached_result(self) -> None:
+        supervisor._write_component_update_state(
+            8,
+            "failed",
+            diagnostic="boom",
+            applied_versions={"plugin": {"version": "1.2.3", "sha": "p"}},
+            reported=True,
+        )
+        state = supervisor._read_component_update_state()
+        self.assertEqual(state["last_revision"], 8)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["diagnostic"], "boom")
+        self.assertIs(state["reported"], True)
+        self.assertEqual(
+            state["applied_versions"], {"plugin": {"version": "1.2.3", "sha": "p"}}
+        )
 
     def test_dispatch_routes_update_component_to_handler(self) -> None:
         cmd = {
@@ -1948,7 +1979,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 3)
         self.assertEqual(kwargs["status"], "applied")
-        self.assertEqual(self._read_state(), {"last_revision": 3, "status": "applied"})
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 3)
+        self.assertEqual(state["status"], "applied")
+        # The result POST was acknowledged (the mocked post did not raise),
+        # so the revision is marked reported and a redelivery will dedupe.
+        self.assertIs(state["reported"], True)
 
     def test_plugin_ref_env_is_restored_after_install(self) -> None:
         sentinel = "ref-before-update"
@@ -2028,8 +2064,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
         diagnostic = kwargs["diagnostic"]
         self.assertIsInstance(diagnostic, str)
         self.assertIn("mismatch", diagnostic)
-        # Failed revision is still recorded so a re-delivery dedupes.
-        self.assertEqual(self._read_state(), {"last_revision": 5, "status": "failed"})
+        # Failed revision is still recorded so a re-delivery dedupes, and
+        # because the result POST was acknowledged it is marked reported.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 5)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
 
     def test_component_failure_reports_failed_without_crashing(self) -> None:
         cmd = {
@@ -2057,7 +2097,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["revision"], 6)
         self.assertEqual(kwargs["status"], "failed")
         self.assertIsInstance(kwargs["diagnostic"], str)
-        self.assertEqual(self._read_state(), {"last_revision": 6, "status": "failed"})
+        # Failed revision is recorded and, because the result POST was
+        # acknowledged, marked reported.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 6)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
 
     def test_dev_mode_runtime_self_update_is_relaxed(self) -> None:
         cmd = {
@@ -2136,8 +2181,14 @@ class UpdateComponentCommandTests(unittest.TestCase):
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["status"], "failed")
 
-    def test_per_revision_dedupe_skips_redelivery(self) -> None:
-        # Pre-seed a failed revision; a re-delivery must NOT re-attempt.
+    def test_legacy_state_without_reported_reposts_not_reattempts(self) -> None:
+        # Backward-compat / upgrade migration: a state file written by the
+        # previous runtime version has only {last_revision, status} and no
+        # "reported" key. After upgrade, a redelivery of that revision must
+        # NOT re-attempt the update (no install, no restart) — that is the
+        # guarantee the old dedupe carried — but, because the result was
+        # never recorded as acknowledged, it re-POSTs the cached result once
+        # (so a result that was lost pre-upgrade is recovered).
         with open(self._state_path, "w", encoding="utf-8") as fh:
             json.dump({"last_revision": 12, "status": "failed"}, fh)
         cmd = {
@@ -2150,12 +2201,191 @@ class UpdateComponentCommandTests(unittest.TestCase):
             patch.object(
                 supervisor, "_restart_gateway_for_component_update"
             ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
         ):
             supervisor.handle_update_component_command(cmd)
 
+        # The update itself is NOT re-run.
         installer.assert_not_called()
         restart_gateway.assert_not_called()
+        restart_supervisor.assert_not_called()
+        # The cached (legacy) result is re-POSTed exactly once.
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 12)
+        self.assertEqual(kwargs["status"], "failed")
+        # And the record is upgraded in place to reported=True.
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_transient_post_failure_then_redelivery_reposts(self) -> None:
+        """P1 regression (tinyloophub/tinyloop#562): a swallowed result-POST
+        failure must NOT mark the revision deduped. The redelivery re-POSTs
+        the cached result without re-running the install or restarting, and
+        flips reported=True.
+        """
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        # --- First delivery: install succeeds, result POST fails. ---
+        self._posted.side_effect = RuntimeError("transient 503")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_1,
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor, "_restart_gateway_for_component_update"),
+        ):
+            # Must not raise even though the result POST failed.
+            supervisor.handle_update_component_command(cmd)
+        installer_1.assert_called_once()
+        # State persisted the cached result, unreported, so a redelivery
+        # re-POSTs it instead of dropping it.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 100)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], self._versions_payload)
+
+        # --- Redelivery of the SAME revision, POST now succeeding. ---
+        self._posted.reset_mock()
+        self._posted.side_effect = None
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_2,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw_2,
+            patch.object(supervisor, "_restart_supervisor") as restart_2,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-install, no gateway restart, no supervisor restart.
+        installer_2.assert_not_called()
+        gw_2.assert_not_called()
+        restart_2.assert_not_called()
+        # The cached result was re-POSTed (revision + cached status).
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 100)
+        self.assertEqual(kwargs["status"], "applied")
+        # State now records the result as reported.
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_fully_reported_revision_is_deduped(self) -> None:
+        # A revision whose state is already reported is fully deduped:
+        # zero install, zero restart, zero post.
+        supervisor._write_component_update_state(
+            100, "applied", applied_versions={"plugin": "1.2.3"}, reported=True
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
         self._posted.assert_not_called()
+
+    def test_repost_failure_leaves_reported_false_for_retry(self) -> None:
+        # If the repost itself fails again, reported stays False so a later
+        # redelivery will retry — still no re-install, no restart.
+        supervisor._write_component_update_state(
+            100, "applied", applied_versions={"plugin": "1.2.3"}, reported=False
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        self._posted.side_effect = RuntimeError("still down")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
+        # The repost was attempted (and failed); reported stays False.
+        self._posted.assert_called_once()
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 100)
+        self.assertIs(state["reported"], False)
+
+    def test_successful_update_persists_reported_true(self) -> None:
+        # Happy path: a successful update whose POST is acknowledged ends with
+        # reported=True so the next redelivery fully dedupes.
+        cmd = {
+            "type": "update_component",
+            "revision": 101,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor, "_restart_gateway_for_component_update"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 101)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], True)
+
+    def test_runtime_self_update_reposts_after_restart_when_post_failed(self) -> None:
+        """Runtime restart-safety: if the runtime self-update's POST fails, the
+        persisted state is reported=False BEFORE the restart, so the
+        post-restart process re-POSTs the cached result (no re-install, no
+        second restart).
+        """
+        cmd = {
+            "type": "update_component",
+            "revision": 102,
+            "targets": {"runtime": {"ref": "v0.10.3"}},
+        }
+        # --- First delivery: runtime applies, POST fails, then restart. ---
+        self._posted.side_effect = RuntimeError("post failed")
+        with (
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ) as update_1,
+            patch.object(supervisor, "_restart_supervisor") as restart_1,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        update_1.assert_called_once()
+        # The restart STILL happens (the new runtime must take effect), and
+        # the pre-restart state records the unreported outcome.
+        restart_1.assert_called_once()
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 102)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], self._versions_payload)
+
+        # --- Post-restart redelivery: re-POSTs, no re-apply, no restart. ---
+        self._posted.reset_mock()
+        self._posted.side_effect = None
+        with (
+            patch.object(supervisor, "_update_runtime_component") as update_2,
+            patch.object(supervisor, "_restart_supervisor") as restart_2,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        update_2.assert_not_called()
+        restart_2.assert_not_called()
+        self._posted.assert_called_once()
+        self.assertEqual(self._posted.call_args.kwargs["status"], "applied")
+        self.assertIs(self._read_state()["reported"], True)
 
     def test_malformed_command_is_ignored(self) -> None:
         # Defensive: missing revision or targets must not raise or POST.

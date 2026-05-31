@@ -2722,17 +2722,44 @@ def _read_component_update_state() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _write_component_update_state(revision: int, status: str) -> None:
+def _write_component_update_state(
+    revision: int,
+    status: str,
+    *,
+    diagnostic: str | None = None,
+    applied_versions: dict | None = None,
+    reported: bool = False,
+) -> None:
     """Persist the last attempted component-update revision + outcome.
 
+    The record carries the full cached apply-result plus a ``reported``
+    flag so a redelivery can tell apart two cases that look identical on
+    ``last_revision`` alone:
+
+    - ``reported is True``  — the result POST was acknowledged by the
+      platform. The revision is fully done; a redelivery is a no-op.
+    - ``reported is False`` — the update ran but its result POST never
+      landed (e.g. a transient network error, swallowed). A redelivery
+      must re-POST the cached result (not re-run the update).
+
+    Without this flag the old code marked the revision done the moment it
+    was attempted, so a swallowed POST failure permanently lost the only
+    result report (the platform stayed "pending"; the runtime self-update
+    restart re-read the same done-marker and skipped the re-POST too).
+
     Best-effort: a write failure is warning-logged but never raised — the
-    update result itself has already been (or is about to be) POSTed, and a
-    missing dedupe record at worst re-runs an idempotent update.
+    update itself already succeeded and the handler must not crash.
     """
     try:
         _atomic_write_json(
             _component_update_state_path(),
-            {"last_revision": int(revision), "status": str(status)},
+            {
+                "last_revision": int(revision),
+                "status": str(status),
+                "diagnostic": diagnostic,
+                "applied_versions": applied_versions or {},
+                "reported": bool(reported),
+            },
             mode=0o600,
         )
     except Exception as exc:  # noqa: BLE001 - never fatal
@@ -2945,6 +2972,64 @@ def _post_component_update_result(
     post_json("/hapi/v1/computers/me/component-update/apply-result", body)
 
 
+def _try_report_and_persist(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None,
+    applied_versions: dict | None,
+) -> bool:
+    """POST the apply-result, then persist whether it was acknowledged.
+
+    The caller has already written the state with ``reported=False``. We
+    attempt the POST: on success we re-persist the same cached result with
+    ``reported=True`` (so a redelivery dedupes); on any failure we swallow
+    the error (as the handler did before) and leave ``reported=False`` (so
+    a redelivery re-POSTs the cached result). Returns whether it was
+    acknowledged. Never raises.
+    """
+    try:
+        _post_component_update_result(
+            revision=revision, status=status, diagnostic=diagnostic
+        )
+    except Exception as exc:  # noqa: BLE001 - report is best-effort
+        log.warning(
+            "failed to post component update result for revision=%d: %s",
+            revision,
+            exc,
+        )
+        return False
+    _write_component_update_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+        reported=True,
+    )
+    return True
+
+
+def _repost_component_update_result(revision: int, state: dict) -> None:
+    """Re-POST a previously-cached, unreported apply-result on redelivery.
+
+    Used when the platform redelivers a revision that was already applied
+    but whose result POST never landed. Re-POSTs the cached status /
+    diagnostic WITHOUT re-running the update or restarting, and flips
+    ``reported`` to True only if the repost is acknowledged. Never raises.
+    """
+    status = str(state.get("status") or "applied")
+    diagnostic = state.get("diagnostic")
+    applied_versions = state.get("applied_versions")
+    if not isinstance(applied_versions, dict):
+        applied_versions = {}
+    _try_report_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic if isinstance(diagnostic, str) else None,
+        applied_versions=applied_versions,
+    )
+
+
 def handle_update_component_command(command: dict) -> None:
     """Handle one heartbeat-delivered ``update_component`` command.
 
@@ -2955,9 +3040,16 @@ def handle_update_component_command(command: dict) -> None:
 
     Per-revision dedupe: the platform re-sends the command until it sees the
     target revision reflected in a heartbeat, so the same command can arrive
-    multiple times. We persist each attempted revision and skip a
-    re-delivery, mirroring the ``apply_config`` dedupe (and the persisted
-    file survives the runtime self-update's process restart).
+    multiple times. The dedupe gate keys on whether the apply-result was
+    *acknowledged*, not merely on "revision attempted" (the persisted file
+    survives the runtime self-update's process restart):
+
+    - same revision, ``reported is True``  -> fully done; skip entirely
+      (no install, no restart, no post).
+    - same revision, ``reported is not True`` -> the update already ran but
+      its result POST never landed; re-POST the cached result only (no
+      re-install, no restart).
+    - new revision -> perform the update.
     """
     revision = _command_revision(command)
     targets = command.get("targets")
@@ -2967,11 +3059,24 @@ def handle_update_component_command(command: dict) -> None:
 
     state = _read_component_update_state()
     if state.get("last_revision") == revision:
+        if state.get("reported") is True:
+            log.info(
+                "update_component revision=%d already applied (status=%s) and "
+                "reported; skipping",
+                revision,
+                state.get("status"),
+            )
+            return
+        # Redelivery of an already-performed update whose result POST never
+        # landed: re-POST the cached result only. Do NOT re-run the install
+        # and do NOT restart.
         log.info(
-            "update_component revision=%d already attempted (status=%s); skipping",
+            "update_component revision=%d already applied (status=%s) but "
+            "unreported; reposting cached result",
             revision,
             state.get("status"),
         )
+        _repost_component_update_result(revision, state)
         return
 
     log.info("heartbeat command: applying component update revision=%d", revision)
@@ -3019,25 +3124,43 @@ def handle_update_component_command(command: dict) -> None:
 
     status = "applied" if all_ok else "failed"
     diagnostic = "; ".join(diagnostics) if diagnostics else None
+    # Cache the resolved component versions alongside the result so the state
+    # record is self-describing for debugging. ``collect_component_versions``
+    # is contractually non-raising (see its tests), so this stays defensive.
+    applied_versions = collect_component_versions()
 
-    # Record the attempted revision (success or fail) for dedupe BEFORE any
-    # restart, so the re-execed supervisor does not re-run this revision on
-    # its next heartbeat.
-    _write_component_update_state(revision, status)
+    # Durably record the outcome with reported=False BEFORE attempting the
+    # network post, so a crash / restart between here and the post never
+    # loses the apply-result: a redelivery sees the unreported state and
+    # re-POSTs the cached result instead of silently dropping it. (The old
+    # code wrote the dedupe marker here and swallowed a POST failure, which
+    # is exactly how a transient error left the platform stuck "pending".)
+    _write_component_update_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+        reported=False,
+    )
 
-    # Post the result before restarting for a runtime self-update (the
-    # restart may terminate this process). For non-runtime updates this is
-    # the normal post-after-work path.
-    try:
-        _post_component_update_result(
-            revision=revision, status=status, diagnostic=diagnostic
-        )
-    except Exception as exc:
-        log.warning(
-            "failed to post component update result for revision=%d: %s",
-            revision,
-            exc,
-        )
+    # Post the result, then persist whether the platform acknowledged it.
+    # On success -> reported=True (a redelivery dedupes). On failure -> the
+    # error is swallowed (as before) but reported stays False, so a
+    # redelivery re-POSTs the cached result.
+    #
+    # Runtime restart-safety: for a runtime self-update the restart must
+    # still happen so the new code takes effect, and the post must precede
+    # it (the restart can terminate this process). We persist the post
+    # outcome BEFORE the restart, so the post-restart supervisor does the
+    # right thing in BOTH directions: reported=True -> it dedupes;
+    # reported=False -> it re-POSTs the cached result (no re-install, no
+    # second restart).
+    _try_report_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+    )
 
     if runtime_needs_restart:
         _restart_supervisor()
