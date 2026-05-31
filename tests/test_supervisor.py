@@ -46,6 +46,15 @@ def _openrouter_binding(model_package: dict) -> dict:
     }
 
 
+def _openrouter_catalog_entry(alias: str) -> dict:
+    return {
+        "alias": alias,
+        "params": {
+            "max_completion_tokens": supervisor.OPENROUTER_COMPLETION_TOKEN_CAP,
+        },
+    }
+
+
 class ReloadOpenClawSecretsTests(unittest.TestCase):
     def test_gateway_settle_retries_until_reload_succeeds(self) -> None:
         calls = 0
@@ -156,9 +165,15 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         self.assertEqual(
             config["agents"]["defaults"]["models"],
             {
-                "openrouter/deepseek/deepseek-v4-flash": {"alias": "cheap"},
-                "openrouter/deepseek/deepseek-v4-pro": {"alias": "default"},
-                "openrouter/moonshotai/kimi-k2.6": {"alias": "power"},
+                "openrouter/deepseek/deepseek-v4-flash": (
+                    _openrouter_catalog_entry("cheap")
+                ),
+                "openrouter/deepseek/deepseek-v4-pro": (
+                    _openrouter_catalog_entry("default")
+                ),
+                "openrouter/moonshotai/kimi-k2.6": (
+                    _openrouter_catalog_entry("power")
+                ),
             },
         )
         self.assertEqual(config["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
@@ -188,7 +203,7 @@ class OpenRouterModelPackageTests(unittest.TestCase):
             config["agents"]["defaults"]["models"],
             {
                 "openrouter/deepseek/deepseek-v4-flash:free": {
-                    "alias": "free-demo"
+                    **_openrouter_catalog_entry("free-demo"),
                 },
             },
         )
