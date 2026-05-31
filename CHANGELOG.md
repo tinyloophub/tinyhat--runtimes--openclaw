@@ -5,6 +5,30 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.5
+
+### Fixed
+
+- On redelivery, repost the component-update result using the cached applied_versions from the persisted state instead of recomputing them live, so the reported result stays faithful to what was applied (especially across a restart or for a failed component).
+
+## 0.10.4
+
+### Fixed
+
+- Make the component-update dedupe-state path stable across a supervisor restart (independent of dev-only env), so the post-restart process finds the persisted unreported result and reposts it instead of re-running the update.
+
+## 0.10.3
+
+### Fixed
+
+- Dedupe the component-update command after ack so a redelivered command does not re-run the update a second time.
+
+## 0.10.2
+
+### Added
+
+- Handle the `update_component` heartbeat command — update the Tinyhat runtime, Tinyhat plugin, and OpenClaw framework in place to a target release and report the applied versions.
+
 ## 0.10.1
 
 ### Added

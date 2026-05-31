@@ -111,8 +111,28 @@ TINYHAT_PLUGIN_REPO_REF_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_REF"
 TINYHAT_PLUGIN_REPO_URL_DEFAULT = "https://github.com/tinyhat-ai/tinyhat.git"
 TINYHAT_PLUGIN_REPO_REF_DEFAULT = "main"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
+# The systemd unit that runs THIS supervisor in production. Used by the
+# runtime self-update path (the ``update_component`` command): after the
+# runtime repo is checked out to a new ref, the still-running old
+# supervisor process must be replaced by the freshly checked-out code, so
+# we restart this unit (with an in-process ``os.execv`` fallback). Override
+# via env if the deployment names the unit differently.
+SUPERVISOR_SYSTEMD_UNIT = (
+    os.environ.get("TINYHAT_SUPERVISOR_UNIT") or "tinyhat-supervisor.service"
+).strip()
 PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
     "/var/lib/tinyhat-private-access/bootstrap-status.json"
+)
+# Where the in-place component-update dedupe state is persisted. Mirrors
+# the per-revision dedupe of ``apply_config`` (``_config_apply_state``) but
+# must survive a supervisor restart — the runtime self-update restarts this
+# process, and the re-execed supervisor must not re-run the same revision.
+# This default is a FIXED absolute path OUTSIDE the runtime checkout dir
+# (``runtime_dir()``), precisely so the in-place re-checkout + restart cannot
+# move or erase it; ``_component_update_state_path()`` enforces that stability
+# invariant for any override too. See tinyloophub/tinyloop#562.
+_DEFAULT_COMPONENT_UPDATE_STATE_PATH = (
+    "/var/lib/tinyhat/component-update-state.json"
 )
 
 # Instance-metadata keys the platform writes at insert time and can
@@ -2653,6 +2673,586 @@ def handle_apply_config_command(command: dict) -> None:
             )
 
 
+# --------------------------------------------------------------------------
+# In-place component update (runtime / plugin / framework)
+# --------------------------------------------------------------------------
+#
+# On a heartbeat the platform may hand back an ``update_component`` command
+# naming a target release for any subset of the three components that make
+# up a running Computer::
+#
+#     {"type": "update_component", "revision": <int>, "targets": {
+#         "runtime":   {"ref": "<git tag>"},        # optional
+#         "plugin":    {"ref": "<git tag>"},        # optional
+#         "framework": {"version": "<npm version>"} # optional
+#     }}
+#
+# Only the components present in ``targets`` are touched. The update is
+# strictly IN PLACE: we never recreate the box and never wipe the BYO-ChatGPT
+# OAuth auth store. That store is owner-scoped and only cleared on an owner
+# change (see ``_wipe_on_owner_release``, called solely from the binding
+# watchdog's ``assigned=false`` / owner-signature-changed branches); a
+# same-owner component update never goes near it.
+#
+# After acting, the supervisor POSTs the outcome to
+# ``/hapi/v1/computers/me/component-update/apply-result`` (mirroring the
+# ``apply_config`` result POST), and the next regular heartbeat re-reports
+# the now-running versions via ``collect_component_versions``.
+#
+# Components are updated in the order plugin -> framework -> runtime so the
+# riskiest step (the supervisor updating the very repo it runs from, which
+# requires restarting this process) runs LAST; a plugin/framework failure
+# therefore never strands a half-updated runtime.
+
+
+def _component_update_state_path() -> str:
+    """Resolve the dedupe-state file path, stable across a supervisor restart.
+
+    The whole point of the persisted ``reported`` record is that the process
+    started AFTER a runtime self-update restart (systemd restart / ``os.execv``)
+    reads back the same file the pre-restart process wrote. That guarantee only
+    holds if this function returns the SAME absolute path before and after the
+    restart, so the path must not depend on anything that changes between boots
+    (the process cwd, or a location inside the runtime checkout that the
+    in-place re-checkout can move/erase).
+
+    Two hardening rules make that explicit rather than implicit:
+
+    - The result is always absolutized, so the returned path never depends on
+      the cwd the supervisor happens to be launched with.
+    - The ``TINYHAT_COMPONENT_UPDATE_STATE_PATH`` override stays honoured for
+      explicit operator control, but ONLY when it points outside the runtime
+      checkout dir. An override that resolves INSIDE ``runtime_dir()`` is the
+      exact footgun a reviewer flagged: the runtime self-update checks the repo
+      out in place, so a state file under that dir is not guaranteed to survive
+      the restart. In that case we warn and fall back to the fixed default
+      (a per-box absolute path outside the checkout) so the dedupe guarantee is
+      preserved instead of silently voided.
+
+    See tinyloophub/tinyloop#562 for the platform side of this contract.
+    """
+    default_path = os.path.abspath(_DEFAULT_COMPONENT_UPDATE_STATE_PATH.strip())
+    override = (os.environ.get("TINYHAT_COMPONENT_UPDATE_STATE_PATH") or "").strip()
+    if not override:
+        return default_path
+
+    override_abs = os.path.abspath(override)
+    checkout_dir = os.path.abspath(runtime_dir())
+    # ``os.path.commonpath`` raises on e.g. mixed drives; treat any failure as
+    # "not inside the checkout" and trust the operator's explicit absolute path.
+    try:
+        inside_checkout = (
+            os.path.commonpath([override_abs, checkout_dir]) == checkout_dir
+        )
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        log.warning(
+            "TINYHAT_COMPONENT_UPDATE_STATE_PATH=%s resolves inside the runtime "
+            "checkout dir (%s); a runtime self-update re-checks-out that dir in "
+            "place, so the dedupe state would not survive the restart. Falling "
+            "back to the restart-stable default %s.",
+            override_abs,
+            checkout_dir,
+            default_path,
+        )
+        return default_path
+    return override_abs
+
+
+def _read_component_update_state() -> dict:
+    """Read the per-revision component-update dedupe record.
+
+    Returns an empty dict when the file is missing or unreadable so a first
+    update (or a wiped box) is never blocked.
+    """
+    try:
+        with open(_component_update_state_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_component_update_state(
+    revision: int,
+    status: str,
+    *,
+    diagnostic: str | None = None,
+    applied_versions: dict | None = None,
+    reported: bool = False,
+) -> None:
+    """Persist the last attempted component-update revision + outcome.
+
+    The record carries the full cached apply-result plus a ``reported``
+    flag so a redelivery can tell apart two cases that look identical on
+    ``last_revision`` alone:
+
+    - ``reported is True``  — the result POST was acknowledged by the
+      platform. The revision is fully done; a redelivery is a no-op.
+    - ``reported is False`` — the update ran but its result POST never
+      landed (e.g. a transient network error, swallowed). A redelivery
+      must re-POST the cached result (not re-run the update).
+
+    Without this flag the old code marked the revision done the moment it
+    was attempted, so a swallowed POST failure permanently lost the only
+    result report (the platform stayed "pending"; the runtime self-update
+    restart re-read the same done-marker and skipped the re-POST too).
+
+    Best-effort: a write failure is warning-logged but never raised — the
+    update itself already succeeded and the handler must not crash.
+    """
+    try:
+        _atomic_write_json(
+            _component_update_state_path(),
+            {
+                "last_revision": int(revision),
+                "status": str(status),
+                "diagnostic": diagnostic,
+                "applied_versions": applied_versions or {},
+                "reported": bool(reported),
+            },
+            mode=0o600,
+        )
+    except Exception as exc:  # noqa: BLE001 - never fatal
+        log.warning("failed to persist component-update state: %s", exc)
+
+
+def _restart_gateway_for_component_update() -> None:
+    """Restart the OpenClaw gateway so a plugin/framework update takes effect.
+
+    Reuses the supervisor's existing restart primitive rather than inventing
+    a parallel path: setting the rebind flag makes ``main()`` stop the
+    gateway and re-run Phase B (re-read ``/me/binding`` -> rewrite
+    openclaw.json -> restart the gateway with the correct binding). This is
+    the same lever ``_signal_rebind_for_secrets`` pulls for an env-block
+    change, so it respects whatever the binding watchdog is doing and does
+    not fight a config-apply that is mid-flight.
+
+    Note this does NOT reload ``supervisor.py`` itself — a runtime
+    self-update needs ``_restart_supervisor`` instead.
+    """
+    log.info(
+        "component update: signaling gateway rebind so the updated "
+        "plugin/framework is picked up"
+    )
+    _stop_holder["rebind"] = True
+    _stop_holder["stop"] = True
+
+
+def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
+    """Update the Tinyhat plugin to ``ref`` in place; restart the gateway.
+
+    ``ensure_tinyhat_plugin_installed`` reads the target ref from the
+    ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` env var, so we override it for the
+    duration of the call (git fetch + checkout + ``openclaw plugins install
+    --force`` + marker write all key off that ref). The resolved version /
+    sha are then read back from the install marker.
+
+    Returns ``(ok, diagnostic)``; never raises.
+    """
+    previous = os.environ.get(TINYHAT_PLUGIN_REPO_REF_ENV)
+    os.environ[TINYHAT_PLUGIN_REPO_REF_ENV] = ref
+    try:
+        ensure_tinyhat_plugin_installed()
+    except Exception as exc:  # noqa: BLE001 - keep the update non-fatal
+        return False, f"plugin update to {ref} failed: {exc}"
+    finally:
+        if previous is None:
+            os.environ.pop(TINYHAT_PLUGIN_REPO_REF_ENV, None)
+        else:
+            os.environ[TINYHAT_PLUGIN_REPO_REF_ENV] = previous
+    marker = _read_installed_plugin_marker()
+    sha = str(marker.get("resolved_commit_sha") or "")
+    log.info("component update: plugin now at ref=%s sha=%s", ref, sha[:12])
+    _restart_gateway_for_component_update()
+    return True, None
+
+
+def _update_framework_component(version: str) -> tuple[bool, str | None]:
+    """Update the OpenClaw framework (npm package) to ``version`` in place.
+
+    Mirrors the bootstrap install style (``npm install -g`` with the
+    non-interactive flags). Verifies the installed version matches the
+    target via ``_read_openclaw_framework_version`` before declaring
+    success, then restarts the gateway. Returns ``(ok, diagnostic)``;
+    never raises.
+    """
+    try:
+        install = subprocess.run(
+            ["npm", "install", "-g", "--no-fund", "--no-audit", f"openclaw@{version}"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"framework npm install of openclaw@{version} timed out"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"framework npm install raised: {exc}"
+    if install.returncode != 0:
+        detail = (install.stderr or install.stdout or "").strip()
+        return False, f"framework npm install failed: {detail[:200]}"
+    installed = _read_openclaw_framework_version()
+    if installed != version:
+        return (
+            False,
+            "framework version mismatch after install: "
+            f"wanted {version}, got {installed or 'unknown'}",
+        )
+    log.info("component update: framework now at %s", version)
+    _restart_gateway_for_component_update()
+    return True, None
+
+
+def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
+    """Check out the runtime repo to ``ref`` in place (the self-update).
+
+    The supervisor updates the very repo it runs from. The running process
+    keeps executing the OLD code until it is restarted, so the CALLER is
+    responsible for posting the applied-result BEFORE triggering the restart
+    (see ``handle_update_component_command``) — that way the platform records
+    success even if the restart terminates this process mid-flight.
+
+    Dev mode (``TINYHAT_DEV_RUNTIME=1``): the supervisor source is typically
+    bind-mounted from the host checkout, so an in-container ``git checkout``
+    would not reflect what is actually running (and could collide with the
+    bind mount). We therefore SKIP the checkout and report success with a
+    clear diagnostic rather than failing hard.
+
+    Returns ``(ok, diagnostic)``; never raises. On any failure we stay on the
+    current ref (git checkout is atomic per-ref, so a failed checkout leaves
+    the working tree untouched) — the box is never left without a working
+    supervisor.
+    """
+    if _dev_mode():
+        log.info("dev runtime: skipping runtime self-update (source is bind-mounted)")
+        return True, "dev runtime: runtime self-update skipped (bind-mounted source)"
+    d = runtime_dir()
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", d, "fetch", "--tags", "--prune"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            detail = (fetch.stderr or fetch.stdout or "").strip()
+            return False, f"runtime fetch failed: {detail[:200]}"
+        checkout = subprocess.run(
+            ["git", "-C", d, "checkout", ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if checkout.returncode != 0:
+            detail = (checkout.stderr or checkout.stdout or "").strip()
+            return False, f"runtime checkout of {ref} failed: {detail[:200]}"
+    except subprocess.TimeoutExpired:
+        return False, f"runtime update to {ref} timed out"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"runtime update raised: {exc}"
+    new_version = _read_runtime_repo_version()
+    new_sha = _read_runtime_git_sha()
+    log.info(
+        "component update: runtime checked out to ref=%s (version=%s sha=%s)",
+        ref,
+        new_version or "unknown",
+        new_sha[:12] or "unknown",
+    )
+    return True, None
+
+
+def _restart_supervisor() -> None:
+    """Restart THIS supervisor so a freshly checked-out runtime takes effect.
+
+    Production: restart the supervisor's systemd unit. systemd starts a new
+    supervisor process from the new repo state, so this call may not return
+    (the restart can terminate us mid-call) — which is exactly why the
+    applied-result is POSTed before this runs. If ``systemctl`` returns (it
+    failed, or the unit name is wrong), we fall back to re-execing ourselves
+    in place via ``os.execv`` so the updated ``supervisor.py`` is still
+    loaded.
+
+    Dev mode: no-op — the dev harness owns the process lifecycle and the
+    source is bind-mounted, so there is nothing to restart here.
+    """
+    if _dev_mode():
+        log.info("dev runtime: supervisor restart is a no-op")
+        return
+    log.info(
+        "component update: restarting supervisor unit %s to load updated runtime",
+        SUPERVISOR_SYSTEMD_UNIT,
+    )
+    try:
+        result = _run_systemctl("restart", SUPERVISOR_SYSTEMD_UNIT, check=False)
+        # If systemctl returned, the restart did not replace us. Fall back to
+        # a clean in-process re-exec so the new code is still picked up.
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            log.warning("supervisor systemctl restart failed: %s", detail[:200])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("supervisor systemctl restart raised: %s", exc)
+    try:
+        log.info("component update: re-execing supervisor in place")
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+    except Exception as exc:  # noqa: BLE001 - last resort; never crash the box
+        log.warning("supervisor re-exec failed: %s", exc)
+
+
+def _post_component_update_result(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None = None,
+    applied_versions: dict | None = None,
+) -> None:
+    """POST the component-update outcome to the platform.
+
+    Mirrors ``_post_config_apply_result`` but on the component-update
+    endpoint, and additionally carries ``applied_versions`` so the platform
+    can confirm exactly what landed.
+
+    ``applied_versions`` is passed in by the caller — it is NOT recomputed
+    here. The first delivery computes the snapshot once (after the update,
+    before the post) and persists that exact dict; a redelivery/repost
+    passes back the *cached* dict read from the persisted state. Recomputing
+    live at POST time would defeat the durability guarantee: a repost across
+    a runtime self-update restart (or for a FAILED component, whose cache
+    records the pre-failure versions) must report exactly what was recorded,
+    not a fresh snapshot of whatever the box happens to be running now. See
+    tinyloophub/tinyloop#562 for the platform side of this contract.
+    """
+    body: dict = {
+        "revision": revision,
+        "status": status,
+        "diagnostic": diagnostic[:1023] if diagnostic else None,
+        "applied_versions": applied_versions or {},
+    }
+    post_json("/hapi/v1/computers/me/component-update/apply-result", body)
+
+
+def _try_report_and_persist(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None,
+    applied_versions: dict | None,
+) -> bool:
+    """POST the apply-result, then persist whether it was acknowledged.
+
+    The caller has already written the state with ``reported=False``. We
+    attempt the POST: on success we re-persist the same cached result with
+    ``reported=True`` (so a redelivery dedupes); on any failure we swallow
+    the error (as the handler did before) and leave ``reported=False`` (so
+    a redelivery re-POSTs the cached result). Returns whether it was
+    acknowledged. Never raises.
+    """
+    try:
+        # Post EXACTLY the cached result the caller handed us. On a repost
+        # this dict came from the persisted state, so the redelivery reports
+        # what was originally applied rather than a fresh live recompute.
+        _post_component_update_result(
+            revision=revision,
+            status=status,
+            diagnostic=diagnostic,
+            applied_versions=applied_versions,
+        )
+    except Exception as exc:  # noqa: BLE001 - report is best-effort
+        log.warning(
+            "failed to post component update result for revision=%d: %s",
+            revision,
+            exc,
+        )
+        return False
+    _write_component_update_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+        reported=True,
+    )
+    return True
+
+
+def _repost_component_update_result(revision: int, state: dict) -> None:
+    """Re-POST a previously-cached, unreported apply-result on redelivery.
+
+    Used when the platform redelivers a revision that was already applied
+    but whose result POST never landed. Re-POSTs the cached status /
+    diagnostic WITHOUT re-running the update or restarting, and flips
+    ``reported`` to True only if the repost is acknowledged. Never raises.
+    """
+    status = str(state.get("status") or "applied")
+    diagnostic = state.get("diagnostic")
+    applied_versions = state.get("applied_versions")
+    if not isinstance(applied_versions, dict):
+        applied_versions = {}
+    _try_report_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic if isinstance(diagnostic, str) else None,
+        applied_versions=applied_versions,
+    )
+
+
+def handle_update_component_command(command: dict) -> None:
+    """Handle one heartbeat-delivered ``update_component`` command.
+
+    See the section header above for the command shape and ordering
+    rationale. Defensive throughout: a Computer in the field must never
+    brick itself, so every component step is wrapped and a failure is
+    REPORTED (``status=failed``) rather than raised.
+
+    Per-revision dedupe: the platform re-sends the command until it sees the
+    target revision reflected in a heartbeat, so the same command can arrive
+    multiple times. The dedupe gate keys on whether the apply-result was
+    *acknowledged*, not merely on "revision attempted" (the persisted file
+    survives the runtime self-update's process restart):
+
+    - same revision, ``reported is True``  -> fully done; skip entirely
+      (no install, no restart, no post).
+    - same revision, ``reported is not True`` -> the update already ran but
+      its result POST never landed; re-POST the cached result only (no
+      re-install, no restart).
+    - new revision -> perform the update.
+    """
+    revision = _command_revision(command)
+    targets = command.get("targets")
+    if revision is None or not isinstance(targets, dict):
+        log.warning("ignoring malformed update_component command: %r", command)
+        return
+
+    state = _read_component_update_state()
+    if state.get("last_revision") == revision:
+        if state.get("reported") is True:
+            log.info(
+                "update_component revision=%d already applied (status=%s) and "
+                "reported; skipping",
+                revision,
+                state.get("status"),
+            )
+            return
+        # Redelivery of an already-performed update whose result POST never
+        # landed: re-POST the cached result only. Do NOT re-run the install
+        # and do NOT restart.
+        log.info(
+            "update_component revision=%d already applied (status=%s) but "
+            "unreported; reposting cached result",
+            revision,
+            state.get("status"),
+        )
+        _repost_component_update_result(revision, state)
+        return
+
+    log.info("heartbeat command: applying component update revision=%d", revision)
+    diagnostics: list[str] = []
+    all_ok = True
+
+    # Order: plugin -> framework -> runtime. The runtime self-update is the
+    # riskiest (rewrites the repo the supervisor runs from and must restart
+    # the process), so it runs last — a plugin/framework failure never
+    # strands a half-updated runtime.
+
+    plugin_target = targets.get("plugin")
+    if isinstance(plugin_target, dict) and str(plugin_target.get("ref") or "").strip():
+        ok, diag = _update_plugin_component(str(plugin_target["ref"]).strip())
+        all_ok = all_ok and ok
+        if diag:
+            diagnostics.append(diag)
+
+    framework_target = targets.get("framework")
+    if isinstance(framework_target, dict) and str(
+        framework_target.get("version") or ""
+    ).strip():
+        ok, diag = _update_framework_component(str(framework_target["version"]).strip())
+        all_ok = all_ok and ok
+        if diag:
+            diagnostics.append(diag)
+
+    # Runtime is handled specially: because the running process is still the
+    # OLD code until restarted, on a SUCCESSFUL real (non-dev) checkout we
+    # post the applied-result FIRST, then restart the supervisor process.
+    runtime_target = targets.get("runtime")
+    runtime_requested = isinstance(runtime_target, dict) and bool(
+        str(runtime_target.get("ref") or "").strip()
+    )
+    runtime_needs_restart = False
+    if runtime_requested:
+        ok, diag = _update_runtime_component(str(runtime_target["ref"]).strip())
+        all_ok = all_ok and ok
+        if diag:
+            diagnostics.append(diag)
+        # Only a real (non-dev) successful checkout requires a process
+        # restart to take effect. Dev mode returns ok with a "skipped"
+        # diagnostic and must not restart.
+        runtime_needs_restart = ok and not _dev_mode()
+
+    status = "applied" if all_ok else "failed"
+    diagnostic = "; ".join(diagnostics) if diagnostics else None
+    # Cache the resolved component versions alongside the result so the state
+    # record is self-describing for debugging. ``collect_component_versions``
+    # is contractually non-raising (see its tests), so this stays defensive.
+    applied_versions = collect_component_versions()
+
+    # Durably record the outcome with reported=False BEFORE attempting the
+    # network post, so a crash / restart between here and the post never
+    # loses the apply-result: a redelivery sees the unreported state and
+    # re-POSTs the cached result instead of silently dropping it. (The old
+    # code wrote the dedupe marker here and swallowed a POST failure, which
+    # is exactly how a transient error left the platform stuck "pending".)
+    _write_component_update_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+        reported=False,
+    )
+
+    # Post the result, then persist whether the platform acknowledged it.
+    # On success -> reported=True (a redelivery dedupes). On failure -> the
+    # error is swallowed (as before) but reported stays False, so a
+    # redelivery re-POSTs the cached result.
+    #
+    # Runtime restart-safety: for a runtime self-update the restart must
+    # still happen so the new code takes effect, and the post must precede
+    # it (the restart can terminate this process). We persist the post
+    # outcome BEFORE the restart, so the post-restart supervisor does the
+    # right thing in BOTH directions: reported=True -> it dedupes;
+    # reported=False -> it re-POSTs the cached result (no re-install, no
+    # second restart).
+    _try_report_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic,
+        applied_versions=applied_versions,
+    )
+
+    if runtime_needs_restart:
+        _restart_supervisor()
+
+
+def handle_heartbeat_command(command: dict) -> None:
+    """Dispatch a heartbeat-delivered command to its handler.
+
+    The platform piggybacks at most one command on a heartbeat response.
+    Unknown command types are ignored (forward-compatibility: an older
+    runtime must tolerate a newer platform emitting a command it does not
+    understand yet).
+    """
+    cmd_type = command.get("type")
+    if cmd_type == "apply_config":
+        handle_apply_config_command(command)
+    elif cmd_type == "start_chatgpt_link":
+        handle_start_chatgpt_link_command(command)
+    elif cmd_type == "update_component":
+        handle_update_component_command(command)
+    else:
+        log.info("ignoring unknown heartbeat command type: %r", cmd_type)
+
+
 def main() -> int:
     log.info("supervisor starting")
 
@@ -2861,11 +3461,7 @@ def _run_one_binding_cycle() -> int:
                 )
                 command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
                 if isinstance(command, dict):
-                    cmd_type = command.get("type")
-                    if cmd_type == "apply_config":
-                        handle_apply_config_command(command)
-                    elif cmd_type == "start_chatgpt_link":
-                        handle_start_chatgpt_link_command(command)
+                    handle_heartbeat_command(command)
             except Exception as exc:
                 log.warning("/me/heartbeat POST failed: %s", exc)
             # Watchdog: did the platform unassign us OR swap the

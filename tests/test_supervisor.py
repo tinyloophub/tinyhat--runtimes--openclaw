@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -1846,6 +1847,912 @@ class CollectComponentVersionsTests(unittest.TestCase):
         self.assertEqual(components["plugin"], {"version": "0.2.2", "sha": "def5678"})
         self.assertEqual(
             components["framework"], {"version": "2026.5.28", "sha": None}
+        )
+
+
+class UpdateComponentCommandTests(unittest.TestCase):
+    """In-place ``update_component`` heartbeat command (tinyloophub/tinyloop#562).
+
+    The supervisor updates any subset of {plugin, framework, runtime} to a
+    target release, in place, then POSTs the result. These tests stub every
+    side-effecting boundary (git/npm subprocess, gateway restart, supervisor
+    restart, result POST) so no real process is touched, and assert the
+    contract: correct installer/npm invocation, applied-vs-failed status,
+    non-secret diagnostics, the runtime post-before-restart ordering, dev-mode
+    relaxation, and per-revision dedupe.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self._state_path = os.path.join(self._tmp, "component-update-state.json")
+        # Point the dedupe-state file at a tempdir and force prod (non-dev)
+        # mode unless an individual test overrides it.
+        self._env = patch.dict(
+            os.environ,
+            {"TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path},
+            clear=False,
+        )
+        self._env.start()
+        os.environ.pop("TINYHAT_DEV_RUNTIME", None)
+        # collect_component_versions hits git + the openclaw CLI; stub it for
+        # every test so the result POST has a deterministic payload. The same
+        # payload is cached into the dedupe-state record, so tests assert
+        # against self._versions_payload.
+        self._versions_payload = {
+            "runtime": {"version": "0.10.2", "sha": "rsha"},
+            "plugin": {"version": "1.2.3", "sha": "psha"},
+            "framework": {"version": "1.4.2", "sha": None},
+        }
+        self._versions = patch.object(
+            supervisor,
+            "collect_component_versions",
+            return_value=self._versions_payload,
+        )
+        self._versions.start()
+        # Never make a real network call from the result POST.
+        self._post = patch.object(supervisor, "_post_component_update_result")
+        self._posted = self._post.start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+
+    def _read_state(self) -> dict:
+        with open(self._state_path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_state_write_defaults_to_unreported_with_empty_cache(self) -> None:
+        # New state shape: reported defaults to False and the cached-result
+        # fields are present (empty / null when not supplied).
+        supervisor._write_component_update_state(7, "applied")
+        state = supervisor._read_component_update_state()
+        self.assertEqual(state["last_revision"], 7)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], {})
+        self.assertIsNone(state["diagnostic"])
+
+    def test_state_write_persists_reported_and_cached_result(self) -> None:
+        supervisor._write_component_update_state(
+            8,
+            "failed",
+            diagnostic="boom",
+            applied_versions={"plugin": {"version": "1.2.3", "sha": "p"}},
+            reported=True,
+        )
+        state = supervisor._read_component_update_state()
+        self.assertEqual(state["last_revision"], 8)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["diagnostic"], "boom")
+        self.assertIs(state["reported"], True)
+        self.assertEqual(
+            state["applied_versions"], {"plugin": {"version": "1.2.3", "sha": "p"}}
+        )
+
+    def test_dispatch_routes_update_component_to_handler(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 11,
+            "targets": {"plugin": {"ref": "v1.2.3"}},
+        }
+        with patch.object(supervisor, "handle_update_component_command") as handler:
+            supervisor.handle_heartbeat_command(cmd)
+        handler.assert_called_once_with(cmd)
+
+    def test_plugin_only_target_installs_ref_restarts_and_reports_applied(
+        self,
+    ) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 3,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        captured_ref = {}
+
+        def fake_install():
+            # The installer reads the target ref from the env var the handler
+            # sets for the duration of the call.
+            captured_ref["ref"] = os.environ.get(
+                supervisor.TINYHAT_PLUGIN_REPO_REF_ENV
+            )
+
+        with (
+            patch.object(
+                supervisor, "ensure_tinyhat_plugin_installed", side_effect=fake_install
+            ) as installer,
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        installer.assert_called_once_with()
+        self.assertEqual(captured_ref["ref"], "v2.0.0")
+        restart_gateway.assert_called_once()
+        # No runtime target -> the supervisor process is never restarted.
+        restart_supervisor.assert_not_called()
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 3)
+        self.assertEqual(kwargs["status"], "applied")
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 3)
+        self.assertEqual(state["status"], "applied")
+        # The result POST was acknowledged (the mocked post did not raise),
+        # so the revision is marked reported and a redelivery will dedupe.
+        self.assertIs(state["reported"], True)
+
+    def test_plugin_ref_env_is_restored_after_install(self) -> None:
+        sentinel = "ref-before-update"
+        os.environ[supervisor.TINYHAT_PLUGIN_REPO_REF_ENV] = sentinel
+        try:
+            cmd = {
+                "type": "update_component",
+                "revision": 31,
+                "targets": {"plugin": {"ref": "v3.0.0"}},
+            }
+            with (
+                patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
+                patch.object(
+                    supervisor, "_read_installed_plugin_marker", return_value={}
+                ),
+                patch.object(supervisor, "_restart_gateway_for_component_update"),
+            ):
+                supervisor.handle_update_component_command(cmd)
+            # The pre-existing ref env var is restored verbatim after the call.
+            self.assertEqual(
+                os.environ.get(supervisor.TINYHAT_PLUGIN_REPO_REF_ENV), sentinel
+            )
+        finally:
+            os.environ.pop(supervisor.TINYHAT_PLUGIN_REPO_REF_ENV, None)
+
+    def test_framework_target_invokes_npm_and_verifies_version(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 4,
+            "targets": {"framework": {"version": "1.5.0"}},
+        }
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(supervisor.subprocess, "run", return_value=ok) as runner,
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value="1.5.0"
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        invoked = [call.args[0] for call in runner.call_args_list]
+        self.assertIn(
+            ["npm", "install", "-g", "--no-fund", "--no-audit", "openclaw@1.5.0"],
+            invoked,
+        )
+        restart_gateway.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 4)
+        self.assertEqual(kwargs["status"], "applied")
+
+    def test_framework_version_mismatch_marks_failed(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 5,
+            "targets": {"framework": {"version": "1.5.0"}},
+        }
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(supervisor.subprocess, "run", return_value=ok),
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value="1.4.2"
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        # A version that did not land must NOT restart the gateway.
+        restart_gateway.assert_not_called()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 5)
+        self.assertEqual(kwargs["status"], "failed")
+        diagnostic = kwargs["diagnostic"]
+        self.assertIsInstance(diagnostic, str)
+        self.assertIn("mismatch", diagnostic)
+        # Failed revision is still recorded so a re-delivery dedupes, and
+        # because the result POST was acknowledged it is marked reported.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 5)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
+
+    def test_component_failure_reports_failed_without_crashing(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 6,
+            "targets": {"plugin": {"ref": "v9.9.9"}},
+        }
+        # Installer raises — the handler must still POST failed, not propagate.
+        with (
+            patch.object(
+                supervisor,
+                "ensure_tinyhat_plugin_installed",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)  # must not raise
+
+        restart_gateway.assert_not_called()
+        restart_supervisor.assert_not_called()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 6)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIsInstance(kwargs["diagnostic"], str)
+        # Failed revision is recorded and, because the result POST was
+        # acknowledged, marked reported.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 6)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
+
+    def test_dev_mode_runtime_self_update_is_relaxed(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 7,
+            "targets": {"runtime": {"ref": "v0.10.2"}},
+        }
+        with (
+            patch.dict(os.environ, {"TINYHAT_DEV_RUNTIME": "1"}, clear=False),
+            patch.object(supervisor.subprocess, "run") as runner,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        # Dev mode: no git checkout, no supervisor restart.
+        runner.assert_not_called()
+        restart_supervisor.assert_not_called()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 7)
+        # Relaxed -> not a hard failure.
+        self.assertEqual(kwargs["status"], "applied")
+        self.assertIn("dev runtime", kwargs["diagnostic"])
+
+    def test_runtime_success_posts_before_restart(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 8,
+            "targets": {"runtime": {"ref": "v0.10.2"}},
+        }
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        order: list[str] = []
+        self._posted.side_effect = lambda *a, **k: order.append("post")
+        with (
+            patch.object(supervisor.subprocess, "run", return_value=ok),
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value="0.10.2"
+            ),
+            patch.object(
+                supervisor, "_read_runtime_git_sha", return_value="newsha"
+            ),
+            patch.object(
+                supervisor,
+                "_restart_supervisor",
+                side_effect=lambda *a, **k: order.append("restart"),
+            ),
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        # The applied-result POST must land BEFORE the supervisor restart, so
+        # the platform records success even if the restart kills this process.
+        self.assertEqual(order, ["post", "restart"])
+
+    def test_runtime_checkout_failure_does_not_restart(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 9,
+            "targets": {"runtime": {"ref": "v0.10.2"}},
+        }
+        # fetch ok, checkout fails -> stay on current ref, report failed, do
+        # not restart (never leave the box without a working supervisor).
+        results = iter(
+            [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),  # fetch
+                SimpleNamespace(returncode=1, stdout="", stderr="bad ref"),  # checkout
+            ]
+        )
+        with (
+            patch.object(
+                supervisor.subprocess, "run", side_effect=lambda *a, **k: next(results)
+            ),
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        restart_supervisor.assert_not_called()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["status"], "failed")
+
+    def test_legacy_state_without_reported_reposts_not_reattempts(self) -> None:
+        # Backward-compat / upgrade migration: a state file written by the
+        # previous runtime version has only {last_revision, status} and no
+        # "reported" key. After upgrade, a redelivery of that revision must
+        # NOT re-attempt the update (no install, no restart) — that is the
+        # guarantee the old dedupe carried — but, because the result was
+        # never recorded as acknowledged, it re-POSTs the cached result once
+        # (so a result that was lost pre-upgrade is recovered).
+        with open(self._state_path, "w", encoding="utf-8") as fh:
+            json.dump({"last_revision": 12, "status": "failed"}, fh)
+        cmd = {
+            "type": "update_component",
+            "revision": 12,
+            "targets": {"plugin": {"ref": "v1.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        # The update itself is NOT re-run.
+        installer.assert_not_called()
+        restart_gateway.assert_not_called()
+        restart_supervisor.assert_not_called()
+        # The cached (legacy) result is re-POSTed exactly once.
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 12)
+        self.assertEqual(kwargs["status"], "failed")
+        # And the record is upgraded in place to reported=True.
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_transient_post_failure_then_redelivery_reposts(self) -> None:
+        """P1 regression (tinyloophub/tinyloop#562): a swallowed result-POST
+        failure must NOT mark the revision deduped. The redelivery re-POSTs
+        the cached result without re-running the install or restarting, and
+        flips reported=True.
+        """
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        # --- First delivery: install succeeds, result POST fails. ---
+        self._posted.side_effect = RuntimeError("transient 503")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_1,
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor, "_restart_gateway_for_component_update"),
+        ):
+            # Must not raise even though the result POST failed.
+            supervisor.handle_update_component_command(cmd)
+        installer_1.assert_called_once()
+        # State persisted the cached result, unreported, so a redelivery
+        # re-POSTs it instead of dropping it.
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 100)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], self._versions_payload)
+
+        # --- Redelivery of the SAME revision, POST now succeeding. ---
+        self._posted.reset_mock()
+        self._posted.side_effect = None
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_2,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw_2,
+            patch.object(supervisor, "_restart_supervisor") as restart_2,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-install, no gateway restart, no supervisor restart.
+        installer_2.assert_not_called()
+        gw_2.assert_not_called()
+        restart_2.assert_not_called()
+        # The cached result was re-POSTed (revision + cached status).
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 100)
+        self.assertEqual(kwargs["status"], "applied")
+        # State now records the result as reported.
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_fully_reported_revision_is_deduped(self) -> None:
+        # A revision whose state is already reported is fully deduped:
+        # zero install, zero restart, zero post.
+        supervisor._write_component_update_state(
+            100, "applied", applied_versions={"plugin": "1.2.3"}, reported=True
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
+        self._posted.assert_not_called()
+
+    def test_repost_failure_leaves_reported_false_for_retry(self) -> None:
+        # If the repost itself fails again, reported stays False so a later
+        # redelivery will retry — still no re-install, no restart.
+        supervisor._write_component_update_state(
+            100, "applied", applied_versions={"plugin": "1.2.3"}, reported=False
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 100,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        self._posted.side_effect = RuntimeError("still down")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
+        # The repost was attempted (and failed); reported stays False.
+        self._posted.assert_called_once()
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 100)
+        self.assertIs(state["reported"], False)
+
+    def test_successful_update_persists_reported_true(self) -> None:
+        # Happy path: a successful update whose POST is acknowledged ends with
+        # reported=True so the next redelivery fully dedupes.
+        cmd = {
+            "type": "update_component",
+            "revision": 101,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor, "_restart_gateway_for_component_update"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 101)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], True)
+
+    def test_runtime_self_update_reposts_after_restart_when_post_failed(self) -> None:
+        """Runtime restart-safety: if the runtime self-update's POST fails, the
+        persisted state is reported=False BEFORE the restart, so the
+        post-restart process re-POSTs the cached result (no re-install, no
+        second restart).
+        """
+        cmd = {
+            "type": "update_component",
+            "revision": 102,
+            "targets": {"runtime": {"ref": "v0.10.3"}},
+        }
+        # --- First delivery: runtime applies, POST fails, then restart. ---
+        self._posted.side_effect = RuntimeError("post failed")
+        with (
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ) as update_1,
+            patch.object(supervisor, "_restart_supervisor") as restart_1,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        update_1.assert_called_once()
+        # The restart STILL happens (the new runtime must take effect), and
+        # the pre-restart state records the unreported outcome.
+        restart_1.assert_called_once()
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 102)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], self._versions_payload)
+
+        # --- Post-restart redelivery: re-POSTs, no re-apply, no restart. ---
+        self._posted.reset_mock()
+        self._posted.side_effect = None
+        with (
+            patch.object(supervisor, "_update_runtime_component") as update_2,
+            patch.object(supervisor, "_restart_supervisor") as restart_2,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        update_2.assert_not_called()
+        restart_2.assert_not_called()
+        self._posted.assert_called_once()
+        self.assertEqual(self._posted.call_args.kwargs["status"], "applied")
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_malformed_command_is_ignored(self) -> None:
+        # Defensive: missing revision or targets must not raise or POST.
+        supervisor.handle_update_component_command({"type": "update_component"})
+        supervisor.handle_update_component_command(
+            {"type": "update_component", "revision": 1}
+        )
+        supervisor.handle_update_component_command(
+            {"type": "update_component", "targets": {}}
+        )
+        self._posted.assert_not_called()
+
+
+class ComponentUpdateStatePathStabilityTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562.
+
+    The component-update dedupe state file must resolve to the SAME absolute
+    path before and after a supervisor restart. The runtime self-update
+    re-checks-out the repo IN PLACE (``runtime_dir()``) and restarts the
+    process; if the state path were tied to the runtime checkout dir or to the
+    process cwd, the post-restart process would compute a different path, miss
+    the persisted ``reported=false`` record, and re-run the update plus a
+    second restart instead of reposting the cached result.
+
+    These tests drive the REAL ``_component_update_state_path()`` (no
+    monkeypatched constant) and vary exactly the things that move across a
+    restart: the cwd, and what ``runtime_dir()`` resolves to.
+    """
+
+    def setUp(self) -> None:
+        self._env_backup = dict(os.environ)
+        os.environ.pop("TINYHAT_COMPONENT_UPDATE_STATE_PATH", None)
+        self._cwd_backup = os.getcwd()
+
+    def tearDown(self) -> None:
+        os.chdir(self._cwd_backup)
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+
+    def test_default_path_is_absolute(self) -> None:
+        self.assertTrue(os.path.isabs(supervisor._component_update_state_path()))
+
+    def test_default_path_stable_across_cwd_change(self) -> None:
+        # A restart can relaunch the supervisor from a different cwd; the
+        # default path must not move with it.
+        with tempfile.TemporaryDirectory() as cwd_a, tempfile.TemporaryDirectory() as cwd_b:
+            os.chdir(cwd_a)
+            p1 = supervisor._component_update_state_path()
+            os.chdir(cwd_b)
+            p2 = supervisor._component_update_state_path()
+        self.assertEqual(p1, p2)
+
+    def test_default_path_stable_across_runtime_recheckout(self) -> None:
+        # Simulate the in-place re-checkout + restart by changing what
+        # ``runtime_dir()`` resolves to between the two calls. The default
+        # state path lives OUTSIDE the checkout, so it must be identical.
+        with tempfile.TemporaryDirectory() as old_checkout, tempfile.TemporaryDirectory() as new_checkout:
+            with patch.object(supervisor, "runtime_dir", return_value=old_checkout):
+                before = supervisor._component_update_state_path()
+            with patch.object(supervisor, "runtime_dir", return_value=new_checkout):
+                after = supervisor._component_update_state_path()
+        self.assertEqual(before, after)
+        self.assertEqual(
+            after,
+            os.path.abspath(supervisor._DEFAULT_COMPONENT_UPDATE_STATE_PATH),
+        )
+
+    def test_override_inside_checkout_dir_falls_back_to_stable_default(self) -> None:
+        # The footgun the reviewer flagged: an override pointing INSIDE the
+        # runtime checkout dir would be erased by the in-place re-checkout, so
+        # the dedupe state would not survive the restart. The supervisor must
+        # reject it and fall back to the restart-stable default rather than
+        # silently honour an unstable path.
+        with tempfile.TemporaryDirectory() as checkout:
+            inside = os.path.join(checkout, "state", "component-update-state.json")
+            with patch.object(supervisor, "runtime_dir", return_value=checkout):
+                os.environ["TINYHAT_COMPONENT_UPDATE_STATE_PATH"] = inside
+                resolved = supervisor._component_update_state_path()
+        self.assertEqual(
+            resolved,
+            os.path.abspath(supervisor._DEFAULT_COMPONENT_UPDATE_STATE_PATH),
+        )
+        self.assertNotEqual(resolved, os.path.abspath(inside))
+
+    def test_override_outside_checkout_dir_is_honoured_and_absolutized(self) -> None:
+        # A legitimate operator override outside the checkout is kept (and
+        # absolutized so it is itself cwd-independent).
+        with tempfile.TemporaryDirectory() as checkout, tempfile.TemporaryDirectory() as state_home:
+            override = os.path.join(state_home, "component-update-state.json")
+            with patch.object(supervisor, "runtime_dir", return_value=checkout):
+                os.environ["TINYHAT_COMPONENT_UPDATE_STATE_PATH"] = override
+                resolved = supervisor._component_update_state_path()
+        self.assertEqual(resolved, os.path.abspath(override))
+
+
+class ComponentUpdateRepostUsesRealStatePathTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562.
+
+    The existing repost-after-restart test pins the state path via the
+    ``TINYHAT_COMPONENT_UPDATE_STATE_PATH`` override, which would MASK a path
+    that moves across a restart. This test instead drives the REAL
+    ``_component_update_state_path()`` against a default that lives under a
+    tmp dir, and changes the process cwd between the pre-restart write and the
+    post-restart read. The post-restart process must still find the persisted
+    ``reported=false`` record and repost it: zero re-apply, zero second
+    restart.
+    """
+
+    def setUp(self) -> None:
+        self._env_backup = dict(os.environ)
+        # Force prod (non-dev) so the runtime path requests a restart, and
+        # clear any inherited override so the REAL default-derivation runs --
+        # just rooted under a writable tmp dir via the constant patch below.
+        os.environ.pop("TINYHAT_COMPONENT_UPDATE_STATE_PATH", None)
+        os.environ.pop("TINYHAT_DEV_RUNTIME", None)
+        self._cwd_backup = os.getcwd()
+        self._tmp = tempfile.mkdtemp()
+        self._default_path = os.path.join(
+            self._tmp, "state", "component-update-state.json"
+        )
+        self._const_patcher = patch.object(
+            supervisor, "_DEFAULT_COMPONENT_UPDATE_STATE_PATH", self._default_path
+        )
+        self._const_patcher.start()
+        self._versions = patch.object(
+            supervisor,
+            "collect_component_versions",
+            return_value={"runtime": {"version": "9.9.9", "sha": "s"}},
+        )
+        self._versions.start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+        os.chdir(self._cwd_backup)
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_repost_after_restart_finds_record_when_cwd_changes(self) -> None:
+        command = {
+            "type": "update_component",
+            "revision": 9,
+            "targets": {"runtime": {"ref": "v9.9.9"}},
+        }
+
+        # --- pre-restart boot: runtime applies, the result POST fails, then
+        #     the supervisor restarts. The unreported record is written via the
+        #     REAL state path. ---
+        with tempfile.TemporaryDirectory() as cwd_before:
+            os.chdir(cwd_before)
+            with (
+                patch.object(
+                    supervisor, "_update_runtime_component", return_value=(True, None)
+                ),
+                patch.object(
+                    supervisor,
+                    "_post_component_update_result",
+                    side_effect=RuntimeError("net down"),
+                ),
+                patch.object(supervisor, "_restart_supervisor") as restart_1,
+            ):
+                supervisor.handle_update_component_command(command)
+            restart_1.assert_called_once()
+            pre = supervisor._read_component_update_state()
+            self.assertEqual(pre["last_revision"], 9)
+            self.assertIs(pre["reported"], False)
+
+        # --- post-restart boot: the process is relaunched from a DIFFERENT
+        #     cwd. It must resolve the SAME state path, find the unreported
+        #     record, and repost -- no re-apply, no second restart. ---
+        with tempfile.TemporaryDirectory() as cwd_after:
+            os.chdir(cwd_after)
+            with (
+                patch.object(supervisor, "_update_runtime_component") as reapply,
+                patch.object(supervisor, "_post_component_update_result") as post_2,
+                patch.object(supervisor, "_restart_supervisor") as restart_2,
+            ):
+                supervisor.handle_update_component_command(command)
+            post_2.assert_called_once()
+            reapply.assert_not_called()
+            restart_2.assert_not_called()
+            self.assertIs(
+                supervisor._read_component_update_state()["reported"], True
+            )
+
+
+class RepostSendsCachedAppliedVersionsTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562 (faithful repost payload).
+
+    ``UpdateComponentCommandTests`` mocks ``_post_component_update_result``
+    wholesale, so it never exercises the real POST body and could not catch
+    the bug where the body recomputed ``collect_component_versions()`` at POST
+    time. These tests instead let the REAL ``_post_component_update_result``
+    run and mock only ``post_json`` (the network boundary), so they assert on
+    the exact ``applied_versions`` that hit the wire.
+
+    The durability contract: on a redelivery the repost must report EXACTLY
+    the cached ``applied_versions`` from the persisted state -- not a fresh
+    live snapshot -- so the report stays faithful to what was applied even
+    when the live versions have since drifted (across a runtime self-update
+    restart, or for a FAILED component whose cache holds the pre-failure
+    versions).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self._state_path = os.path.join(self._tmp, "component-update-state.json")
+        self._env = patch.dict(
+            os.environ,
+            {"TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path},
+            clear=False,
+        )
+        self._env.start()
+        os.environ.pop("TINYHAT_DEV_RUNTIME", None)
+        # Record every POST body the REAL _post_component_update_result emits.
+        self._posts: list[tuple[str, dict]] = []
+        self._post_json = patch.object(
+            supervisor,
+            "post_json",
+            side_effect=lambda path, body: self._posts.append((path, body)) or {},
+        )
+        self._post_json.start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_repost_sends_cached_applied_versions_not_live(self) -> None:
+        # --- First delivery: the update applies and records v1.0.0, but the
+        # result POST raises (swallowed), so the revision is left unreported
+        # with the cached applied_versions persisted. ---
+        cached_versions = {"runtime": {"version": "v1.0.0", "sha": "aaa"}}
+        cmd = {
+            "type": "update_component",
+            "revision": 200,
+            "targets": {"runtime": {"ref": "v1.0.0"}},
+        }
+        first_post = {"raised": False}
+
+        def _raise_then_record(path, body):
+            # Fail the very first POST (first delivery) and record the rest.
+            if not first_post["raised"]:
+                first_post["raised"] = True
+                raise RuntimeError("transient 503")
+            self._posts.append((path, body))
+            return {}
+
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=cached_versions,
+            ),
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ),
+            patch.object(supervisor, "post_json", side_effect=_raise_then_record),
+            patch.object(supervisor, "_restart_supervisor"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # The cached versions were persisted, unreported.
+        state = supervisor._read_component_update_state()
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], cached_versions)
+
+        # --- Redelivery: a live recompute would now return a DIFFERENT value
+        # (v9.9.9). The repost must still send the CACHED v1.0.0, proving it
+        # reads the persisted cache rather than recomputing live. ---
+        live_versions = {"runtime": {"version": "v9.9.9", "sha": "zzz"}}
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=live_versions,
+            ),
+            patch.object(supervisor, "_update_runtime_component") as reapply,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-apply / no restart on a repost.
+        reapply.assert_not_called()
+        restart.assert_not_called()
+        # Exactly one POST landed (the repost), and it carried the CACHED
+        # versions, NOT the live recompute.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["revision"], 200)
+        self.assertEqual(body["status"], "applied")
+        self.assertEqual(body["applied_versions"], cached_versions)
+        self.assertNotEqual(body["applied_versions"], live_versions)
+        # The repost was acknowledged, so the record is now reported.
+        self.assertIs(
+            supervisor._read_component_update_state()["reported"], True
+        )
+
+    def test_repost_of_failed_component_sends_cached_pre_failure_versions(
+        self,
+    ) -> None:
+        # A FAILED component's cache holds the versions recorded at failure
+        # time (the pre-failure snapshot). A redelivery must repost EXACTLY
+        # those, never a fresh live snapshot.
+        pre_failure_versions = {"plugin": {"version": "1.2.3", "sha": "old"}}
+        supervisor._write_component_update_state(
+            300,
+            "failed",
+            diagnostic="plugin update to v9.9.9 failed: boom",
+            applied_versions=pre_failure_versions,
+            reported=False,
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 300,
+            "targets": {"plugin": {"ref": "v9.9.9"}},
+        }
+        # Live recompute would now differ -- the repost must ignore it.
+        live_versions = {"plugin": {"version": "9.9.9", "sha": "new"}}
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=live_versions,
+            ),
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-install, no restart on a repost.
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
+        # The repost carried the cached failed status + pre-failure versions.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["revision"], 300)
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("boom", body["diagnostic"])
+        self.assertEqual(body["applied_versions"], pre_failure_versions)
+        self.assertNotEqual(body["applied_versions"], live_versions)
+
+    def test_first_delivery_posts_exactly_what_it_persists(self) -> None:
+        # First delivery: the versions snapshot is computed once, and the
+        # POSTed applied_versions are identical to the persisted cache by
+        # construction (so a later repost is faithful).
+        snapshot = {"runtime": {"version": "v2.0.0", "sha": "bbb"}}
+        cmd = {
+            "type": "update_component",
+            "revision": 400,
+            "targets": {"runtime": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(
+                supervisor, "collect_component_versions", return_value=snapshot
+            ),
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ),
+            patch.object(supervisor, "_restart_supervisor"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # The single POST body matches the persisted cache exactly.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["applied_versions"], snapshot)
+        self.assertEqual(
+            supervisor._read_component_update_state()["applied_versions"], snapshot
         )
 
 
