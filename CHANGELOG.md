@@ -5,6 +5,12 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.2
+
+### Added
+
+- Handle the `update_component` heartbeat command — update the Tinyhat runtime, Tinyhat plugin, and OpenClaw framework in place to a target release and report the applied versions.
+
 ## 0.10.1
 
 ### Added
