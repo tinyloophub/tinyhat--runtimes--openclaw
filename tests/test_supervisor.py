@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -2397,6 +2398,179 @@ class UpdateComponentCommandTests(unittest.TestCase):
             {"type": "update_component", "targets": {}}
         )
         self._posted.assert_not_called()
+
+
+class ComponentUpdateStatePathStabilityTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562.
+
+    The component-update dedupe state file must resolve to the SAME absolute
+    path before and after a supervisor restart. The runtime self-update
+    re-checks-out the repo IN PLACE (``runtime_dir()``) and restarts the
+    process; if the state path were tied to the runtime checkout dir or to the
+    process cwd, the post-restart process would compute a different path, miss
+    the persisted ``reported=false`` record, and re-run the update plus a
+    second restart instead of reposting the cached result.
+
+    These tests drive the REAL ``_component_update_state_path()`` (no
+    monkeypatched constant) and vary exactly the things that move across a
+    restart: the cwd, and what ``runtime_dir()`` resolves to.
+    """
+
+    def setUp(self) -> None:
+        self._env_backup = dict(os.environ)
+        os.environ.pop("TINYHAT_COMPONENT_UPDATE_STATE_PATH", None)
+        self._cwd_backup = os.getcwd()
+
+    def tearDown(self) -> None:
+        os.chdir(self._cwd_backup)
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+
+    def test_default_path_is_absolute(self) -> None:
+        self.assertTrue(os.path.isabs(supervisor._component_update_state_path()))
+
+    def test_default_path_stable_across_cwd_change(self) -> None:
+        # A restart can relaunch the supervisor from a different cwd; the
+        # default path must not move with it.
+        with tempfile.TemporaryDirectory() as cwd_a, tempfile.TemporaryDirectory() as cwd_b:
+            os.chdir(cwd_a)
+            p1 = supervisor._component_update_state_path()
+            os.chdir(cwd_b)
+            p2 = supervisor._component_update_state_path()
+        self.assertEqual(p1, p2)
+
+    def test_default_path_stable_across_runtime_recheckout(self) -> None:
+        # Simulate the in-place re-checkout + restart by changing what
+        # ``runtime_dir()`` resolves to between the two calls. The default
+        # state path lives OUTSIDE the checkout, so it must be identical.
+        with tempfile.TemporaryDirectory() as old_checkout, tempfile.TemporaryDirectory() as new_checkout:
+            with patch.object(supervisor, "runtime_dir", return_value=old_checkout):
+                before = supervisor._component_update_state_path()
+            with patch.object(supervisor, "runtime_dir", return_value=new_checkout):
+                after = supervisor._component_update_state_path()
+        self.assertEqual(before, after)
+        self.assertEqual(
+            after,
+            os.path.abspath(supervisor._DEFAULT_COMPONENT_UPDATE_STATE_PATH),
+        )
+
+    def test_override_inside_checkout_dir_falls_back_to_stable_default(self) -> None:
+        # The footgun the reviewer flagged: an override pointing INSIDE the
+        # runtime checkout dir would be erased by the in-place re-checkout, so
+        # the dedupe state would not survive the restart. The supervisor must
+        # reject it and fall back to the restart-stable default rather than
+        # silently honour an unstable path.
+        with tempfile.TemporaryDirectory() as checkout:
+            inside = os.path.join(checkout, "state", "component-update-state.json")
+            with patch.object(supervisor, "runtime_dir", return_value=checkout):
+                os.environ["TINYHAT_COMPONENT_UPDATE_STATE_PATH"] = inside
+                resolved = supervisor._component_update_state_path()
+        self.assertEqual(
+            resolved,
+            os.path.abspath(supervisor._DEFAULT_COMPONENT_UPDATE_STATE_PATH),
+        )
+        self.assertNotEqual(resolved, os.path.abspath(inside))
+
+    def test_override_outside_checkout_dir_is_honoured_and_absolutized(self) -> None:
+        # A legitimate operator override outside the checkout is kept (and
+        # absolutized so it is itself cwd-independent).
+        with tempfile.TemporaryDirectory() as checkout, tempfile.TemporaryDirectory() as state_home:
+            override = os.path.join(state_home, "component-update-state.json")
+            with patch.object(supervisor, "runtime_dir", return_value=checkout):
+                os.environ["TINYHAT_COMPONENT_UPDATE_STATE_PATH"] = override
+                resolved = supervisor._component_update_state_path()
+        self.assertEqual(resolved, os.path.abspath(override))
+
+
+class ComponentUpdateRepostUsesRealStatePathTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562.
+
+    The existing repost-after-restart test pins the state path via the
+    ``TINYHAT_COMPONENT_UPDATE_STATE_PATH`` override, which would MASK a path
+    that moves across a restart. This test instead drives the REAL
+    ``_component_update_state_path()`` against a default that lives under a
+    tmp dir, and changes the process cwd between the pre-restart write and the
+    post-restart read. The post-restart process must still find the persisted
+    ``reported=false`` record and repost it: zero re-apply, zero second
+    restart.
+    """
+
+    def setUp(self) -> None:
+        self._env_backup = dict(os.environ)
+        # Force prod (non-dev) so the runtime path requests a restart, and
+        # clear any inherited override so the REAL default-derivation runs --
+        # just rooted under a writable tmp dir via the constant patch below.
+        os.environ.pop("TINYHAT_COMPONENT_UPDATE_STATE_PATH", None)
+        os.environ.pop("TINYHAT_DEV_RUNTIME", None)
+        self._cwd_backup = os.getcwd()
+        self._tmp = tempfile.mkdtemp()
+        self._default_path = os.path.join(
+            self._tmp, "state", "component-update-state.json"
+        )
+        self._const_patcher = patch.object(
+            supervisor, "_DEFAULT_COMPONENT_UPDATE_STATE_PATH", self._default_path
+        )
+        self._const_patcher.start()
+        self._versions = patch.object(
+            supervisor,
+            "collect_component_versions",
+            return_value={"runtime": {"version": "9.9.9", "sha": "s"}},
+        )
+        self._versions.start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+        os.chdir(self._cwd_backup)
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_repost_after_restart_finds_record_when_cwd_changes(self) -> None:
+        command = {
+            "type": "update_component",
+            "revision": 9,
+            "targets": {"runtime": {"ref": "v9.9.9"}},
+        }
+
+        # --- pre-restart boot: runtime applies, the result POST fails, then
+        #     the supervisor restarts. The unreported record is written via the
+        #     REAL state path. ---
+        with tempfile.TemporaryDirectory() as cwd_before:
+            os.chdir(cwd_before)
+            with (
+                patch.object(
+                    supervisor, "_update_runtime_component", return_value=(True, None)
+                ),
+                patch.object(
+                    supervisor,
+                    "_post_component_update_result",
+                    side_effect=RuntimeError("net down"),
+                ),
+                patch.object(supervisor, "_restart_supervisor") as restart_1,
+            ):
+                supervisor.handle_update_component_command(command)
+            restart_1.assert_called_once()
+            pre = supervisor._read_component_update_state()
+            self.assertEqual(pre["last_revision"], 9)
+            self.assertIs(pre["reported"], False)
+
+        # --- post-restart boot: the process is relaunched from a DIFFERENT
+        #     cwd. It must resolve the SAME state path, find the unreported
+        #     record, and repost -- no re-apply, no second restart. ---
+        with tempfile.TemporaryDirectory() as cwd_after:
+            os.chdir(cwd_after)
+            with (
+                patch.object(supervisor, "_update_runtime_component") as reapply,
+                patch.object(supervisor, "_post_component_update_result") as post_2,
+                patch.object(supervisor, "_restart_supervisor") as restart_2,
+            ):
+                supervisor.handle_update_component_command(command)
+            post_2.assert_called_once()
+            reapply.assert_not_called()
+            restart_2.assert_not_called()
+            self.assertIs(
+                supervisor._read_component_update_state()["reported"], True
+            )
 
 
 if __name__ == "__main__":

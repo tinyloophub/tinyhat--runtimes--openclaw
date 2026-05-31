@@ -127,6 +127,10 @@ PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
 # the per-revision dedupe of ``apply_config`` (``_config_apply_state``) but
 # must survive a supervisor restart — the runtime self-update restarts this
 # process, and the re-execed supervisor must not re-run the same revision.
+# This default is a FIXED absolute path OUTSIDE the runtime checkout dir
+# (``runtime_dir()``), precisely so the in-place re-checkout + restart cannot
+# move or erase it; ``_component_update_state_path()`` enforces that stability
+# invariant for any override too. See tinyloophub/tinyloop#562.
 _DEFAULT_COMPONENT_UPDATE_STATE_PATH = (
     "/var/lib/tinyhat/component-update-state.json"
 )
@@ -2702,10 +2706,58 @@ def handle_apply_config_command(command: dict) -> None:
 
 
 def _component_update_state_path() -> str:
-    return (
-        os.environ.get("TINYHAT_COMPONENT_UPDATE_STATE_PATH")
-        or _DEFAULT_COMPONENT_UPDATE_STATE_PATH
-    ).strip()
+    """Resolve the dedupe-state file path, stable across a supervisor restart.
+
+    The whole point of the persisted ``reported`` record is that the process
+    started AFTER a runtime self-update restart (systemd restart / ``os.execv``)
+    reads back the same file the pre-restart process wrote. That guarantee only
+    holds if this function returns the SAME absolute path before and after the
+    restart, so the path must not depend on anything that changes between boots
+    (the process cwd, or a location inside the runtime checkout that the
+    in-place re-checkout can move/erase).
+
+    Two hardening rules make that explicit rather than implicit:
+
+    - The result is always absolutized, so the returned path never depends on
+      the cwd the supervisor happens to be launched with.
+    - The ``TINYHAT_COMPONENT_UPDATE_STATE_PATH`` override stays honoured for
+      explicit operator control, but ONLY when it points outside the runtime
+      checkout dir. An override that resolves INSIDE ``runtime_dir()`` is the
+      exact footgun a reviewer flagged: the runtime self-update checks the repo
+      out in place, so a state file under that dir is not guaranteed to survive
+      the restart. In that case we warn and fall back to the fixed default
+      (a per-box absolute path outside the checkout) so the dedupe guarantee is
+      preserved instead of silently voided.
+
+    See tinyloophub/tinyloop#562 for the platform side of this contract.
+    """
+    default_path = os.path.abspath(_DEFAULT_COMPONENT_UPDATE_STATE_PATH.strip())
+    override = (os.environ.get("TINYHAT_COMPONENT_UPDATE_STATE_PATH") or "").strip()
+    if not override:
+        return default_path
+
+    override_abs = os.path.abspath(override)
+    checkout_dir = os.path.abspath(runtime_dir())
+    # ``os.path.commonpath`` raises on e.g. mixed drives; treat any failure as
+    # "not inside the checkout" and trust the operator's explicit absolute path.
+    try:
+        inside_checkout = (
+            os.path.commonpath([override_abs, checkout_dir]) == checkout_dir
+        )
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        log.warning(
+            "TINYHAT_COMPONENT_UPDATE_STATE_PATH=%s resolves inside the runtime "
+            "checkout dir (%s); a runtime self-update re-checks-out that dir in "
+            "place, so the dedupe state would not survive the restart. Falling "
+            "back to the restart-stable default %s.",
+            override_abs,
+            checkout_dir,
+            default_path,
+        )
+        return default_path
+    return override_abs
 
 
 def _read_component_update_state() -> dict:
