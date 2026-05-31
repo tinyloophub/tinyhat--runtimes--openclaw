@@ -1674,5 +1674,180 @@ class DispatcherCapturesGenerationSynchronouslyTests(unittest.TestCase):
             )
 
 
+class CollectComponentVersionsTests(unittest.TestCase):
+    """Issue #26 — payload-shape coverage for the heartbeat component_versions.
+
+    ``collect_component_versions`` feeds ``POST /me/heartbeat`` so the
+    platform can show what a Computer is actually running. These tests pin
+    the contract the platform ingests: the three components
+    (runtime / plugin / framework), each with a ``version`` and an
+    optional ``sha`` (framework never carries one); components with no
+    resolvable version or sha are omitted entirely (not emitted with a
+    null body); and a failing reader must never break the heartbeat.
+    """
+
+    def test_includes_all_three_components(self) -> None:
+        """All readers resolve → runtime + plugin carry their sha, the
+        framework carries ``version`` with ``sha`` always ``None``."""
+        with (
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value="0.10.1"
+            ),
+            patch.object(
+                supervisor, "_read_runtime_git_sha", return_value="abc1234"
+            ),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={
+                    "version": "0.2.2",
+                    "resolved_commit_sha": "def5678",
+                },
+            ),
+            patch.object(
+                supervisor,
+                "_read_openclaw_framework_version",
+                return_value="2026.5.28",
+            ),
+        ):
+            components = supervisor.collect_component_versions()
+
+        self.assertEqual(
+            components,
+            {
+                "runtime": {"version": "0.10.1", "sha": "abc1234"},
+                "plugin": {"version": "0.2.2", "sha": "def5678"},
+                "framework": {"version": "2026.5.28", "sha": None},
+            },
+        )
+        # The framework is an npm package — it must never report a sha.
+        self.assertIsNone(components["framework"]["sha"])
+
+    def test_omits_components_with_no_resolvable_version_or_sha(self) -> None:
+        """A component whose version AND sha both come back empty is
+        dropped from the result — not emitted with null fields — so the
+        platform falls back to its provisioning manifest for it.
+
+        Here the runtime resolves nothing (no VERSION file, not a git
+        tree) and the framework CLI is absent; only the plugin survives.
+        """
+        with (
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value=""
+            ),
+            patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={
+                    "version": "0.2.2",
+                    "resolved_commit_sha": "def5678",
+                },
+            ),
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value=""
+            ),
+        ):
+            components = supervisor.collect_component_versions()
+
+        self.assertNotIn("runtime", components)
+        self.assertNotIn("framework", components)
+        self.assertEqual(
+            components,
+            {"plugin": {"version": "0.2.2", "sha": "def5678"}},
+        )
+
+    def test_optional_sha_is_nulled_when_only_version_resolves(self) -> None:
+        """A component with a version but no sha is still reported, with
+        its ``sha`` coerced to ``None`` (the optional-SHA contract)."""
+        with (
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value="0.10.1"
+            ),
+            patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                # Marker present but only a sha, no version string.
+                return_value={"resolved_commit_sha": "def5678"},
+            ),
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value=""
+            ),
+        ):
+            components = supervisor.collect_component_versions()
+
+        # runtime: version present, sha missing -> sha is None, still reported.
+        self.assertEqual(components["runtime"], {"version": "0.10.1", "sha": None})
+        # plugin: sha present, version missing -> version None, still reported.
+        self.assertEqual(components["plugin"], {"version": None, "sha": "def5678"})
+
+    def test_plugin_unknown_version_is_treated_as_unreported(self) -> None:
+        """An ``"unknown"`` plugin marker version (the installer's
+        placeholder when no package.json/version.txt was found) is not
+        surfaced as a version, but the resolved sha still is."""
+        with (
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value=""
+            ),
+            patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={
+                    "version": "unknown",
+                    "resolved_commit_sha": "def5678",
+                },
+            ),
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value=""
+            ),
+        ):
+            components = supervisor.collect_component_versions()
+
+        self.assertEqual(
+            components,
+            {"plugin": {"version": None, "sha": "def5678"}},
+        )
+
+    def test_never_raises_when_a_reader_fails(self) -> None:
+        """A reader raising must not propagate: the failing component is
+        skipped while the others survive, so the heartbeat still ships."""
+        with (
+            patch.object(
+                supervisor,
+                "_read_runtime_repo_version",
+                side_effect=RuntimeError("git exploded"),
+            ),
+            patch.object(
+                supervisor, "_read_runtime_git_sha", return_value="abc1234"
+            ),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={
+                    "version": "0.2.2",
+                    "resolved_commit_sha": "def5678",
+                },
+            ),
+            patch.object(
+                supervisor,
+                "_read_openclaw_framework_version",
+                return_value="2026.5.28",
+            ),
+        ):
+            # Must not raise.
+            components = supervisor.collect_component_versions()
+
+        self.assertIsInstance(components, dict)
+        # The runtime reader blew up, so runtime is dropped; the other two
+        # components are unaffected.
+        self.assertNotIn("runtime", components)
+        self.assertEqual(components["plugin"], {"version": "0.2.2", "sha": "def5678"})
+        self.assertEqual(
+            components["framework"], {"version": "2026.5.28", "sha": None}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
