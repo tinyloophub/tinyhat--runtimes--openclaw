@@ -82,6 +82,11 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
+# OpenRouter's catalog can report very large per-model completion ceilings
+# (for example Kimi K2.6 advertises ~262k). OpenClaw treats the model
+# completion ceiling as the default request cap unless the model has an
+# explicit params override, so keep Computer chat replies bounded.
+OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 
 # ChatGPT BYO subscription (issue #23): when an `openai-codex` OAuth
 # profile is present in this Computer's per-agent auth store, the
@@ -1343,17 +1348,30 @@ def write_openclaw_config(
         refs_by_role = openrouter_model_refs_by_role(package)
         enabled_roles = package.get("enabled_roles")
         if not isinstance(enabled_roles, list) or not refs_by_role:
-            return {primary_model: {"alias": "default"}}
-        catalog: dict[str, dict[str, str]] = {}
+            return {primary_model: openrouter_model_catalog_entry("default")}
+        catalog: dict[str, dict[str, object]] = {}
         for role in enabled_roles:
             if not isinstance(role, str):
                 continue
             ref = refs_by_role.get(role)
             if not ref:
                 continue
-            catalog[ref] = {"alias": role.replace("_", "-")}
-        catalog.setdefault(primary_model, {"alias": "default"})
+            catalog[ref] = openrouter_model_catalog_entry(
+                role.replace("_", "-")
+            )
+        catalog.setdefault(
+            primary_model,
+            openrouter_model_catalog_entry("default"),
+        )
         return catalog
+
+    def openrouter_model_catalog_entry(alias: str) -> dict[str, object]:
+        return {
+            "alias": alias,
+            "params": {
+                "max_completion_tokens": OPENROUTER_COMPLETION_TOKEN_CAP,
+            },
+        }
 
     def openrouter_model_fallbacks(package: dict) -> list[str]:
         refs_by_role = openrouter_model_refs_by_role(package)
