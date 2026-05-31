@@ -2573,5 +2573,188 @@ class ComponentUpdateRepostUsesRealStatePathTests(unittest.TestCase):
             )
 
 
+class RepostSendsCachedAppliedVersionsTests(unittest.TestCase):
+    """Regression for tinyloophub/tinyloop#562 (faithful repost payload).
+
+    ``UpdateComponentCommandTests`` mocks ``_post_component_update_result``
+    wholesale, so it never exercises the real POST body and could not catch
+    the bug where the body recomputed ``collect_component_versions()`` at POST
+    time. These tests instead let the REAL ``_post_component_update_result``
+    run and mock only ``post_json`` (the network boundary), so they assert on
+    the exact ``applied_versions`` that hit the wire.
+
+    The durability contract: on a redelivery the repost must report EXACTLY
+    the cached ``applied_versions`` from the persisted state -- not a fresh
+    live snapshot -- so the report stays faithful to what was applied even
+    when the live versions have since drifted (across a runtime self-update
+    restart, or for a FAILED component whose cache holds the pre-failure
+    versions).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self._state_path = os.path.join(self._tmp, "component-update-state.json")
+        self._env = patch.dict(
+            os.environ,
+            {"TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path},
+            clear=False,
+        )
+        self._env.start()
+        os.environ.pop("TINYHAT_DEV_RUNTIME", None)
+        # Record every POST body the REAL _post_component_update_result emits.
+        self._posts: list[tuple[str, dict]] = []
+        self._post_json = patch.object(
+            supervisor,
+            "post_json",
+            side_effect=lambda path, body: self._posts.append((path, body)) or {},
+        )
+        self._post_json.start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_repost_sends_cached_applied_versions_not_live(self) -> None:
+        # --- First delivery: the update applies and records v1.0.0, but the
+        # result POST raises (swallowed), so the revision is left unreported
+        # with the cached applied_versions persisted. ---
+        cached_versions = {"runtime": {"version": "v1.0.0", "sha": "aaa"}}
+        cmd = {
+            "type": "update_component",
+            "revision": 200,
+            "targets": {"runtime": {"ref": "v1.0.0"}},
+        }
+        first_post = {"raised": False}
+
+        def _raise_then_record(path, body):
+            # Fail the very first POST (first delivery) and record the rest.
+            if not first_post["raised"]:
+                first_post["raised"] = True
+                raise RuntimeError("transient 503")
+            self._posts.append((path, body))
+            return {}
+
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=cached_versions,
+            ),
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ),
+            patch.object(supervisor, "post_json", side_effect=_raise_then_record),
+            patch.object(supervisor, "_restart_supervisor"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # The cached versions were persisted, unreported.
+        state = supervisor._read_component_update_state()
+        self.assertIs(state["reported"], False)
+        self.assertEqual(state["applied_versions"], cached_versions)
+
+        # --- Redelivery: a live recompute would now return a DIFFERENT value
+        # (v9.9.9). The repost must still send the CACHED v1.0.0, proving it
+        # reads the persisted cache rather than recomputing live. ---
+        live_versions = {"runtime": {"version": "v9.9.9", "sha": "zzz"}}
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=live_versions,
+            ),
+            patch.object(supervisor, "_update_runtime_component") as reapply,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-apply / no restart on a repost.
+        reapply.assert_not_called()
+        restart.assert_not_called()
+        # Exactly one POST landed (the repost), and it carried the CACHED
+        # versions, NOT the live recompute.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["revision"], 200)
+        self.assertEqual(body["status"], "applied")
+        self.assertEqual(body["applied_versions"], cached_versions)
+        self.assertNotEqual(body["applied_versions"], live_versions)
+        # The repost was acknowledged, so the record is now reported.
+        self.assertIs(
+            supervisor._read_component_update_state()["reported"], True
+        )
+
+    def test_repost_of_failed_component_sends_cached_pre_failure_versions(
+        self,
+    ) -> None:
+        # A FAILED component's cache holds the versions recorded at failure
+        # time (the pre-failure snapshot). A redelivery must repost EXACTLY
+        # those, never a fresh live snapshot.
+        pre_failure_versions = {"plugin": {"version": "1.2.3", "sha": "old"}}
+        supervisor._write_component_update_state(
+            300,
+            "failed",
+            diagnostic="plugin update to v9.9.9 failed: boom",
+            applied_versions=pre_failure_versions,
+            reported=False,
+        )
+        cmd = {
+            "type": "update_component",
+            "revision": 300,
+            "targets": {"plugin": {"ref": "v9.9.9"}},
+        }
+        # Live recompute would now differ -- the repost must ignore it.
+        live_versions = {"plugin": {"version": "9.9.9", "sha": "new"}}
+        with (
+            patch.object(
+                supervisor,
+                "collect_component_versions",
+                return_value=live_versions,
+            ),
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_restart_gateway_for_component_update") as gw,
+            patch.object(supervisor, "_restart_supervisor") as restart,
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # No re-install, no restart on a repost.
+        installer.assert_not_called()
+        gw.assert_not_called()
+        restart.assert_not_called()
+        # The repost carried the cached failed status + pre-failure versions.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["revision"], 300)
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("boom", body["diagnostic"])
+        self.assertEqual(body["applied_versions"], pre_failure_versions)
+        self.assertNotEqual(body["applied_versions"], live_versions)
+
+    def test_first_delivery_posts_exactly_what_it_persists(self) -> None:
+        # First delivery: the versions snapshot is computed once, and the
+        # POSTed applied_versions are identical to the persisted cache by
+        # construction (so a later repost is faithful).
+        snapshot = {"runtime": {"version": "v2.0.0", "sha": "bbb"}}
+        cmd = {
+            "type": "update_component",
+            "revision": 400,
+            "targets": {"runtime": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(
+                supervisor, "collect_component_versions", return_value=snapshot
+            ),
+            patch.object(
+                supervisor, "_update_runtime_component", return_value=(True, None)
+            ),
+            patch.object(supervisor, "_restart_supervisor"),
+        ):
+            supervisor.handle_update_component_command(cmd)
+        # The single POST body matches the persisted cache exactly.
+        self.assertEqual(len(self._posts), 1)
+        _path, body = self._posts[0]
+        self.assertEqual(body["applied_versions"], snapshot)
+        self.assertEqual(
+            supervisor._read_component_update_state()["applied_versions"], snapshot
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

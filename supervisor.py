@@ -3007,19 +3007,29 @@ def _post_component_update_result(
     revision: int,
     status: str,
     diagnostic: str | None = None,
+    applied_versions: dict | None = None,
 ) -> None:
     """POST the component-update outcome to the platform.
 
     Mirrors ``_post_config_apply_result`` but on the component-update
-    endpoint, and additionally carries ``applied_versions`` (read back from
-    ``collect_component_versions`` after the update) so the platform can
-    confirm exactly what landed.
+    endpoint, and additionally carries ``applied_versions`` so the platform
+    can confirm exactly what landed.
+
+    ``applied_versions`` is passed in by the caller — it is NOT recomputed
+    here. The first delivery computes the snapshot once (after the update,
+    before the post) and persists that exact dict; a redelivery/repost
+    passes back the *cached* dict read from the persisted state. Recomputing
+    live at POST time would defeat the durability guarantee: a repost across
+    a runtime self-update restart (or for a FAILED component, whose cache
+    records the pre-failure versions) must report exactly what was recorded,
+    not a fresh snapshot of whatever the box happens to be running now. See
+    tinyloophub/tinyloop#562 for the platform side of this contract.
     """
     body: dict = {
         "revision": revision,
         "status": status,
         "diagnostic": diagnostic[:1023] if diagnostic else None,
-        "applied_versions": collect_component_versions(),
+        "applied_versions": applied_versions or {},
     }
     post_json("/hapi/v1/computers/me/component-update/apply-result", body)
 
@@ -3041,8 +3051,14 @@ def _try_report_and_persist(
     acknowledged. Never raises.
     """
     try:
+        # Post EXACTLY the cached result the caller handed us. On a repost
+        # this dict came from the persisted state, so the redelivery reports
+        # what was originally applied rather than a fresh live recompute.
         _post_component_update_result(
-            revision=revision, status=status, diagnostic=diagnostic
+            revision=revision,
+            status=status,
+            diagnostic=diagnostic,
+            applied_versions=applied_versions,
         )
     except Exception as exc:  # noqa: BLE001 - report is best-effort
         log.warning(
