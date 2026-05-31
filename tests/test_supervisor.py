@@ -202,9 +202,9 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         self.assertEqual(
             config["agents"]["defaults"]["models"],
             {
-                "openrouter/deepseek/deepseek-v4-flash:free": {
-                    **_openrouter_catalog_entry("free-demo"),
-                },
+                "openrouter/deepseek/deepseek-v4-flash:free": (
+                    _openrouter_catalog_entry("free-demo")
+                ),
             },
         )
 
