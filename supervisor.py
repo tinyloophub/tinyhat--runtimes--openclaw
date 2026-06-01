@@ -139,6 +139,10 @@ PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
 _DEFAULT_COMPONENT_UPDATE_STATE_PATH = (
     "/var/lib/tinyhat/component-update-state.json"
 )
+_DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
+    "/var/lib/tinyhat/tinyhat-plugin-source.json"
+)
+TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 
 # Instance-metadata keys the platform writes at insert time and can
 # update later via ``compute.instances.setMetadata``. Both are
@@ -493,7 +497,17 @@ def private_access_report() -> dict | None:
 
 
 def _tinyhat_plugin_source() -> tuple[str, str]:
-    """Return the public plugin repo/ref pinned by the platform manifest."""
+    """Return the public plugin repo/ref the supervisor should install.
+
+    The boot-time env vars come from the provisioning manifest and are immutable
+    for an already-created VM. A successful in-place plugin component update
+    writes a durable override outside the runtime checkout so later gateway
+    rebinds or supervisor restarts keep installing the updated plugin instead
+    of rolling back to the original boot-pinned ref.
+    """
+    override = _read_tinyhat_plugin_source_override()
+    if override is not None:
+        return override
     repo_url = (
         os.environ.get(TINYHAT_PLUGIN_REPO_URL_ENV) or TINYHAT_PLUGIN_REPO_URL_DEFAULT
     ).strip()
@@ -520,6 +534,71 @@ def _tinyhat_plugin_version(plugin_dir: str) -> str:
 
 def _tinyhat_plugin_marker_path() -> str:
     return os.path.join(openclaw_state_dir(), "tinyhat-plugin.version")
+
+
+def _tinyhat_plugin_source_override_path() -> str:
+    configured = (
+        os.environ.get(TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV) or ""
+    ).strip()
+    path = os.path.abspath(
+        configured or _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
+    )
+    checkout_dir = os.path.abspath(runtime_dir())
+    try:
+        inside_checkout = os.path.commonpath([path, checkout_dir]) == checkout_dir
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        fallback = os.path.abspath(_DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH)
+        log.warning(
+            "%s=%s resolves inside the runtime checkout dir (%s); plugin "
+            "update source overrides must survive runtime checkouts. Falling "
+            "back to %s.",
+            TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV,
+            path,
+            checkout_dir,
+            fallback,
+        )
+        return fallback
+    return path
+
+
+def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
+    try:
+        with open(_tinyhat_plugin_source_override_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    repo_url = str(payload.get("repo_url") or "").strip()
+    repo_ref = str(payload.get("repo_ref") or "").strip()
+    if not repo_url or not repo_ref:
+        return None
+    return repo_url, repo_ref
+
+
+def _write_tinyhat_plugin_source_override(
+    *,
+    repo_url: str,
+    repo_ref: str,
+    resolved_commit_sha: str | None = None,
+    version: str | None = None,
+) -> None:
+    """Persist the plugin source selected by an in-place component update."""
+    payload = {
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+    }
+    if resolved_commit_sha:
+        payload["resolved_commit_sha"] = resolved_commit_sha
+    if version:
+        payload["version"] = version
+    _atomic_write_json(
+        _tinyhat_plugin_source_override_path(),
+        payload,
+        mode=0o600,
+    )
 
 
 def _read_runtime_repo_version() -> str:
@@ -669,7 +748,9 @@ def collect_component_versions() -> dict:
     return components
 
 
-def ensure_tinyhat_plugin_installed() -> bool:
+def ensure_tinyhat_plugin_installed(
+    *, repo_url: str | None = None, repo_ref: str | None = None
+) -> bool:
     """Install the public Tinyhat tool plugin into OpenClaw.
 
     The runtime repo does not own the plugin implementation. It only
@@ -678,7 +759,9 @@ def ensure_tinyhat_plugin_installed() -> bool:
     The plugin contains no Tinyhat credentials; requests authenticate
     with the same Computer identity-token boundary as the supervisor.
     """
-    repo_url, repo_ref = _tinyhat_plugin_source()
+    configured_url, configured_ref = _tinyhat_plugin_source()
+    repo_url = (repo_url or configured_url).strip()
+    repo_ref = (repo_ref or configured_ref).strip()
     plugin_dir = tinyhat_plugin_checkout_dir()
     os.makedirs(os.path.dirname(plugin_dir), mode=0o700, exist_ok=True)
     if os.path.isdir(os.path.join(plugin_dir, ".git")):
@@ -2918,26 +3001,28 @@ def _restart_gateway_for_component_update() -> None:
 def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
     """Update the Tinyhat plugin to ``ref`` in place; restart the gateway.
 
-    ``ensure_tinyhat_plugin_installed`` reads the target ref from the
-    ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` env var, so we override it for the
-    duration of the call (git fetch + checkout + ``openclaw plugins install
-    --force`` + marker write all key off that ref). The resolved version /
-    sha are then read back from the install marker.
+    The boot-time ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` stays pinned to the
+    VM's original provisioning manifest, so a component update cannot be just
+    an in-memory env override. After a successful install we persist the new
+    plugin source outside the runtime checkout; subsequent gateway rebinds and
+    supervisor restarts read that override and keep the updated plugin instead
+    of reinstalling the old boot-pinned ref.
 
     Returns ``(ok, diagnostic)``; never raises.
     """
-    previous = os.environ.get(TINYHAT_PLUGIN_REPO_REF_ENV)
-    os.environ[TINYHAT_PLUGIN_REPO_REF_ENV] = ref
+    repo_url, _current_ref = _tinyhat_plugin_source()
     try:
-        ensure_tinyhat_plugin_installed()
+        ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=ref)
+        marker = _read_installed_plugin_marker()
+        _write_tinyhat_plugin_source_override(
+            repo_url=repo_url,
+            repo_ref=ref,
+            resolved_commit_sha=str(marker.get("resolved_commit_sha") or "").strip()
+            or None,
+            version=str(marker.get("version") or "").strip() or None,
+        )
     except Exception as exc:  # noqa: BLE001 - keep the update non-fatal
         return False, f"plugin update to {ref} failed: {exc}"
-    finally:
-        if previous is None:
-            os.environ.pop(TINYHAT_PLUGIN_REPO_REF_ENV, None)
-        else:
-            os.environ[TINYHAT_PLUGIN_REPO_REF_ENV] = previous
-    marker = _read_installed_plugin_marker()
     sha = str(marker.get("resolved_commit_sha") or "")
     log.info("component update: plugin now at ref=%s sha=%s", ref, sha[:12])
     _restart_gateway_for_component_update()

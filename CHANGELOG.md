@@ -5,6 +5,14 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.11.3
+
+### Fixed
+
+- Persist the Tinyhat plugin source selected by an in-place component update so
+  later gateway rebinds and supervisor restarts keep the upgraded plugin
+  instead of reinstalling the VM's original boot-pinned plugin ref.
+
 ## 0.11.2
 
 ### Changed
