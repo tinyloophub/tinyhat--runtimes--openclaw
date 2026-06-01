@@ -267,6 +267,19 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
         self.assertIn("Invalid config", detail or "")
         self.assertIn("agents.defaults: Invalid input", detail or "")
 
+    def test_startup_failure_detail_ignores_benign_gateway_logs(self) -> None:
+        detail = supervisor._openclaw_gateway_startup_failure_from_logs(
+            "\n".join(
+                [
+                    "[gateway] loading configuration...",
+                    "[gateway] ready",
+                    "[telegram] connected to gateway",
+                ]
+            )
+        )
+
+        self.assertIsNone(detail)
+
     def test_wait_raises_startup_failure_without_waiting_for_timeout(self) -> None:
         with (
             patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
@@ -276,6 +289,25 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
                 return_value=(
                     False,
                     "gateway startup failed: Invalid config at /etc/openclaw/openclaw.json. agents.defaults: Invalid input",
+                ),
+            ),
+            patch.object(supervisor.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                supervisor.wait_for_openclaw_start(123.0)
+
+        self.assertIn("openclaw gateway failed to start", str(raised.exception))
+        self.assertEqual(sleep.call_args_list, [])
+
+    def test_wait_raises_inactive_startup_failure_without_timeout(self) -> None:
+        with (
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+            patch.object(
+                supervisor,
+                "probe_openclaw_gateway_health",
+                return_value=(
+                    False,
+                    "gateway startup failed: Invalid config at /etc/openclaw/openclaw.json.",
                 ),
             ),
             patch.object(supervisor.time, "sleep") as sleep,
@@ -547,6 +579,60 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         # Plain-text env block carries everything else, but NOT OPENAI_API_KEY:
         # surfacing both would shadow the SecretRef.
         self.assertEqual(config.get("env"), {"EXA_API_KEY": "exa-test-key"})
+
+    def test_openrouter_binding_keeps_openai_secret_ref_without_runtime_pin(
+        self,
+    ) -> None:
+        binding = _openrouter_binding(
+            {
+                "default_model": "moonshotai/kimi-k2.6",
+                "default_role": "power",
+                "enabled_roles": ["power"],
+                "models": {
+                    "power": "moonshotai/kimi-k2.6",
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "OPENAI_API_KEY": "sk-openai-test",
+                        "EXA_API_KEY": "exa-test-key",
+                    },
+                    fh,
+                )
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(binding)
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertNotIn("agentRuntime", config["agents"]["defaults"])
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        providers = config["models"]["providers"]
+        self.assertEqual(
+            providers["openai"]["apiKey"],
+            {
+                "source": "file",
+                "provider": supervisor.TINYHAT_SECRETS_PROVIDER,
+                "id": supervisor.TINYHAT_OPENAI_API_KEY_POINTER,
+            },
+        )
+        self.assertNotIn("agentRuntime", providers["openai"])
+        self.assertEqual(
+            config["env"],
+            {
+                "OPENROUTER_API_KEY": "sk-or-v1-child",
+                "EXA_API_KEY": "exa-test-key",
+            },
+        )
 
     def test_binding_openrouter_wins_over_user_runtime_secret(self) -> None:
         package = {
