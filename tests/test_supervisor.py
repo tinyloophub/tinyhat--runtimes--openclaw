@@ -493,6 +493,27 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 ],
             )
 
+    def test_plugin_source_prefers_component_update_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = os.path.join(tmpdir, "plugin-source.json")
+            env = {
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": "https://example.com/old.git",
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": "old-ref",
+                "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH": override_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor._write_tinyhat_plugin_source_override(
+                    repo_url="https://example.com/new.git",
+                    repo_ref="v2.0.0",
+                    resolved_commit_sha="abc123",
+                    version="2.0.0",
+                )
+
+                self.assertEqual(
+                    supervisor._tinyhat_plugin_source(),
+                    ("https://example.com/new.git", "v2.0.0"),
+                )
+
 
 class RuntimeSecretEnvBlockTests(unittest.TestCase):
     """Regression coverage for the runtime-secret env injection contract.
@@ -2027,11 +2048,20 @@ class UpdateComponentCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.mkdtemp()
         self._state_path = os.path.join(self._tmp, "component-update-state.json")
+        self._plugin_override_path = os.path.join(
+            self._tmp,
+            "plugin-source.json",
+        )
         # Point the dedupe-state file at a tempdir and force prod (non-dev)
         # mode unless an individual test overrides it.
         self._env = patch.dict(
             os.environ,
-            {"TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path},
+            {
+                "TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path,
+                "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH": self._plugin_override_path,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": "https://example.com/tinyhat.git",
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": "boot-ref",
+            },
             clear=False,
         )
         self._env.start()
@@ -2110,12 +2140,8 @@ class UpdateComponentCommandTests(unittest.TestCase):
         }
         captured_ref = {}
 
-        def fake_install():
-            # The installer reads the target ref from the env var the handler
-            # sets for the duration of the call.
-            captured_ref["ref"] = os.environ.get(
-                supervisor.TINYHAT_PLUGIN_REPO_REF_ENV
-            )
+        def fake_install(**kwargs):
+            captured_ref.update(kwargs)
 
         with (
             patch.object(
@@ -2133,8 +2159,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
         ):
             supervisor.handle_update_component_command(cmd)
 
-        installer.assert_called_once_with()
-        self.assertEqual(captured_ref["ref"], "v2.0.0")
+        installer.assert_called_once_with(
+            repo_url="https://example.com/tinyhat.git",
+            repo_ref="v2.0.0",
+        )
+        self.assertEqual(captured_ref["repo_url"], "https://example.com/tinyhat.git")
+        self.assertEqual(captured_ref["repo_ref"], "v2.0.0")
         restart_gateway.assert_called_once()
         # No runtime target -> the supervisor process is never restarted.
         restart_supervisor.assert_not_called()
@@ -2148,8 +2178,16 @@ class UpdateComponentCommandTests(unittest.TestCase):
         # The result POST was acknowledged (the mocked post did not raise),
         # so the revision is marked reported and a redelivery will dedupe.
         self.assertIs(state["reported"], True)
+        with open(self._plugin_override_path, encoding="utf-8") as fh:
+            override = json.load(fh)
+        self.assertEqual(override["repo_url"], "https://example.com/tinyhat.git")
+        self.assertEqual(override["repo_ref"], "v2.0.0")
+        self.assertEqual(override["resolved_commit_sha"], "abc123")
+        self.assertEqual(override["version"], "2.0.0")
 
-    def test_plugin_ref_env_is_restored_after_install(self) -> None:
+    def test_plugin_update_persists_ref_for_later_rebind_without_mutating_env(
+        self,
+    ) -> None:
         sentinel = "ref-before-update"
         os.environ[supervisor.TINYHAT_PLUGIN_REPO_REF_ENV] = sentinel
         try:
@@ -2166,9 +2204,14 @@ class UpdateComponentCommandTests(unittest.TestCase):
                 patch.object(supervisor, "_restart_gateway_for_component_update"),
             ):
                 supervisor.handle_update_component_command(cmd)
-            # The pre-existing ref env var is restored verbatim after the call.
+            # The boot-time ref env var stays untouched; persistence comes from
+            # the source override that later rebinds/restarts will read.
             self.assertEqual(
                 os.environ.get(supervisor.TINYHAT_PLUGIN_REPO_REF_ENV), sentinel
+            )
+            self.assertEqual(
+                supervisor._tinyhat_plugin_source(),
+                ("https://example.com/tinyhat.git", "v3.0.0"),
             )
         finally:
             os.environ.pop(supervisor.TINYHAT_PLUGIN_REPO_REF_ENV, None)
