@@ -5,6 +5,14 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.11.4
+
+### Changed
+
+- Publish another patch runtime release so production Tinyhat Software update
+  flows can exercise upgrades after the plugin-update persistence fix, without
+  changing runtime behavior.
+
 ## 0.11.3
 
 ### Fixed
