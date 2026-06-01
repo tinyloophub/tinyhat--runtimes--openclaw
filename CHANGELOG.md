@@ -5,6 +5,18 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.10.7
+
+### Fixed
+
+- Emit the OpenClaw runtime policy on each model provider entry instead of
+  `agents.defaults.agentRuntime`, which OpenClaw 2026.5.28 rejects. Newly
+  provisioned Computers on OpenClaw 2026.5.28 now pass config validation and
+  complete gateway startup.
+- Fast-fail when the OpenClaw gateway log shows a terminal startup error
+  such as config validation failure, invalid input, or doctor-fix prompts,
+  replacing the generic 90-second startup timeout with a useful diagnostic.
+
 ## 0.10.6
 
 ### Fixed
