@@ -55,6 +55,18 @@ def _openrouter_catalog_entry(alias: str) -> dict:
     }
 
 
+def _assert_openclaw_provider_runtime(
+    testcase: unittest.TestCase,
+    config: dict,
+    provider_id: str,
+) -> None:
+    providers = (config.get("models") or {}).get("providers") or {}
+    testcase.assertEqual(
+        providers.get(provider_id, {}).get("agentRuntime"),
+        {"id": "openclaw"},
+    )
+
+
 class ReloadOpenClawSecretsTests(unittest.TestCase):
     def test_gateway_settle_retries_until_reload_succeeds(self) -> None:
         calls = 0
@@ -176,6 +188,8 @@ class OpenRouterModelPackageTests(unittest.TestCase):
                 ),
             },
         )
+        self.assertNotIn("agentRuntime", config["agents"]["defaults"])
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
         self.assertEqual(config["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
 
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:
@@ -207,6 +221,8 @@ class OpenRouterModelPackageTests(unittest.TestCase):
                 ),
             },
         )
+        self.assertNotIn("agentRuntime", config["agents"]["defaults"])
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
 
     def test_binding_signature_changes_when_model_package_changes(self) -> None:
         package = {
@@ -232,6 +248,43 @@ class OpenRouterModelPackageTests(unittest.TestCase):
             supervisor._binding_signature(binding),
             supervisor._binding_signature(next_binding),
         )
+
+
+class OpenClawGatewayHealthTests(unittest.TestCase):
+    def test_startup_failure_detail_is_extracted_from_gateway_logs(self) -> None:
+        detail = supervisor._openclaw_gateway_startup_failure_from_logs(
+            "\n".join(
+                [
+                    "[gateway] loading configuration...",
+                    "Gateway failed to start: Invalid config at /etc/openclaw/openclaw.json.",
+                    "agents.defaults: Invalid input",
+                    'Run "openclaw doctor --fix" to repair, then retry.',
+                ]
+            )
+        )
+
+        self.assertIsNotNone(detail)
+        self.assertIn("Invalid config", detail or "")
+        self.assertIn("agents.defaults: Invalid input", detail or "")
+
+    def test_wait_raises_startup_failure_without_waiting_for_timeout(self) -> None:
+        with (
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(
+                supervisor,
+                "probe_openclaw_gateway_health",
+                return_value=(
+                    False,
+                    "gateway startup failed: Invalid config at /etc/openclaw/openclaw.json. agents.defaults: Invalid input",
+                ),
+            ),
+            patch.object(supervisor.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                supervisor.wait_for_openclaw_start(123.0)
+
+        self.assertIn("openclaw gateway failed to start", str(raised.exception))
+        self.assertEqual(sleep.call_args_list, [])
 
 
 class TinyhatPluginInstallTests(unittest.TestCase):
@@ -800,8 +853,9 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
     def test_opted_in_with_profile_writes_subscription_config(self) -> None:
         """auth-profile present + llm_auth_mode=chatgpt_subscription on
-        binding → openai/gpt-5.5, no `pi` runtime pin, no openai SecretRef,
-        cross-provider fallback to OpenRouter when its key is present."""
+        binding → openai/gpt-5.5, no provider runtime pin for OpenAI,
+        no openai SecretRef, cross-provider fallback to OpenRouter when
+        its key is present."""
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
                 "TINYHAT_DEV_RUNTIME": "1",
@@ -818,12 +872,14 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
-        # No `pi` pin — let OpenClaw auto-select the Codex harness.
+        # No whole-agent runtime pin — let OpenClaw auto-select the Codex harness.
         self.assertNotIn("agentRuntime", defaults)
         # No openai SecretRef — the OAuth profile owns auth.
         self.assertNotIn("models", defaults.get("models", {}))
         providers = (config.get("models") or {}).get("providers") or {}
         self.assertNotIn("apiKey", providers.get("openai", {}))
+        self.assertNotIn("agentRuntime", providers.get("openai", {}))
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
         # Cross-provider fallback to OpenRouter for rate-window relief.
         self.assertEqual(
             defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
@@ -835,8 +891,8 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
     def test_opted_in_without_profile_stays_on_default_config(self) -> None:
         """llm_auth_mode=chatgpt_subscription but NO auth-profile yet →
-        default-mode (pi + OpenRouter) so the agent keeps replying while
-        the device-code flow is in flight or before the user has approved."""
+        default-mode (OpenClaw runtime + OpenRouter) so the agent keeps replying
+        while the device-code flow is in flight or before the user has approved."""
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
                 "TINYHAT_DEV_RUNTIME": "1",
@@ -852,13 +908,14 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 with open(config_path, encoding="utf-8") as fh:
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
-        # Stays on `pi` because the credential isn't on disk yet.
-        self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+        # Stays on the OpenClaw runtime because the credential isn't on disk yet.
+        self.assertNotIn("agentRuntime", defaults)
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
         self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
 
-    def test_default_binding_unchanged(self) -> None:
-        """Non-subscription Computers — the existing path stays
-        completely unaffected by this branch (regression guard)."""
+    def test_default_binding_uses_provider_runtime_policy(self) -> None:
+        """Non-subscription Computers pin the provider runtime instead
+        of the schema-invalid whole-agent runtime policy."""
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
                 "TINYHAT_DEV_RUNTIME": "1",
@@ -881,7 +938,8 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 with open(config_path, encoding="utf-8") as fh:
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
-        self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+        self.assertNotIn("agentRuntime", defaults)
+        _assert_openclaw_provider_runtime(self, config, "openrouter")
 
 
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
@@ -1075,12 +1133,13 @@ class StaleProfileCarryoverGuardTests(unittest.TestCase):
                     config = json.load(fh)
 
                 defaults = config["agents"]["defaults"]
-                # New owner without a profile yet → STAYS on `pi` +
-                # OpenRouter (the opted-in-without-profile branch).
+                # New owner without a profile yet → STAYS on OpenClaw
+                # runtime + OpenRouter (the opted-in-without-profile branch).
                 # The critical assertion: the prior owner's profile
                 # did NOT survive to make the supervisor flip to
                 # subscription mode for the new owner.
-                self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+                self.assertNotIn("agentRuntime", defaults)
+                _assert_openclaw_provider_runtime(self, config, "openrouter")
                 self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
 
 
@@ -1413,7 +1472,8 @@ class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
                 # release-time re-wipe, this is exactly the cross-
                 # owner leak Codex reproduced. We verify that the
                 # release-path wipe (called by the watchdog) clears
-                # the profile so the new owner stays on pi+OpenRouter.
+                # the profile so the new owner stays on OpenClaw +
+                # OpenRouter.
                 killed: list[int] = []
 
                 with patch.object(
@@ -1439,9 +1499,10 @@ class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
                     config = json.load(fh)
                 defaults = config["agents"]["defaults"]
                 # NEW owner sees the opted-in-but-no-profile-yet
-                # branch — stays on pi + OpenRouter (not subscription
-                # mode with the prior owner's credential).
-                self.assertEqual(defaults.get("agentRuntime"), {"id": "pi"})
+                # branch — stays on OpenClaw runtime + OpenRouter (not
+                # subscription mode with the prior owner's credential).
+                self.assertNotIn("agentRuntime", defaults)
+                _assert_openclaw_provider_runtime(self, config, "openrouter")
                 self.assertTrue(
                     defaults["model"]["primary"].startswith("openrouter/")
                 )

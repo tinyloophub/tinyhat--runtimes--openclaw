@@ -90,8 +90,8 @@ OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 
 # ChatGPT BYO subscription (issue #23): when an `openai-codex` OAuth
 # profile is present in this Computer's per-agent auth store, the
-# supervisor swaps the default `pi`+OpenRouter config for the native
-# Codex app-server harness pointed at `openai/gpt-5.5`. The OAuth
+# supervisor swaps the default OpenClaw+OpenRouter config for the
+# native Codex app-server harness pointed at `openai/gpt-5.5`. The OAuth
 # credential is born on the Computer (either from the Mini App-driven
 # heartbeat-command flow OR from the chat-driven plugin tool running
 # the device-code CLI in-sandbox); the supervisor only reads the
@@ -869,6 +869,17 @@ def _sync_openai_api_key_ref(config: dict, secrets: dict[str, str]) -> None:
         del config["models"]
 
 
+def _set_model_provider_runtime(
+    config: dict,
+    provider_id: str,
+    runtime_id: str,
+) -> None:
+    models_cfg = config.setdefault("models", {})
+    providers = models_cfg.setdefault("providers", {})
+    provider_cfg = providers.setdefault(provider_id, {})
+    provider_cfg["agentRuntime"] = {"id": runtime_id}
+
+
 def _runtime_secret_env_entries(secrets: dict[str, str]) -> dict[str, str]:
     """Return the subset of runtime secrets that should land in ``config["env"]``.
 
@@ -1454,16 +1465,6 @@ def write_openclaw_config(
         "workspace": workspace_dir,
         "model": text_model_config,
     }
-    # The `pi` agent runtime is the v0.5.x default — used for OpenRouter
-    # / API-key routes. Subscription mode (openai/gpt-5.5 + the
-    # native Codex app-server harness) is selected automatically by
-    # OpenClaw when an `openai-codex` profile is present, so we drop
-    # the explicit `pi` pin here — pinning it would force OpenClaw's
-    # built-in runtime instead of the Codex harness and silently
-    # negate the linked subscription.
-    if not use_chatgpt_subscription:
-        agents_defaults["agentRuntime"] = {"id": "pi"}
-
     config = {
         "gateway": {
             "mode": "local",
@@ -1491,6 +1492,15 @@ def write_openclaw_config(
         "session": {"dmScope": "per-channel-peer"},
     }
     _ensure_tinyhat_secret_provider_config(config)
+    # OpenClaw 2026.5.28 rejects legacy whole-agent runtime pins such
+    # as agents.defaults.agentRuntime. Runtime policy now belongs on
+    # providers or model entries. Keep platform-credit routes on the
+    # built-in OpenClaw runtime while leaving subscription OpenAI refs
+    # unpinned so OpenClaw can select the Codex harness automatically.
+    if openrouter_enabled:
+        _set_model_provider_runtime(config, "openrouter", "openclaw")
+    if not use_chatgpt_subscription and primary_model.startswith("openai/"):
+        _set_model_provider_runtime(config, "openai", "openclaw")
     if openrouter_enabled and not use_chatgpt_subscription:
         config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
             model_package
@@ -1670,6 +1680,9 @@ def _probe_openclaw_gateway_health_dev(
             tail = fh.read()
     except FileNotFoundError:
         return False, "gateway log file not created yet"
+    startup_failure = _openclaw_gateway_startup_failure_from_logs(tail)
+    if startup_failure:
+        return False, startup_failure
     gateway_ready = "[gateway] ready" in tail
     telegram_connected = "[telegram] connected to gateway" in tail
     if gateway_ready and telegram_connected:
@@ -1680,6 +1693,38 @@ def _probe_openclaw_gateway_health_dev(
     if not telegram_connected:
         missing.append("telegram connected")
     return False, "waiting for OpenClaw " + ", ".join(missing)
+
+
+def _openclaw_gateway_startup_failure_from_logs(logs: str) -> str | None:
+    lines = [line.strip() for line in logs.splitlines() if line.strip()]
+    failure_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "Gateway failed to start:" in line
+        ),
+        None,
+    )
+    if failure_index is None:
+        return None
+
+    details = []
+    for line in lines[failure_index : failure_index + 6]:
+        if "Gateway failed to start:" in line:
+            details.append(line.split("Gateway failed to start:", 1)[1].strip())
+            continue
+        if (
+            "Invalid config" in line
+            or "Invalid input" in line
+            or "Run \"openclaw doctor --fix\"" in line
+        ):
+            details.append(line)
+    compact = " ".join(part for part in details if part)
+    return "gateway startup failed" + (f": {compact}" if compact else "")
+
+
+def _is_openclaw_gateway_startup_failure(detail: str) -> bool:
+    return detail.startswith("gateway startup failed")
 
 
 def _stop_openclaw_gateway_dev() -> None:
@@ -1776,6 +1821,9 @@ def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
         detail = (result.stderr or result.stdout or "").strip()
         return False, detail or f"journalctl exited {result.returncode}"
     logs = result.stdout or ""
+    startup_failure = _openclaw_gateway_startup_failure_from_logs(logs)
+    if startup_failure:
+        return False, startup_failure
     gateway_ready = "[gateway] ready" in logs
     telegram_connected = "[telegram] connected to gateway" in logs
     if gateway_ready and telegram_connected:
@@ -1794,17 +1842,26 @@ def wait_for_openclaw_start(started_at: float) -> None:
     last_probe = ""
     while time.time() < deadline:
         if not is_openclaw_gateway_active():
-            last_probe = (
+            ok, detail = probe_openclaw_gateway_health(started_at)
+            if ok:
+                log.info("OpenClaw gateway readiness probe succeeded")
+                return
+            if _is_openclaw_gateway_startup_failure(detail):
+                raise RuntimeError("openclaw gateway failed to start: " + detail)
+            inactive_detail = (
                 "openclaw subprocess exited"
                 if _dev_mode()
                 else "systemd unit is not active"
             )
+            last_probe = detail if detail else inactive_detail
             time.sleep(1)
             continue
         ok, detail = probe_openclaw_gateway_health(started_at)
         if ok:
             log.info("OpenClaw gateway readiness probe succeeded")
             return
+        if _is_openclaw_gateway_startup_failure(detail):
+            raise RuntimeError("openclaw gateway failed to start: " + detail)
         last_probe = detail
         time.sleep(1)
     raise RuntimeError(
@@ -1857,7 +1914,7 @@ def _binding_signature(binding: dict) -> tuple:
     ``llm_auth_mode`` / ``llm_model_ref`` so a platform-credits ->
     chatgpt_subscription flip triggers rebind and the supervisor
     rewrites openclaw.json instead of keeping the old
-    ``pi`` + OpenRouter config running). The supervisor must drop
+    OpenClaw + OpenRouter config running). The supervisor must drop
     its in-memory state and re-run Phase B so openclaw.json gets
     rewritten with the now-present provider config.
     """
