@@ -5,6 +5,17 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.11.5
+
+### Fixed
+
+- Stop writing provider-level `agentRuntime` pins in generated OpenClaw config
+  so OpenClaw 2026.5.22 can select its embedded runtime harness while Tinyhat
+  continues to provide model package settings, provider secrets, and the
+  8192-token OpenRouter completion cap.
+- This release pairs with the Tinyloop payment-onboarding support in
+  tinyloophub/tinyloop#618. No Tinyhat plugin release is required.
+
 ## 0.11.4
 
 ### Changed
