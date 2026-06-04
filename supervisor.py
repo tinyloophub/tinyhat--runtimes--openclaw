@@ -1536,6 +1536,11 @@ def write_openclaw_config(
     agents_defaults: dict[str, object] = {
         "workspace": workspace_dir,
         "model": text_model_config,
+        # Reserve reply headroom so auto-compaction can recover a turn instead
+        # of failing with "Auto-compaction could not recover this turn." Without
+        # a floor the gateway leaves no room after compacting and bails on every
+        # turn; 20000 is OpenClaw's recommended minimum.
+        "compaction": {"reserveTokensFloor": 20000},
     }
     config = {
         "gateway": {
