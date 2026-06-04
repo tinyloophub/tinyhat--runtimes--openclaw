@@ -952,17 +952,6 @@ def _sync_openai_api_key_ref(config: dict, secrets: dict[str, str]) -> None:
         del config["models"]
 
 
-def _set_model_provider_runtime(
-    config: dict,
-    provider_id: str,
-    runtime_id: str,
-) -> None:
-    models_cfg = config.setdefault("models", {})
-    providers = models_cfg.setdefault("providers", {})
-    provider_cfg = providers.setdefault(provider_id, {})
-    provider_cfg["agentRuntime"] = {"id": runtime_id}
-
-
 def _runtime_secret_env_entries(secrets: dict[str, str]) -> dict[str, str]:
     """Return the subset of runtime secrets that should land in ``config["env"]``.
 
@@ -1575,15 +1564,10 @@ def write_openclaw_config(
         "session": {"dmScope": "per-channel-peer"},
     }
     _ensure_tinyhat_secret_provider_config(config)
-    # OpenClaw 2026.5.28 rejects legacy whole-agent runtime pins such
-    # as agents.defaults.agentRuntime. Runtime policy now belongs on
-    # providers or model entries. Keep platform-credit routes on the
-    # built-in OpenClaw runtime while leaving subscription OpenAI refs
-    # unpinned so OpenClaw can select the Codex harness automatically.
-    if openrouter_enabled:
-        _set_model_provider_runtime(config, "openrouter", "openclaw")
-    if not use_chatgpt_subscription and primary_model.startswith("openai/"):
-        _set_model_provider_runtime(config, "openai", "openclaw")
+    # OpenClaw 2026.5.22 rejects provider runtime pins such as
+    # models.providers.openrouter.agentRuntime={"id":"openclaw"}, while newer
+    # builds reject the older whole-agent runtime pin. Leave runtime selection
+    # to OpenClaw and only write model/package details Tinyhat owns.
     if openrouter_enabled and not use_chatgpt_subscription:
         config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
             model_package
