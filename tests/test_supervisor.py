@@ -55,16 +55,13 @@ def _openrouter_catalog_entry(alias: str) -> dict:
     }
 
 
-def _assert_openclaw_provider_runtime(
+def _assert_no_provider_runtime_pin(
     testcase: unittest.TestCase,
     config: dict,
     provider_id: str,
 ) -> None:
     providers = (config.get("models") or {}).get("providers") or {}
-    testcase.assertEqual(
-        providers.get(provider_id, {}).get("agentRuntime"),
-        {"id": "openclaw"},
-    )
+    testcase.assertNotIn("agentRuntime", providers.get(provider_id, {}))
 
 
 class ReloadOpenClawSecretsTests(unittest.TestCase):
@@ -189,7 +186,7 @@ class OpenRouterModelPackageTests(unittest.TestCase):
             },
         )
         self.assertNotIn("agentRuntime", config["agents"]["defaults"])
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
         self.assertEqual(config["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
 
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:
@@ -222,7 +219,7 @@ class OpenRouterModelPackageTests(unittest.TestCase):
             },
         )
         self.assertNotIn("agentRuntime", config["agents"]["defaults"])
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
 
     def test_binding_signature_changes_when_model_package_changes(self) -> None:
         package = {
@@ -615,7 +612,7 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
                     config = json.load(fh)
 
         self.assertNotIn("agentRuntime", config["agents"]["defaults"])
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
         providers = config["models"]["providers"]
         self.assertEqual(
             providers["openai"]["apiKey"],
@@ -965,7 +962,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         providers = (config.get("models") or {}).get("providers") or {}
         self.assertNotIn("apiKey", providers.get("openai", {}))
         self.assertNotIn("agentRuntime", providers.get("openai", {}))
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
         # Cross-provider fallback to OpenRouter for rate-window relief.
         self.assertEqual(
             defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
@@ -996,7 +993,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         defaults = config["agents"]["defaults"]
         # Stays on the OpenClaw runtime because the credential isn't on disk yet.
         self.assertNotIn("agentRuntime", defaults)
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
         self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
 
     def test_default_binding_uses_provider_runtime_policy(self) -> None:
@@ -1025,7 +1022,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
         self.assertNotIn("agentRuntime", defaults)
-        _assert_openclaw_provider_runtime(self, config, "openrouter")
+        _assert_no_provider_runtime_pin(self, config, "openrouter")
 
 
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
@@ -1225,7 +1222,7 @@ class StaleProfileCarryoverGuardTests(unittest.TestCase):
                 # did NOT survive to make the supervisor flip to
                 # subscription mode for the new owner.
                 self.assertNotIn("agentRuntime", defaults)
-                _assert_openclaw_provider_runtime(self, config, "openrouter")
+                _assert_no_provider_runtime_pin(self, config, "openrouter")
                 self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
 
 
@@ -1588,7 +1585,7 @@ class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
                 # branch — stays on OpenClaw runtime + OpenRouter (not
                 # subscription mode with the prior owner's credential).
                 self.assertNotIn("agentRuntime", defaults)
-                _assert_openclaw_provider_runtime(self, config, "openrouter")
+                _assert_no_provider_runtime_pin(self, config, "openrouter")
                 self.assertTrue(
                     defaults["model"]["primary"].startswith("openrouter/")
                 )
