@@ -7,6 +7,17 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.9
+
+### Fixed
+
+- Retry ChatGPT subscription device-code startup when the OpenClaw CLI exits or
+  hangs before emitting the verification URL and user code, while preserving
+  fail-fast behavior for local provider-plugin and PTY allocation errors.
+- Add a dev-mode smoke harness for the `start_chatgpt_link` retry path that
+  forces first-attempt CLI exit/hang failures and verifies the runtime posts
+  `pending` then `linked` after recovery.
+
 ## 0.11.8
 
 ### Fixed
