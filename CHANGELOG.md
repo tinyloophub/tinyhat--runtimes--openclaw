@@ -5,6 +5,16 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## Unreleased
+
+### Fixed
+
+- Ship and verify OpenClaw's official Codex provider plugin during Computer
+  bootstrap, keep the generated gateway config enabling `codex` and
+  `codex-supervisor`, and self-heal missing installs before gateway startup so
+  ChatGPT subscription device-code linking works on new Computers without
+  manual plugin installation.
+
 ## 0.11.7
 
 ### Fixed

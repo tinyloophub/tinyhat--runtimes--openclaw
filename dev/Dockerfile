@@ -66,7 +66,21 @@ RUN npm install -g openclaw@latest \
 RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
         --home-dir /home/tinyhat --shell /bin/bash tinyhat \
-    && mkdir -p /home/tinyhat/runtime /etc/openclaw \
+    && mkdir -p /home/tinyhat/runtime/openclaw /etc/openclaw \
+    && chown -R tinyhat:tinyhat /home/tinyhat /etc/openclaw
+
+# Ship the same official Codex provider plugin that production bootstrap
+# installs. The supervisor also self-heals this at boot, but baking it into
+# the dev image makes local "new Computer" testing match a fresh VM.
+RUN HOME=/home/tinyhat/runtime \
+    OPENCLAW_CONFIG_PATH=/home/tinyhat/runtime/openclaw/openclaw.json \
+    OPENCLAW_STATE_DIR=/home/tinyhat/runtime \
+    openclaw plugins install @openclaw/codex --force \
+    && HOME=/home/tinyhat/runtime \
+       OPENCLAW_CONFIG_PATH=/home/tinyhat/runtime/openclaw/openclaw.json \
+       OPENCLAW_STATE_DIR=/home/tinyhat/runtime \
+       openclaw plugins inspect codex --json \
+       | python3 -c 'import json, sys; p=(json.load(sys.stdin).get("plugin") or {}); ids=p.get("providerIds") or p.get("providers") or []; sys.exit(0 if p.get("id") == "codex" and p.get("enabled") is not False and p.get("status") == "loaded" and "codex" in ids else 1)' \
     && chown -R tinyhat:tinyhat /home/tinyhat /etc/openclaw
 
 WORKDIR /opt/tinyhat-runtime

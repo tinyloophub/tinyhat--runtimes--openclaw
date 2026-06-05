@@ -42,6 +42,7 @@ OPENCLAW_STATE_DIR="/var/lib/tinyhat-openclaw"
 RUNTIME_BOOTSTRAP_STATUS_PATH="${OPENCLAW_STATE_DIR}/bootstrap-status.json"
 OPENCLAW_GATEWAY_PORT="18789"
 OPENCLAW_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-}"
+CODEX_SUBSCRIPTION_PLUGIN_PACKAGE="@openclaw/codex"
 PRIVATE_ACCESS_PROVIDER="${TINYHAT_PRIVATE_ACCESS_PROVIDER:-disabled}"
 
 echo "[tinyhat-runtime] bootstrap starting from ${RUNTIME_DIR}"
@@ -52,6 +53,14 @@ write_runtime_bootstrap_status() {
   mkdir -p "${OPENCLAW_STATE_DIR}"
   printf '{"provider":"openclaw","state":"%s","diagnostic":"%s"}\n' \
     "${state}" "${diagnostic}" > "${RUNTIME_BOOTSTRAP_STATUS_PATH}"
+}
+
+verify_codex_subscription_plugin() {
+  HOME="${OPENCLAW_STATE_DIR}" \
+    OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" \
+    OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" \
+    openclaw plugins inspect codex --json \
+    | python3 -c 'import json, sys; p=(json.load(sys.stdin).get("plugin") or {}); ids=p.get("providerIds") or p.get("providers") or []; sys.exit(0 if p.get("id") == "codex" and p.get("enabled") is not False and p.get("status") == "loaded" and "codex" in ids else 1)'
 }
 
 if [[ ! -f "${SUPERVISOR_PATH}" ]]; then
@@ -131,6 +140,25 @@ if command -v openclaw >/dev/null 2>&1; then
 else
   write_runtime_bootstrap_status "error" "openclaw binary missing"
   echo "[tinyhat-runtime] ERROR: openclaw binary is missing after bootstrap" >&2
+  exit 1
+fi
+
+echo "[tinyhat-runtime] installing subscription provider plugin: ${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}"
+if HOME="${OPENCLAW_STATE_DIR}" \
+    OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" \
+    OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" \
+    openclaw plugins install "${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}" --force; then
+  echo "[tinyhat-runtime] installed subscription provider plugin"
+else
+  write_runtime_bootstrap_status "error" "codex subscription plugin install failed"
+  echo "[tinyhat-runtime] ERROR: failed to install ${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}" >&2
+  exit 1
+fi
+if verify_codex_subscription_plugin; then
+  echo "[tinyhat-runtime] verified subscription provider plugin: codex"
+else
+  write_runtime_bootstrap_status "error" "codex subscription plugin verify failed"
+  echo "[tinyhat-runtime] ERROR: codex plugin is not registered after install" >&2
   exit 1
 fi
 

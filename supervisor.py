@@ -100,6 +100,9 @@ OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
 CHATGPT_SUBSCRIPTION_PROVIDER = "openai"
 LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+CODEX_SUBSCRIPTION_PLUGIN_ID = "codex"
+CODEX_SUBSCRIPTION_PLUGIN_PACKAGE = "@openclaw/codex"
+CODEX_SUPERVISOR_PLUGIN_ID = "codex-supervisor"
 CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES = ("openai:", "openai-codex:")
 CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS = frozenset(
     {"openai", "openai-codex"}
@@ -751,6 +754,89 @@ def _is_chatgpt_subscription_provider_available() -> bool:
         LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER,
     )
     return False
+
+
+def _is_codex_subscription_plugin_available() -> bool:
+    """Return True when the official Codex plugin is installed and enabled.
+
+    OpenClaw's current ChatGPT device-code route uses the bundled ``openai``
+    model provider, while older chat-tool paths and Codex-native capabilities
+    require the official ``@openclaw/codex`` plugin to be installed. Keep this
+    as a separate readiness check so a missing optional plugin does not get
+    confused with the bundled OpenAI provider registry.
+    """
+    plugin = _inspect_openclaw_plugin(CODEX_SUBSCRIPTION_PLUGIN_ID)
+    if plugin is None:
+        return False
+    status = plugin.get("status")
+    if plugin.get("enabled") is False or status == "disabled":
+        log.warning("OpenClaw Codex subscription plugin is installed but disabled")
+        return False
+    if status and status != "loaded":
+        log.warning("OpenClaw Codex subscription plugin is not loaded: %s", status)
+        return False
+    provider_ids = plugin.get("providerIds") or plugin.get("providers") or []
+    if CODEX_SUBSCRIPTION_PLUGIN_ID in provider_ids:
+        return True
+    log.warning(
+        "OpenClaw Codex subscription plugin is registered but does not expose "
+        "provider %s",
+        CODEX_SUBSCRIPTION_PLUGIN_ID,
+    )
+    return False
+
+
+def ensure_codex_subscription_plugin_installed() -> bool:
+    """Install OpenClaw's official Codex plugin for subscription linking.
+
+    The plugin install command updates OpenClaw's config and prints "restart
+    the gateway" because a running gateway cannot load a newly installed plugin
+    in-place. During cold boot we call this before writing Tinyhat's generated
+    config and before starting the gateway; the generated config below includes
+    the same plugin entries so the installer's config mutation is not lost.
+    """
+    if _is_codex_subscription_plugin_available():
+        return True
+
+    result = subprocess.run(
+        [
+            "openclaw",
+            "plugins",
+            "install",
+            CODEX_SUBSCRIPTION_PLUGIN_PACKAGE,
+            "--force",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_openclaw_cli_env(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Codex subscription plugin install failed: {detail}")
+    if not _is_codex_subscription_plugin_available():
+        raise RuntimeError(
+            "Codex subscription plugin install completed but provider "
+            f"{CODEX_SUBSCRIPTION_PLUGIN_ID!r} is still unavailable"
+        )
+    log.info(
+        "installed OpenClaw Codex subscription plugin (%s)",
+        CODEX_SUBSCRIPTION_PLUGIN_PACKAGE,
+    )
+    return True
+
+
+def try_install_codex_subscription_plugin() -> bool:
+    """Best-effort install for ChatGPT/Codex subscription link support."""
+    try:
+        return ensure_codex_subscription_plugin_installed()
+    except Exception as exc:
+        log.warning(
+            "Codex subscription plugin unavailable; subscription linking may "
+            "need platform credits or manual repair: %s",
+            exc,
+        )
+        return False
 
 
 def ensure_chatgpt_subscription_provider_available() -> bool:
@@ -1874,6 +1960,9 @@ def write_openclaw_config(
         "telegram": {"enabled": True},
         "openai": openai_plugin,
     }
+    if enable_chatgpt_subscription_provider:
+        plugin_entries[CODEX_SUBSCRIPTION_PLUGIN_ID] = {"enabled": True}
+        plugin_entries[CODEX_SUPERVISOR_PLUGIN_ID] = {"enabled": True}
     if enable_tinyhat_plugin:
         plugin_entries[TINYHAT_PLUGIN_ID] = {
             "enabled": True,
@@ -3931,6 +4020,9 @@ def _run_one_binding_cycle() -> int:
 
     # Phase C: persist binding + start OpenClaw + report active
     try:
+        codex_subscription_plugin_installed = (
+            try_install_codex_subscription_plugin()
+        )
         chatgpt_subscription_provider_available = (
             try_check_chatgpt_subscription_provider()
         )
@@ -3940,6 +4032,7 @@ def _run_one_binding_cycle() -> int:
             enable_tinyhat_plugin=tinyhat_plugin_installed,
             enable_chatgpt_subscription_provider=(
                 chatgpt_subscription_provider_available
+                and codex_subscription_plugin_installed
             ),
         )
         delete_telegram_webhook(binding)
