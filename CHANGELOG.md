@@ -5,6 +5,17 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.11.6
+
+### Fixed
+
+- Reserve 20,000 tokens of reply headroom in generated OpenClaw config so
+  auto-compaction can recover turns instead of failing immediately after
+  context compaction.
+- This release contains the runtime-side fix from
+  tinyloophub/tinyhat--runtimes--openclaw#42. No Tinyhat plugin release is
+  required.
+
 ## 0.11.5
 
 ### Fixed
