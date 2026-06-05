@@ -79,7 +79,7 @@ node --version
 npm --version
 git --version
 
-mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat-private-access
+mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access
 
 if [[ "${PRIVATE_ACCESS_PROVIDER}" == "tailscale" ]]; then
   TAILSCALE_AUTH_KEY="${TINYHAT_TAILSCALE_AUTH_KEY:-}"
