@@ -148,10 +148,12 @@ PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
 _DEFAULT_COMPONENT_UPDATE_STATE_PATH = (
     "/var/lib/tinyhat/component-update-state.json"
 )
+_DEFAULT_PACKAGE_APPLY_STATE_PATH = "/var/lib/tinyhat/package-apply-state.json"
 _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
     "/var/lib/tinyhat/tinyhat-plugin-source.json"
 )
 TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
+TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
 
 # Instance-metadata keys the platform writes at insert time and can
 # update later via ``compute.instances.setMetadata``. Both are
@@ -549,8 +551,14 @@ def _tinyhat_plugin_source_override_path() -> str:
     configured = (
         os.environ.get(TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV) or ""
     ).strip()
+    default_path = os.path.abspath(
+        os.path.join(openclaw_state_dir(), "tinyhat-plugin-source.json")
+        if _dev_mode()
+        else _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
+    )
     path = os.path.abspath(
-        configured or _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
+        configured
+        or default_path
     )
     checkout_dir = os.path.abspath(runtime_dir())
     try:
@@ -558,7 +566,6 @@ def _tinyhat_plugin_source_override_path() -> str:
     except ValueError:
         inside_checkout = False
     if inside_checkout:
-        fallback = os.path.abspath(_DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH)
         log.warning(
             "%s=%s resolves inside the runtime checkout dir (%s); plugin "
             "update source overrides must survive runtime checkouts. Falling "
@@ -566,9 +573,9 @@ def _tinyhat_plugin_source_override_path() -> str:
             TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV,
             path,
             checkout_dir,
-            fallback,
+            default_path,
         )
-        return fallback
+        return default_path
     return path
 
 
@@ -3370,7 +3377,11 @@ def _component_update_state_path() -> str:
 
     See tinyloophub/tinyloop#562 for the platform side of this contract.
     """
-    default_path = os.path.abspath(_DEFAULT_COMPONENT_UPDATE_STATE_PATH.strip())
+    default_path = os.path.abspath(
+        os.path.join(openclaw_state_dir(), "component-update-state.json")
+        if _dev_mode()
+        else _DEFAULT_COMPONENT_UPDATE_STATE_PATH.strip()
+    )
     override = (os.environ.get("TINYHAT_COMPONENT_UPDATE_STATE_PATH") or "").strip()
     if not override:
         return default_path
@@ -3739,6 +3750,315 @@ def _repost_component_update_result(revision: int, state: dict) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# Tinyhat package/default-skill apply
+# --------------------------------------------------------------------------
+#
+# The platform may emit ``apply_packages`` after component updates are caught up.
+# The command represents the Tinyhat plugin/default-skills package ref stored in
+# the provisioning manifest. OpenClaw has no separate "packages" CLI today: the
+# package is made concrete by installing the Tinyhat plugin ref, whose manifest
+# exposes the bundled skills. After the install we rebind-restart the gateway so
+# OpenClaw loads the updated plugin and skill surface.
+
+
+def _package_apply_state_path() -> str:
+    """Resolve the package-apply dedupe-state path.
+
+    Like the component-update state, this lives outside the runtime checkout so
+    it survives runtime self-updates and gateway rebinds. The env override is
+    honoured only when it is not inside ``runtime_dir()``.
+    """
+    default_path = os.path.abspath(
+        os.path.join(openclaw_state_dir(), "package-apply-state.json")
+        if _dev_mode()
+        else _DEFAULT_PACKAGE_APPLY_STATE_PATH.strip()
+    )
+    override = (os.environ.get(TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV) or "").strip()
+    if not override:
+        return default_path
+
+    override_abs = os.path.abspath(override)
+    checkout_dir = os.path.abspath(runtime_dir())
+    try:
+        inside_checkout = (
+            os.path.commonpath([override_abs, checkout_dir]) == checkout_dir
+        )
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        log.warning(
+            "%s=%s resolves inside the runtime checkout dir (%s); package-apply "
+            "state must survive runtime checkouts. Falling back to %s.",
+            TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV,
+            override_abs,
+            checkout_dir,
+            default_path,
+        )
+        return default_path
+    return override_abs
+
+
+def _read_package_apply_state() -> dict:
+    try:
+        with open(_package_apply_state_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_package_apply_state(
+    revision: int,
+    status: str,
+    *,
+    diagnostic: str | None = None,
+    installed_packages: dict | None = None,
+    reported: bool = False,
+) -> None:
+    try:
+        _atomic_write_json(
+            _package_apply_state_path(),
+            {
+                "last_revision": int(revision),
+                "status": str(status),
+                "diagnostic": diagnostic,
+                "installed_packages": installed_packages or {},
+                "reported": bool(reported),
+            },
+            mode=0o600,
+        )
+    except Exception as exc:  # noqa: BLE001 - never fatal
+        log.warning("failed to persist package-apply state: %s", exc)
+
+
+def _post_package_apply_result(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None = None,
+    installed_packages: dict | None = None,
+) -> None:
+    body: dict = {
+        "revision": revision,
+        "status": status,
+        "diagnostic": diagnostic[:1023] if diagnostic else None,
+        "installed_packages": installed_packages or {},
+    }
+    post_json("/hapi/v1/computers/me/packages/apply-result", body)
+
+
+def _try_report_package_apply_and_persist(
+    *,
+    revision: int,
+    status: str,
+    diagnostic: str | None,
+    installed_packages: dict | None,
+) -> bool:
+    try:
+        _post_package_apply_result(
+            revision=revision,
+            status=status,
+            diagnostic=diagnostic,
+            installed_packages=installed_packages,
+        )
+    except Exception as exc:  # noqa: BLE001 - report is best-effort
+        log.warning(
+            "failed to post package apply result for revision=%d: %s",
+            revision,
+            exc,
+        )
+        return False
+    _write_package_apply_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        installed_packages=installed_packages,
+        reported=True,
+    )
+    return True
+
+
+def _repost_package_apply_result(revision: int, state: dict) -> None:
+    status = str(state.get("status") or "applied")
+    diagnostic = state.get("diagnostic")
+    installed_packages = state.get("installed_packages")
+    if not isinstance(installed_packages, dict):
+        installed_packages = {}
+    _try_report_package_apply_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic if isinstance(diagnostic, str) else None,
+        installed_packages=installed_packages,
+    )
+
+
+def _package_plugin_identity(command_plugin: dict, marker: dict) -> dict:
+    repo_url = str(marker.get("repo_url") or command_plugin.get("repo_url") or "").strip()
+    repo_ref = str(
+        marker.get("repo_ref")
+        or command_plugin.get("requested_ref")
+        or command_plugin.get("repo_ref")
+        or ""
+    ).strip()
+    sha = str(
+        marker.get("resolved_commit_sha")
+        or command_plugin.get("resolved_commit_sha")
+        or command_plugin.get("commit_sha")
+        or ""
+    ).strip()
+    version = str(marker.get("version") or command_plugin.get("version") or "").strip()
+    out = dict(command_plugin)
+    out.update(
+        {
+            "id": str(command_plugin.get("id") or TINYHAT_PLUGIN_ID),
+            "repo_url": repo_url or None,
+            "requested_ref": repo_ref or None,
+            "repo_ref": repo_ref or None,
+            "resolved_commit_sha": sha or None,
+            "version": version or None,
+            "status": "applied",
+        }
+    )
+    return out
+
+
+def _applied_default_skills(default_skills: list, plugin_identity: dict) -> list[dict]:
+    applied: list[dict] = []
+    for item in default_skills:
+        if not isinstance(item, dict):
+            continue
+        skill = dict(item)
+        skill["status"] = "applied"
+        skill["package_ref"] = plugin_identity.get("requested_ref")
+        skill["package_sha"] = plugin_identity.get("resolved_commit_sha")
+        applied.append(skill)
+    return applied
+
+
+def _missing_default_skill_names(default_skills: list) -> list[str]:
+    extension_dir = os.path.join(openclaw_state_dir(), "extensions", TINYHAT_PLUGIN_ID)
+    missing: list[str] = []
+    for item in default_skills:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        skill_path = os.path.join(extension_dir, "skills", name, "SKILL.md")
+        if not os.path.exists(skill_path):
+            missing.append(name)
+    return missing
+
+
+def _apply_tinyhat_packages(command: dict) -> tuple[bool, str | None, dict]:
+    platform_plugin = command.get("platform_plugin")
+    default_skills = command.get("default_skills")
+    if not isinstance(platform_plugin, dict):
+        return False, "package apply command is missing platform_plugin", {}
+    if default_skills is None:
+        default_skills = []
+    if not isinstance(default_skills, list):
+        return False, "package apply command default_skills must be a list", {}
+    if command.get("preserve_user_installed") is False:
+        return (
+            False,
+            "package apply requested user-installed package removal, which this "
+            "runtime does not support",
+            {},
+        )
+
+    repo_url = str(platform_plugin.get("repo_url") or "").strip()
+    repo_ref = str(
+        platform_plugin.get("requested_ref") or platform_plugin.get("repo_ref") or ""
+    ).strip()
+    if not repo_url or not repo_ref:
+        return False, "package apply command is missing plugin repo_url/requested_ref", {}
+
+    try:
+        ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=repo_ref)
+        marker = _read_installed_plugin_marker()
+        plugin_identity = _package_plugin_identity(platform_plugin, marker)
+        installed_packages = {
+            "platform_plugin": plugin_identity,
+            "default_skills": _applied_default_skills(
+                default_skills,
+                plugin_identity,
+            ),
+        }
+        missing = _missing_default_skill_names(default_skills)
+        if missing:
+            return (
+                False,
+                "default skills missing after Tinyhat plugin install: "
+                + ", ".join(missing[:10]),
+                installed_packages,
+            )
+        _write_tinyhat_plugin_source_override(
+            repo_url=repo_url,
+            repo_ref=repo_ref,
+            resolved_commit_sha=str(
+                plugin_identity.get("resolved_commit_sha") or ""
+            ).strip()
+            or None,
+            version=str(plugin_identity.get("version") or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - package apply is reported, not fatal
+        return False, f"Tinyhat package apply failed: {exc}", {}
+
+    log.info(
+        "package apply: Tinyhat plugin/default skills now at ref=%s sha=%s",
+        repo_ref,
+        str(plugin_identity.get("resolved_commit_sha") or "")[:12],
+    )
+    return True, None, installed_packages
+
+
+def handle_apply_packages_command(command: dict) -> None:
+    revision = _command_revision(command)
+    if revision is None:
+        log.warning("ignoring malformed apply_packages command: %r", command)
+        return
+
+    state = _read_package_apply_state()
+    if state.get("last_revision") == revision:
+        if state.get("reported") is True:
+            log.info(
+                "apply_packages revision=%d already applied (status=%s) and "
+                "reported; skipping",
+                revision,
+                state.get("status"),
+            )
+            return
+        log.info(
+            "apply_packages revision=%d already applied (status=%s) but "
+            "unreported; reposting cached result",
+            revision,
+            state.get("status"),
+        )
+        _repost_package_apply_result(revision, state)
+        return
+
+    log.info("heartbeat command: applying Tinyhat packages revision=%d", revision)
+    ok, diagnostic, installed_packages = _apply_tinyhat_packages(command)
+    status = "applied" if ok else "failed"
+    _write_package_apply_state(
+        revision,
+        status,
+        diagnostic=diagnostic,
+        installed_packages=installed_packages,
+        reported=False,
+    )
+    _try_report_package_apply_and_persist(
+        revision=revision,
+        status=status,
+        diagnostic=diagnostic,
+        installed_packages=installed_packages,
+    )
+    if ok:
+        _restart_gateway_for_component_update()
+
+
 def handle_update_component_command(command: dict) -> None:
     """Handle one heartbeat-delivered ``update_component`` command.
 
@@ -3890,6 +4210,8 @@ def handle_heartbeat_command(command: dict) -> None:
         handle_start_chatgpt_link_command(command)
     elif cmd_type == "update_component":
         handle_update_component_command(command)
+    elif cmd_type == "apply_packages":
+        handle_apply_packages_command(command)
     else:
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 
