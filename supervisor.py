@@ -107,6 +107,18 @@ CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES = ("openai:", "openai-codex:")
 CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS = frozenset(
     {"openai", "openai-codex"}
 )
+CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_ENV = (
+    "TINYHAT_CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_S"
+)
+CHATGPT_DEVICE_CODE_URL_EMIT_ATTEMPTS_ENV = (
+    "TINYHAT_CHATGPT_DEVICE_CODE_URL_EMIT_ATTEMPTS"
+)
+CHATGPT_DEVICE_CODE_RETRY_DELAY_ENV = (
+    "TINYHAT_CHATGPT_DEVICE_CODE_RETRY_DELAY_S"
+)
+CHATGPT_DEVICE_CODE_OVERALL_TIMEOUT_ENV = (
+    "TINYHAT_CHATGPT_DEVICE_CODE_OVERALL_TIMEOUT_S"
+)
 # Default agent id mirrors the platform's single-agent assumption today.
 # The auth store is per-agent inside the per-Computer OpenClaw state dir.
 DEFAULT_OPENCLAW_AGENT_ID = "main"
@@ -902,6 +914,71 @@ def _chatgpt_subscription_login_command(openclaw_bin: str) -> list[str]:
         CHATGPT_SUBSCRIPTION_PROVIDER,
         "--device-code",
     ]
+
+
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("invalid %s=%r; using default %.3f", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning(
+            "%s=%r is below minimum %.3f; using default %.3f",
+            name,
+            raw,
+            minimum,
+            default,
+        )
+        return default
+    return value
+
+
+def _int_env(name: str, default: int, *, minimum: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("invalid %s=%r; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning(
+            "%s=%r is below minimum %d; using default %d",
+            name,
+            raw,
+            minimum,
+            default,
+        )
+        return default
+    return value
+
+
+def _chatgpt_device_code_worker_kwargs() -> dict[str, float | int]:
+    """Runtime-tunable timing for start_chatgpt_link smoke/dev runs.
+
+    Production defaults intentionally match the worker signature. The env
+    overrides let a dev Computer force fast pre-code retry scenarios without
+    changing user-facing behaviour in normal deployments.
+    """
+    return {
+        "url_emit_timeout_s": _float_env(
+            CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_ENV, 20.0, minimum=0.001
+        ),
+        "url_emit_attempts": _int_env(
+            CHATGPT_DEVICE_CODE_URL_EMIT_ATTEMPTS_ENV, 3, minimum=1
+        ),
+        "url_emit_retry_delay_s": _float_env(
+            CHATGPT_DEVICE_CODE_RETRY_DELAY_ENV, 2.0, minimum=0.0
+        ),
+        "overall_timeout_s": _float_env(
+            CHATGPT_DEVICE_CODE_OVERALL_TIMEOUT_ENV, 900.0, minimum=0.001
+        ),
+    }
 
 
 _OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
@@ -2743,7 +2820,10 @@ def _run_chatgpt_device_code_login_in_thread(
     starting_generation: int | None = None,
     openclaw_bin: str = "openclaw",
     url_emit_timeout_s: float = 20.0,
+    url_emit_attempts: int = 3,
+    url_emit_retry_delay_s: float = 2.0,
     overall_timeout_s: float = 900.0,  # 15 min = device-code expiry
+    _attempt_index: int = 1,
 ) -> None:
     """Worker thread: spawn the device-code CLI in a PTY + report progress.
 
@@ -2788,11 +2868,16 @@ def _run_chatgpt_device_code_login_in_thread(
     if starting_generation is None:
         starting_generation = _current_binding_generation()
 
+    max_url_emit_attempts = max(1, int(url_emit_attempts))
+    attempt_index = max(1, min(int(_attempt_index), max_url_emit_attempts))
+
     log.info(
         "subscription-link: starting device-code login subprocess "
-        "session_id=%s starting_generation=%d",
+        "session_id=%s starting_generation=%d attempt=%d/%d",
         session_id,
         starting_generation,
+        attempt_index,
+        max_url_emit_attempts,
     )
 
     # Pre-fork supersession check: if owner-release fired between
@@ -2879,6 +2964,7 @@ def _run_chatgpt_device_code_login_in_thread(
     # complete" or the child exits, and POST exactly one terminal
     # result regardless of which way we exit the loop.
     started_at = _time.monotonic()
+    fd_closed = False
     buffer = ""
     url_line_re = re.compile(r"URL:\s*(https?://\S+)")
     code_line_re = re.compile(r"Code:\s*([A-Za-z0-9]{4,5}-[A-Za-z0-9]{4,6})")
@@ -2887,6 +2973,7 @@ def _run_chatgpt_device_code_login_in_thread(
     pending_reported = False
     terminal_posted = False
     child_exit_code: int | None = None
+    child_reaped = False
 
     # Cross-owner credential-leak guard (PR #24 reviews at 01:19Z +
     # 01:41Z). The `starting_generation` parameter is the binding
@@ -2906,13 +2993,17 @@ def _run_chatgpt_device_code_login_in_thread(
         return _current_binding_generation() != starting_generation
 
     def _child_alive() -> bool:
-        nonlocal child_exit_code
+        nonlocal child_exit_code, child_reaped
+        if child_reaped:
+            return False
         try:
             wpid, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
+            child_reaped = True
             return False
         if wpid == 0:
             return True
+        child_reaped = True
         # Decode the status — only the exit-code byte is non-secret
         # diagnostic context we ever surface.
         if os.WIFEXITED(status):
@@ -2956,10 +3047,104 @@ def _run_chatgpt_device_code_login_in_thread(
         terminal_posted = True
 
     def _kill_child() -> None:
+        if child_reaped:
+            return
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+    def _wait_for_child_exit(timeout_s: float) -> bool:
+        nonlocal child_exit_code, child_reaped
+        if child_reaped:
+            return True
+        deadline = _time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                child_reaped = True
+                return True
+            if wpid != 0:
+                child_reaped = True
+                if os.WIFEXITED(status):
+                    child_exit_code = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    child_exit_code = -os.WTERMSIG(status)
+                return True
+            if _time.monotonic() >= deadline:
+                return False
+            _time.sleep(0.05)
+
+    def _stop_child_before_retry() -> None:
+        if child_reaped:
+            return
+        _kill_child()
+        if _wait_for_child_exit(2.0):
+            return
+        log.warning(
+            "subscription-link: device-code CLI did not exit after SIGTERM; "
+            "sending SIGKILL session_id=%s attempt=%d/%d",
+            session_id,
+            attempt_index,
+            max_url_emit_attempts,
+        )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        _wait_for_child_exit(1.0)
+
+    def _cleanup_current_child() -> None:
+        nonlocal fd_closed
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd_closed = True
+        _wait_for_child_exit(0.0)
+
+    def _retry_url_emit_failure(reason: str) -> bool:
+        nonlocal terminal_posted
+        if attempt_index >= max_url_emit_attempts or _is_superseded():
+            return False
+        log.warning(
+            "subscription-link: device-code URL/code startup attempt %d/%d "
+            "failed for session_id=%s; retrying: %s",
+            attempt_index,
+            max_url_emit_attempts,
+            session_id,
+            reason[:300],
+        )
+        terminal_posted = True
+        _stop_child_before_retry()
+        with _subscription_link_active_workers_lock:
+            entry = _subscription_link_active_workers.get(session_id)
+            if entry is not None:
+                entry["pid"] = None
+        _cleanup_current_child()
+        if url_emit_retry_delay_s > 0:
+            _time.sleep(url_emit_retry_delay_s)
+        _run_chatgpt_device_code_login_in_thread(
+            session_id=session_id,
+            starting_generation=starting_generation,
+            openclaw_bin=openclaw_bin,
+            url_emit_timeout_s=url_emit_timeout_s,
+            url_emit_attempts=max_url_emit_attempts,
+            url_emit_retry_delay_s=url_emit_retry_delay_s,
+            overall_timeout_s=overall_timeout_s,
+            _attempt_index=attempt_index + 1,
+        )
+        return True
+
+    def _url_emit_failure_reason(reason: str) -> str:
+        if max_url_emit_attempts <= 1:
+            return reason
+        return (
+            f"{reason} Tried {max_url_emit_attempts} startup attempts before "
+            "reporting this failure."
+        )
 
     def _cli_tail() -> str:
         stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
@@ -3025,20 +3210,25 @@ def _run_chatgpt_device_code_login_in_thread(
             # certainly errored before issuing the device code
             # (network, OpenAI 4xx, disabled-for-account, etc.).
             if not pending_reported and elapsed > url_emit_timeout_s:
-                log.warning(
-                    "subscription-link: no URL/code from CLI after %.0fs "
-                    "session_id=%s; reporting failed",
-                    elapsed,
-                    session_id,
-                )
-                _post_failed(
+                reason = (
                     "openclaw did not return a device code. Check that "
                     "device-code login is enabled in your ChatGPT security "
                     "settings (Settings -> Security -> Enable device code "
                     "authorization for Codex). Recent CLI output: "
                     f"{_cli_tail()}"
                 )
+                log.warning(
+                    "subscription-link: no URL/code from CLI after %.0fs "
+                    "session_id=%s attempt=%d/%d",
+                    elapsed,
+                    session_id,
+                    attempt_index,
+                    max_url_emit_attempts,
+                )
                 _kill_child()
+                if _retry_url_emit_failure(reason):
+                    break
+                _post_failed(_url_emit_failure_reason(reason))
                 break
 
             ready, _, _ = select.select([fd], [], [], 0.5)
@@ -3138,7 +3328,7 @@ def _run_chatgpt_device_code_login_in_thread(
                         session_id,
                         child_exit_code,
                     )
-                    _post_failed(
+                    reason = (
                         "The OpenClaw device-code login subprocess exited "
                         f"before issuing a code (exit code: {child_exit_code}). "
                         "Check that device-code login is enabled in your "
@@ -3146,6 +3336,9 @@ def _run_chatgpt_device_code_login_in_thread(
                         "Enable device code authorization for Codex), then "
                         f"ask to retry. Recent CLI output: {_cli_tail()}"
                     )
+                    if _retry_url_emit_failure(reason):
+                        break
+                    _post_failed(_url_emit_failure_reason(reason))
                 break
     except Exception as exc:  # noqa: BLE001 — worker thread, must not crash silently
         log.exception(
@@ -3158,13 +3351,11 @@ def _run_chatgpt_device_code_login_in_thread(
         with _subscription_link_active_workers_lock:
             _subscription_link_active_workers.pop(session_id, None)
         try:
-            os.close(fd)
+            if not fd_closed:
+                os.close(fd)
         except OSError:
             pass
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
+        _wait_for_child_exit(0.0)
 
 
 # ANSI / OSC regexes used by the device-code CLI capture path.
@@ -3229,6 +3420,7 @@ def handle_start_chatgpt_link_command(command: dict) -> None:
         kwargs={
             "session_id": session_id,
             "starting_generation": starting_generation,
+            **_chatgpt_device_code_worker_kwargs(),
         },
         name=f"chatgpt-link-{session_id[:8]}",
         daemon=True,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -1978,6 +1979,8 @@ class HandleStartChatgptLinkCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         # Clear the in-memory idempotency set so test order doesn't matter.
         supervisor._subscription_link_sessions_started.clear()
+        with supervisor._subscription_link_active_workers_lock:
+            supervisor._subscription_link_active_workers.clear()
 
     def test_handler_rejects_malformed_command(self) -> None:
         captured = []
@@ -2030,6 +2033,53 @@ class HandleStartChatgptLinkCommandTests(unittest.TestCase):
 
         # Same session id only spawned once; different session id spawns.
         self.assertEqual(captured, ["sess-xyz", "other-sess"])
+
+    def test_handler_applies_device_code_timing_env(self) -> None:
+        import threading as threading_mod
+
+        captured = []
+
+        def _fake_runner(**kw):
+            captured.append(kw)
+
+        class _InlineThread:
+            """Run the target inline so the test can observe the call."""
+
+            def __init__(self, target, kwargs, name, daemon):
+                self._target = target
+                self._kwargs = kwargs
+
+            def start(self):
+                self._target(**self._kwargs)
+
+        with (
+            patch.object(
+                supervisor,
+                "_run_chatgpt_device_code_login_in_thread",
+                side_effect=_fake_runner,
+            ),
+            patch.object(threading_mod, "Thread", _InlineThread),
+            patch.dict(
+                os.environ,
+                {
+                    supervisor.CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_ENV: "0.25",
+                    supervisor.CHATGPT_DEVICE_CODE_URL_EMIT_ATTEMPTS_ENV: "2",
+                    supervisor.CHATGPT_DEVICE_CODE_RETRY_DELAY_ENV: "0",
+                    supervisor.CHATGPT_DEVICE_CODE_OVERALL_TIMEOUT_ENV: "5",
+                },
+                clear=False,
+            ),
+        ):
+            supervisor.handle_start_chatgpt_link_command(
+                {"type": "start_chatgpt_link", "session_id": "timing-env-test"}
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["session_id"], "timing-env-test")
+        self.assertEqual(captured[0]["url_emit_timeout_s"], 0.25)
+        self.assertEqual(captured[0]["url_emit_attempts"], 2)
+        self.assertEqual(captured[0]["url_emit_retry_delay_s"], 0.0)
+        self.assertEqual(captured[0]["overall_timeout_s"], 5.0)
 
 
 class StripAnsiForCliCaptureTests(unittest.TestCase):
@@ -2160,6 +2210,7 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
                 session_id="quick-exit-test",
                 openclaw_bin="/bin/false",
                 url_emit_timeout_s=2.0,
+                url_emit_retry_delay_s=0.0,
                 overall_timeout_s=5.0,
             )
 
@@ -2175,6 +2226,7 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         # hint AND include the CLI tail / exit code.
         self.assertIn("device-code", body["error"].lower())
         self.assertIn("exit code", body["error"].lower())
+        self.assertIn("Tried 3 startup attempts", body["error"])
 
     def test_quick_exit_posts_once_even_with_late_drain(self) -> None:
         """No double-post: only ONE terminal status per invocation."""
@@ -2195,6 +2247,7 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
                 session_id="dup-guard-test",
                 openclaw_bin="/bin/false",
                 url_emit_timeout_s=2.0,
+                url_emit_retry_delay_s=0.0,
                 overall_timeout_s=5.0,
             )
         # Only one terminal post, not two.
@@ -2202,6 +2255,123 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
             b for _, b in calls if b.get("status") in ("linked", "failed")
         ]
         self.assertEqual(len(terminal_posts), 1, f"got {terminal_posts}")
+
+    def test_quick_exit_retries_before_reporting_failure(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = os.path.join(tmpdir, "attempts.txt")
+            script_path = os.path.join(tmpdir, "fake-openclaw")
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "count=0\n"
+                    "if [ -f \"$ATTEMPTS_PATH\" ]; then\n"
+                    "  count=$(cat \"$ATTEMPTS_PATH\")\n"
+                    "fi\n"
+                    "count=$((count + 1))\n"
+                    "printf '%s' \"$count\" > \"$ATTEMPTS_PATH\"\n"
+                    "if [ \"$count\" = \"1\" ]; then\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "printf 'URL: https://auth.openai.com/codex/device\\n'\n"
+                    "printf 'Code: RETR-YOKAY\\n'\n"
+                    "printf 'OpenAI device code complete\\n'\n"
+                )
+            os.chmod(script_path, 0o755)
+
+            with (
+                patch.object(
+                    supervisor,
+                    "post_json",
+                    side_effect=lambda p, b: calls.append((p, b)) or {},
+                ),
+                patch.object(
+                    supervisor,
+                    "ensure_chatgpt_subscription_provider_available",
+                    return_value=True,
+                ),
+                patch.dict(os.environ, {"ATTEMPTS_PATH": attempts_path}, clear=False),
+            ):
+                supervisor._run_chatgpt_device_code_login_in_thread(
+                    session_id="retry-start-test",
+                    openclaw_bin=script_path,
+                    url_emit_timeout_s=1.0,
+                    url_emit_attempts=2,
+                    url_emit_retry_delay_s=0.0,
+                    overall_timeout_s=5.0,
+                )
+
+            with open(attempts_path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "2")
+
+        bodies = [body for _, body in calls]
+        self.assertEqual([body["status"] for body in bodies], ["pending", "linked"])
+        self.assertEqual(bodies[0]["session_id"], "retry-start-test")
+        self.assertEqual(
+            bodies[0]["verification_url"],
+            "https://auth.openai.com/codex/device",
+        )
+        self.assertEqual(bodies[0]["user_code"], "RETR-YOKAY")
+
+    def test_url_emit_timeout_retries_before_reporting_failure(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = os.path.join(tmpdir, "timeout-attempts.txt")
+            script_path = os.path.join(tmpdir, "fake-openclaw-timeout")
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "count=0\n"
+                    "if [ -f \"$ATTEMPTS_PATH\" ]; then\n"
+                    "  count=$(cat \"$ATTEMPTS_PATH\")\n"
+                    "fi\n"
+                    "count=$((count + 1))\n"
+                    "printf '%s' \"$count\" > \"$ATTEMPTS_PATH\"\n"
+                    "if [ \"$count\" = \"1\" ]; then\n"
+                    "  exec \"$PYTHON_BIN\" -c 'import time; time.sleep(30)'\n"
+                    "fi\n"
+                    "printf 'URL: https://auth.openai.com/codex/device\\n'\n"
+                    "printf 'Code: TIME-OKAY\\n'\n"
+                    "printf 'OpenAI device code complete\\n'\n"
+                )
+            os.chmod(script_path, 0o755)
+
+            with (
+                patch.object(
+                    supervisor,
+                    "post_json",
+                    side_effect=lambda p, b: calls.append((p, b)) or {},
+                ),
+                patch.object(
+                    supervisor,
+                    "ensure_chatgpt_subscription_provider_available",
+                    return_value=True,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "ATTEMPTS_PATH": attempts_path,
+                        "PYTHON_BIN": sys.executable,
+                    },
+                    clear=False,
+                ),
+            ):
+                supervisor._run_chatgpt_device_code_login_in_thread(
+                    session_id="retry-timeout-test",
+                    openclaw_bin=script_path,
+                    url_emit_timeout_s=0.1,
+                    url_emit_attempts=2,
+                    url_emit_retry_delay_s=0.0,
+                    overall_timeout_s=5.0,
+                )
+
+            with open(attempts_path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "2")
+
+        bodies = [body for _, body in calls]
+        self.assertEqual([body["status"] for body in bodies], ["pending", "linked"])
+        self.assertEqual(bodies[0]["session_id"], "retry-timeout-test")
+        self.assertEqual(bodies[0]["user_code"], "TIME-OKAY")
 
     def test_pty_fork_failure_posts_terminal_failed(self) -> None:
         """If we can't even allocate a PTY, the platform still hears
