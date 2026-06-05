@@ -1284,6 +1284,60 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
             config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
         )
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
+        self.assertEqual(
+            config["auth"],
+            {
+                "profiles": {
+                    "openai:default": {
+                        "provider": "openai",
+                        "mode": "oauth",
+                        "email": "owner@example.com",
+                    },
+                },
+                "order": {"openai": ["openai:default"]},
+            },
+        )
+
+    def test_legacy_profile_is_normalized_for_codex_native_auth(self) -> None:
+        """OpenClaw 2026.6.x still writes some device-code profiles as
+        openai-codex, but the native Codex route resolves auth under openai."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_legacy_auth_profile(supervisor.openclaw_state_dir())
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                auth_path = supervisor.openclaw_auth_profiles_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+                with open(auth_path, encoding="utf-8") as fh:
+                    auth_store = json.load(fh)
+
+        self.assertEqual(config["agents"]["defaults"]["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(
+            config["auth"]["profiles"]["openai:owner@example.com"],
+            {
+                "provider": "openai",
+                "mode": "oauth",
+                "email": "owner@example.com",
+            },
+        )
+        self.assertEqual(config["auth"]["order"], {"openai": ["openai:owner@example.com"]})
+        self.assertNotIn("openai-codex:owner@example.com", auth_store["profiles"])
+        self.assertEqual(
+            auth_store["profiles"]["openai:owner@example.com"]["provider"],
+            "openai",
+        )
+        self.assertEqual(
+            auth_store["profiles"]["openai:owner@example.com"]["access"],
+            "redacted-access",
+        )
 
     def test_opted_in_without_profile_stays_on_default_config(self) -> None:
         """llm_auth_mode=chatgpt_subscription but NO auth-profile yet →

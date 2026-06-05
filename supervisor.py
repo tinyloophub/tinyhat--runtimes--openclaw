@@ -1445,6 +1445,137 @@ def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) ->
     )
 
 
+def _chatgpt_subscription_profile_suffix(profile_id: str) -> str:
+    tail = profile_id.split(":", 1)[1] if ":" in profile_id else profile_id
+    return tail.strip() or "default"
+
+
+def _allocate_chatgpt_subscription_profile_id(
+    legacy_profile_id: str, occupied: set[str]
+) -> str:
+    suffix = _chatgpt_subscription_profile_suffix(legacy_profile_id)
+    direct = f"{CHATGPT_SUBSCRIPTION_PROVIDER}:{suffix}"
+    if direct not in occupied:
+        occupied.add(direct)
+        return direct
+    chatgpt = f"{CHATGPT_SUBSCRIPTION_PROVIDER}:chatgpt-{suffix}"
+    if chatgpt not in occupied:
+        occupied.add(chatgpt)
+        return chatgpt
+    index = 2
+    while True:
+        candidate = f"{chatgpt}-{index}"
+        if candidate not in occupied:
+            occupied.add(candidate)
+            return candidate
+        index += 1
+
+
+def _replace_profile_id_refs(value: Any, profile_id_map: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        return profile_id_map.get(value, value)
+    if isinstance(value, list):
+        return [_replace_profile_id_refs(item, profile_id_map) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_profile_id_refs(entry, profile_id_map)
+            for key, entry in value.items()
+        }
+    return value
+
+
+def normalize_chatgpt_subscription_profile_store(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> list[tuple[str, str]]:
+    """Migrate legacy OpenAI Codex profile ids to current OpenAI ids.
+
+    OpenClaw 2026.6.x still writes device-code credentials with the legacy
+    ``openai-codex`` profile id/provider in some flows, but the current Codex
+    app-server route resolves auth for the ``openai`` provider. Keep the
+    secret-bearing profile on disk, but rewrite only its non-secret key/provider
+    metadata so OpenClaw can select it for ``openai/*`` models.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    if not profiles:
+        return []
+
+    occupied = {
+        profile_id
+        for profile_id in profiles
+        if isinstance(profile_id, str)
+        and not profile_id.startswith(f"{LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER}:")
+    }
+    profile_id_map: dict[str, str] = {}
+    changed = False
+    for profile_id, profile in list(profiles.items()):
+        if not isinstance(profile_id, str) or not isinstance(profile, dict):
+            continue
+        legacy_id = profile_id.startswith(f"{LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER}:")
+        legacy_provider = (
+            str(profile.get("provider") or "").strip()
+            == LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER
+        )
+        if not (legacy_id or legacy_provider):
+            continue
+        next_profile_id = (
+            _allocate_chatgpt_subscription_profile_id(profile_id, occupied)
+            if legacy_id
+            else profile_id
+        )
+        next_profile = dict(profile)
+        next_profile["provider"] = CHATGPT_SUBSCRIPTION_PROVIDER
+        if next_profile_id != profile_id:
+            del profiles[profile_id]
+            profile_id_map[profile_id] = next_profile_id
+            changed = True
+        if next_profile != profile:
+            changed = True
+        profiles[next_profile_id] = next_profile
+
+    if not changed:
+        return []
+
+    if profile_id_map:
+        for key in ("usageStats", "lastGood"):
+            if key in data:
+                data[key] = _replace_profile_id_refs(data[key], profile_id_map)
+        if isinstance(data.get("order"), dict):
+            order = dict(data["order"])
+            legacy_order = order.pop(LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER, None)
+            if isinstance(legacy_order, list):
+                current_order = order.get(CHATGPT_SUBSCRIPTION_PROVIDER)
+                merged = [
+                    *_replace_profile_id_refs(legacy_order, profile_id_map),
+                    *(current_order if isinstance(current_order, list) else []),
+                ]
+                deduped: list[str] = []
+                for entry in merged:
+                    if isinstance(entry, str) and entry not in deduped:
+                        deduped.append(entry)
+                order[CHATGPT_SUBSCRIPTION_PROVIDER] = deduped
+            else:
+                order = _replace_profile_id_refs(order, profile_id_map)
+            data["order"] = order
+
+    data["profiles"] = profiles
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    return sorted(profile_id_map.items())
+
+
 def read_chatgpt_subscription_profile(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> dict | None:
@@ -1461,6 +1592,12 @@ def read_chatgpt_subscription_profile(
     own use of this function is metadata-only (presence check + email
     for logging); the actual OAuth refresh is OpenClaw's own concern.
     """
+    migrated = normalize_chatgpt_subscription_profile_store(agent_id=agent_id)
+    if migrated:
+        log.info(
+            "normalized ChatGPT subscription auth profile ids: %s",
+            ", ".join(f"{old}->{new}" for old, new in migrated),
+        )
     path = openclaw_auth_profiles_path(agent_id=agent_id)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1735,6 +1872,27 @@ def write_openclaw_config(
         },
         "session": {"dmScope": "per-channel-peer"},
     }
+    if use_chatgpt_subscription and subscription_profile:
+        subscription_profile_id = str(
+            subscription_profile.get("__profile_id") or ""
+        ).strip()
+        if subscription_profile_id:
+            auth_profile: dict[str, str] = {
+                "provider": CHATGPT_SUBSCRIPTION_PROVIDER,
+                "mode": "oauth",
+            }
+            email = str(subscription_profile.get("email") or "").strip()
+            display_name = str(subscription_profile.get("displayName") or "").strip()
+            if email:
+                auth_profile["email"] = email
+            if display_name:
+                auth_profile["displayName"] = display_name
+            config["auth"] = {
+                "profiles": {subscription_profile_id: auth_profile},
+                "order": {
+                    CHATGPT_SUBSCRIPTION_PROVIDER: [subscription_profile_id],
+                },
+            }
     _ensure_tinyhat_secret_provider_config(config)
     # OpenClaw 2026.5.22 rejects provider runtime pins such as
     # models.providers.openrouter.agentRuntime={"id":"openclaw"}, while newer
