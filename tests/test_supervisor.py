@@ -1415,6 +1415,98 @@ def _seed_other_provider_profile(state_dir: str) -> None:
         json.dump(data, fh)
 
 
+class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update(
+            {
+                "stop": False,
+                "rebind": False,
+                "signature": None,
+                "owner_signature": None,
+            }
+        )
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_codex_plugin_failure_does_not_disable_openai_subscription_provider(
+        self,
+    ) -> None:
+        import threading as threading_mod
+
+        binding = _subscription_binding(with_openrouter=True)
+        captured_config_kwargs: list[dict] = []
+
+        class _NoopThread:
+            def __init__(self, target, daemon):
+                self._target = target
+                self.daemon = daemon
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def fake_write_openclaw_config(config_binding: dict, **kwargs) -> None:
+            self.assertEqual(config_binding, binding)
+            captured_config_kwargs.append(dict(kwargs))
+
+        def fake_gateway_active() -> bool:
+            supervisor._stop_holder["stop"] = True
+            return True
+
+        with (
+            patch.object(supervisor, "post_json", return_value={}),
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={"assigned": True, "binding": binding},
+            ),
+            patch.object(
+                supervisor,
+                "try_install_codex_subscription_plugin",
+                return_value=False,
+            ),
+            patch.object(
+                supervisor,
+                "try_check_chatgpt_subscription_provider",
+                return_value=True,
+            ),
+            patch.object(supervisor, "try_install_tinyhat_plugin", return_value=True),
+            patch.object(
+                supervisor,
+                "write_openclaw_config",
+                side_effect=fake_write_openclaw_config,
+            ),
+            patch.object(supervisor, "delete_telegram_webhook"),
+            patch.object(supervisor, "start_openclaw_gateway", return_value=123.0),
+            patch.object(supervisor, "wait_for_openclaw_start"),
+            patch.object(
+                supervisor,
+                "is_openclaw_gateway_active",
+                side_effect=fake_gateway_active,
+            ),
+            patch.object(supervisor, "stop_openclaw_gateway"),
+            patch.object(supervisor.time, "sleep"),
+            patch.object(threading_mod, "Thread", _NoopThread),
+        ):
+            self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(
+            captured_config_kwargs,
+            [
+                {
+                    "enable_tinyhat_plugin": True,
+                    "enable_chatgpt_subscription_provider": True,
+                    "enable_codex_subscription_plugins": False,
+                }
+            ],
+        )
+
+
 class ChatgptSubscriptionBranchTests(unittest.TestCase):
     """Issue #23 — supervisor branches on auth-profile presence."""
 
