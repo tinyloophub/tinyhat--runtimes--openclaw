@@ -132,7 +132,7 @@ GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
 # we restart this unit (with an in-process ``os.execv`` fallback). Override
 # via env if the deployment names the unit differently.
 SUPERVISOR_SYSTEMD_UNIT = (
-    os.environ.get("TINYHAT_SUPERVISOR_UNIT") or "tinyhat-supervisor.service"
+    os.environ.get("TINYHAT_SUPERVISOR_UNIT") or "tinyhat-openclaw.service"
 ).strip()
 PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
     "/var/lib/tinyhat-private-access/bootstrap-status.json"

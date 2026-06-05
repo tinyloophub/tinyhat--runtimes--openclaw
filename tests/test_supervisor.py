@@ -2656,6 +2656,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
         with open(self._state_path, encoding="utf-8") as fh:
             return json.load(fh)
 
+    def test_supervisor_restart_unit_matches_bootstrap_unit(self) -> None:
+        self.assertEqual(
+            supervisor.SUPERVISOR_SYSTEMD_UNIT,
+            "tinyhat-openclaw.service",
+        )
+
     def test_state_write_defaults_to_unreported_with_empty_cache(self) -> None:
         # New state shape: reported defaults to False and the cached-result
         # fields are present (empty / null when not supplied).
