@@ -3446,6 +3446,43 @@ class ApplyPackagesCommandTests(unittest.TestCase):
         with open(self._state_path, encoding="utf-8") as fh:
             return json.load(fh)
 
+    def test_missing_default_skill_names_reads_extension_skill_layout(self) -> None:
+        runtime_home = os.path.join(self._tmp, "runtime-home")
+        skill_root = os.path.join(
+            runtime_home,
+            "extensions",
+            supervisor.TINYHAT_PLUGIN_ID,
+            "skills",
+        )
+        first_skill = os.path.join(skill_root, "tinyhat-platform", "SKILL.md")
+        second_skill = os.path.join(
+            skill_root,
+            "tinyhat-software-updates",
+            "SKILL.md",
+        )
+        os.makedirs(os.path.dirname(first_skill), exist_ok=True)
+        with open(first_skill, "w", encoding="utf-8") as fh:
+            fh.write("# Tinyhat Platform\n")
+
+        env = {
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_RUNTIME_HOME": runtime_home,
+        }
+        default_skills = self._command()["default_skills"]
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(
+                supervisor._missing_default_skill_names(default_skills),
+                ["tinyhat-software-updates"],
+            )
+
+            os.makedirs(os.path.dirname(second_skill), exist_ok=True)
+            with open(second_skill, "w", encoding="utf-8") as fh:
+                fh.write("# Tinyhat Software Updates\n")
+            self.assertEqual(
+                supervisor._missing_default_skill_names(default_skills),
+                [],
+            )
+
     def test_dev_mode_defaults_state_paths_to_runtime_home(self) -> None:
         runtime_home = os.path.join(self._tmp, "runtime-home")
         env = {
@@ -3567,6 +3604,50 @@ class ApplyPackagesCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["revision"], 7)
         self.assertEqual(kwargs["status"], "failed")
         self.assertIn("boom", kwargs["diagnostic"])
+
+    def test_missing_default_skill_reports_failed_without_override_or_restart(
+        self,
+    ) -> None:
+        cmd = self._command(revision=8)
+        marker = {
+            "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+            "repo_ref": "v0.4.5",
+            "resolved_commit_sha": "abc123",
+            "version": "0.4.5",
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_read_installed_plugin_marker", return_value=marker),
+            patch.object(
+                supervisor,
+                "_missing_default_skill_names",
+                return_value=["tinyhat-software-updates"],
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+
+        installer.assert_called_once_with(
+            repo_url="https://github.com/tinyhat-ai/tinyhat.git",
+            repo_ref="v0.4.5",
+        )
+        restart_gateway.assert_not_called()
+        self.assertFalse(os.path.exists(self._plugin_override_path))
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 8)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("default skills missing", kwargs["diagnostic"])
+        self.assertEqual(
+            kwargs["installed_packages"]["platform_plugin"]["resolved_commit_sha"],
+            "abc123",
+        )
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 8)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
 
     def test_malformed_command_is_ignored(self) -> None:
         supervisor.handle_apply_packages_command({"type": "apply_packages"})

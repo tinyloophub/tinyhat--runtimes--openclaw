@@ -3979,15 +3979,6 @@ def _apply_tinyhat_packages(command: dict) -> tuple[bool, str | None, dict]:
         ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=repo_ref)
         marker = _read_installed_plugin_marker()
         plugin_identity = _package_plugin_identity(platform_plugin, marker)
-        _write_tinyhat_plugin_source_override(
-            repo_url=repo_url,
-            repo_ref=repo_ref,
-            resolved_commit_sha=str(
-                plugin_identity.get("resolved_commit_sha") or ""
-            ).strip()
-            or None,
-            version=str(plugin_identity.get("version") or "").strip() or None,
-        )
         installed_packages = {
             "platform_plugin": plugin_identity,
             "default_skills": _applied_default_skills(
@@ -4003,6 +3994,15 @@ def _apply_tinyhat_packages(command: dict) -> tuple[bool, str | None, dict]:
                 + ", ".join(missing[:10]),
                 installed_packages,
             )
+        _write_tinyhat_plugin_source_override(
+            repo_url=repo_url,
+            repo_ref=repo_ref,
+            resolved_commit_sha=str(
+                plugin_identity.get("resolved_commit_sha") or ""
+            ).strip()
+            or None,
+            version=str(plugin_identity.get("version") or "").strip() or None,
+        )
     except Exception as exc:  # noqa: BLE001 - package apply is reported, not fatal
         return False, f"Tinyhat package apply failed: {exc}", {}
 
