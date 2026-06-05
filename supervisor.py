@@ -2434,6 +2434,25 @@ _config_apply_state = {
 }
 
 
+def _binding_model_auth_signature(binding: dict) -> tuple[str, str]:
+    """Config-affecting model-auth state for watchdog comparisons.
+
+    Starting the ChatGPT device-code flow flips the platform row to
+    ``chatgpt_subscription`` while the Computer is still waiting for the
+    user to approve and before a local OAuth profile exists. That pending
+    state intentionally writes the same OpenRouter-backed config as
+    platform credits, so it must not restart the gateway in the middle of
+    the chat tool that is trying to render the URL + code. Once the
+    platform reports a linked model ref, the signature moves and the
+    supervisor rewrites config for the subscription profile.
+    """
+    mode = str(binding.get("llm_auth_mode") or "platform_credits")
+    model_ref = str(binding.get("llm_model_ref") or "").strip()
+    if mode == "chatgpt_subscription" and model_ref:
+        return (mode, model_ref)
+    return ("platform_credits", "")
+
+
 def _binding_signature(binding: dict) -> tuple:
     """Identity tuple for an ``/me/binding`` payload.
 
@@ -2443,13 +2462,13 @@ def _binding_signature(binding: dict) -> tuple:
     different owner, or new vault row with a fresh token, or an
     OpenRouter child key + base URL + default model that appeared
     after a transient vault miss on the first poll), OR the owner
-    flipped the LLM auth mode (issue #23 — adding
-    ``llm_auth_mode`` / ``llm_model_ref`` so a platform-credits ->
-    chatgpt_subscription flip triggers rebind and the supervisor
-    rewrites openclaw.json instead of keeping the old
-    OpenClaw + OpenRouter config running). The supervisor must drop
-    its in-memory state and re-run Phase B so openclaw.json gets
-    rewritten with the now-present provider config.
+    linked or unlinked ChatGPT subscription state changed. A pending
+    device-code flow is normalized as platform credits because
+    ``write_openclaw_config`` also keeps the OpenRouter-backed config
+    until the local OAuth profile exists. This prevents the watchdog
+    from restarting the gateway mid-tool while the agent is sending
+    the verification URL + code; the linked model ref still triggers
+    the rebind that rewrites openclaw.json for the subscription.
     """
     return (
         str(binding.get("telegram_bot_user_id") or ""),
@@ -2461,12 +2480,7 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
         json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
-        # ChatGPT BYO subscription (issue #23) — mode/model_ref live
-        # on the binding so the watchdog notices a flip and triggers
-        # a rebind (otherwise write_openclaw_config never runs after
-        # the platform changes the auth mode).
-        str(binding.get("llm_auth_mode") or "platform_credits"),
-        str(binding.get("llm_model_ref") or ""),
+        *_binding_model_auth_signature(binding),
     )
 
 

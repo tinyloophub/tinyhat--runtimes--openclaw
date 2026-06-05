@@ -1610,15 +1610,15 @@ class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
             "openrouter_default_model": "openai/gpt-5.5",
         }
 
-    def test_signature_moves_when_llm_auth_mode_flips(self) -> None:
+    def test_signature_stays_stable_for_pending_subscription_flow(self) -> None:
         before = self._base_binding()  # implicit platform_credits
         after = dict(before, llm_auth_mode="chatgpt_subscription")
-        self.assertNotEqual(
+        self.assertEqual(
             supervisor._binding_signature(before),
             supervisor._binding_signature(after),
         )
 
-    def test_signature_moves_when_llm_model_ref_changes(self) -> None:
+    def test_signature_moves_when_subscription_model_ref_links(self) -> None:
         before = dict(
             self._base_binding(), llm_auth_mode="chatgpt_subscription"
         )
