@@ -7,6 +7,8 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.8
+
 ### Fixed
 
 - Ship and verify OpenClaw's official Codex provider plugin during Computer
@@ -14,6 +16,10 @@ runtime's published `VERSION` on each new Computer row.
   `codex-supervisor`, and self-heal missing installs before gateway startup so
   ChatGPT subscription device-code linking works on new Computers without
   manual plugin installation.
+- Apply Tinyhat plugin/default-skill package updates from platform commands,
+  persist and repost package-apply outcomes across restarts, restart the
+  gateway after successful package updates, and verify default skill files
+  before persisting the updated plugin source override.
 
 ## 0.11.7
 
