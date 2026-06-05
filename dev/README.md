@@ -62,6 +62,27 @@ build-time smoke check, so a future engine-floor bump fails the build
 instead of the first `docker run`. First build is slow (~600MB,
 ~2min); subsequent builds cache the npm layer.
 
+## Smoke the ChatGPT link retry
+
+Before merging runtime changes that touch subscription linking, run:
+
+```bash
+python3 scripts/smoke_start_chatgpt_link_retry.py
+```
+
+The smoke starts a localhost backend, invokes the real
+`start_chatgpt_link` heartbeat handler in dev mode, and shadows only
+the `openclaw` executable with a fake CLI. It forces two pre-code
+failure shapes that are hard to trigger against a live account:
+
+- first CLI spawn exits before printing the device-code URL/code;
+- first CLI spawn hangs before printing the device-code URL/code.
+
+Both scenarios must recover on the retry and POST
+`pending` then `linked` to `/hapi/v1/computers/me/subscription-link-result`.
+This validates the Computer-side retry path; it does not approve a
+real OpenAI device code or mutate a ChatGPT account.
+
 ## Run
 
 The minimum env the supervisor needs:
