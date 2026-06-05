@@ -1808,6 +1808,7 @@ def write_openclaw_config(
     *,
     enable_tinyhat_plugin: bool = True,
     enable_chatgpt_subscription_provider: bool = True,
+    enable_codex_subscription_plugins: bool = True,
 ) -> None:
     """Write the real OpenClaw gateway config for this binding."""
     owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
@@ -1960,7 +1961,7 @@ def write_openclaw_config(
         "telegram": {"enabled": True},
         "openai": openai_plugin,
     }
-    if enable_chatgpt_subscription_provider:
+    if enable_codex_subscription_plugins:
         plugin_entries[CODEX_SUBSCRIPTION_PLUGIN_ID] = {"enabled": True}
         plugin_entries[CODEX_SUPERVISOR_PLUGIN_ID] = {"enabled": True}
     if enable_tinyhat_plugin:
@@ -4044,10 +4045,8 @@ def _run_one_binding_cycle() -> int:
         write_openclaw_config(
             binding,
             enable_tinyhat_plugin=tinyhat_plugin_installed,
-            enable_chatgpt_subscription_provider=(
-                chatgpt_subscription_provider_available
-                and codex_subscription_plugin_installed
-            ),
+            enable_chatgpt_subscription_provider=chatgpt_subscription_provider_available,
+            enable_codex_subscription_plugins=codex_subscription_plugin_installed,
         )
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)

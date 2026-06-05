@@ -150,16 +150,14 @@ if HOME="${OPENCLAW_STATE_DIR}" \
     openclaw plugins install "${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}" --force; then
   echo "[tinyhat-runtime] installed subscription provider plugin"
 else
-  write_runtime_bootstrap_status "error" "codex subscription plugin install failed"
-  echo "[tinyhat-runtime] ERROR: failed to install ${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}" >&2
-  exit 1
+  write_runtime_bootstrap_status "ready" "codex subscription plugin install pending supervisor self-heal"
+  echo "[tinyhat-runtime] WARNING: failed to install ${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}; supervisor will retry during gateway boot" >&2
 fi
 if verify_codex_subscription_plugin; then
   echo "[tinyhat-runtime] verified subscription provider plugin: codex"
 else
-  write_runtime_bootstrap_status "error" "codex subscription plugin verify failed"
-  echo "[tinyhat-runtime] ERROR: codex plugin is not registered after install" >&2
-  exit 1
+  write_runtime_bootstrap_status "ready" "codex subscription plugin verify pending supervisor self-heal"
+  echo "[tinyhat-runtime] WARNING: codex plugin is not registered yet; supervisor will retry during gateway boot" >&2
 fi
 
 # Fallback runtime config. The supervisor prefers GCE instance
