@@ -2909,6 +2909,20 @@ class UpdateComponentCommandTests(unittest.TestCase):
             supervisor.handle_heartbeat_command(cmd)
         handler.assert_called_once_with(cmd)
 
+    def test_dispatch_routes_apply_packages_to_handler(self) -> None:
+        cmd = {
+            "type": "apply_packages",
+            "revision": 12,
+            "platform_plugin": {
+                "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+                "requested_ref": "v0.4.5",
+            },
+            "default_skills": [],
+        }
+        with patch.object(supervisor, "handle_apply_packages_command") as handler:
+            supervisor.handle_heartbeat_command(cmd)
+        handler.assert_called_once_with(cmd)
+
     def test_plugin_only_target_installs_ref_restarts_and_reports_applied(
         self,
     ) -> None:
@@ -3381,6 +3395,262 @@ class UpdateComponentCommandTests(unittest.TestCase):
         supervisor.handle_update_component_command(
             {"type": "update_component", "targets": {}}
         )
+        self._posted.assert_not_called()
+
+
+class ApplyPackagesCommandTests(unittest.TestCase):
+    """``apply_packages`` installs Tinyhat plugin/default skills and rebinds."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self._state_path = os.path.join(self._tmp, "package-apply-state.json")
+        self._plugin_override_path = os.path.join(
+            self._tmp,
+            "plugin-source.json",
+        )
+        self._env = patch.dict(
+            os.environ,
+            {
+                supervisor.TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV: self._state_path,
+                "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH": self._plugin_override_path,
+            },
+            clear=False,
+        )
+        self._env.start()
+        self._posted = patch.object(supervisor, "_post_package_apply_result").start()
+
+    def tearDown(self) -> None:
+        patch.stopall()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _command(self, revision: int = 5) -> dict:
+        return {
+            "type": "apply_packages",
+            "revision": revision,
+            "reason": "default_package_refs_changed",
+            "preserve_user_installed": True,
+            "platform_plugin": {
+                "id": "tinyhat",
+                "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+                "repo_name": "tinyhat",
+                "requested_ref": "v0.4.5",
+                "source": "git",
+            },
+            "default_skills": [
+                {"name": "tinyhat-platform", "role": "router"},
+                {"name": "tinyhat-software-updates", "role": "software_updates"},
+            ],
+        }
+
+    def _read_state(self) -> dict:
+        with open(self._state_path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_missing_default_skill_names_reads_extension_skill_layout(self) -> None:
+        runtime_home = os.path.join(self._tmp, "runtime-home")
+        skill_root = os.path.join(
+            runtime_home,
+            "extensions",
+            supervisor.TINYHAT_PLUGIN_ID,
+            "skills",
+        )
+        first_skill = os.path.join(skill_root, "tinyhat-platform", "SKILL.md")
+        second_skill = os.path.join(
+            skill_root,
+            "tinyhat-software-updates",
+            "SKILL.md",
+        )
+        os.makedirs(os.path.dirname(first_skill), exist_ok=True)
+        with open(first_skill, "w", encoding="utf-8") as fh:
+            fh.write("# Tinyhat Platform\n")
+
+        env = {
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_RUNTIME_HOME": runtime_home,
+        }
+        default_skills = self._command()["default_skills"]
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(
+                supervisor._missing_default_skill_names(default_skills),
+                ["tinyhat-software-updates"],
+            )
+
+            os.makedirs(os.path.dirname(second_skill), exist_ok=True)
+            with open(second_skill, "w", encoding="utf-8") as fh:
+                fh.write("# Tinyhat Software Updates\n")
+            self.assertEqual(
+                supervisor._missing_default_skill_names(default_skills),
+                [],
+            )
+
+    def test_dev_mode_defaults_state_paths_to_runtime_home(self) -> None:
+        runtime_home = os.path.join(self._tmp, "runtime-home")
+        env = {
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_RUNTIME_HOME": runtime_home,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                supervisor._package_apply_state_path(),
+                os.path.join(runtime_home, "package-apply-state.json"),
+            )
+            self.assertEqual(
+                supervisor._component_update_state_path(),
+                os.path.join(runtime_home, "component-update-state.json"),
+            )
+            self.assertEqual(
+                supervisor._tinyhat_plugin_source_override_path(),
+                os.path.join(runtime_home, "tinyhat-plugin-source.json"),
+            )
+
+    def test_success_installs_packages_reports_and_restarts_gateway(self) -> None:
+        cmd = self._command()
+        marker = {
+            "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+            "repo_ref": "v0.4.5",
+            "resolved_commit_sha": "abc123",
+            "version": "0.4.5",
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_read_installed_plugin_marker", return_value=marker),
+            patch.object(supervisor, "_missing_default_skill_names", return_value=[]),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+
+        installer.assert_called_once_with(
+            repo_url="https://github.com/tinyhat-ai/tinyhat.git",
+            repo_ref="v0.4.5",
+        )
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 5)
+        self.assertEqual(kwargs["status"], "applied")
+        packages = kwargs["installed_packages"]
+        self.assertEqual(
+            packages["platform_plugin"]["resolved_commit_sha"],
+            "abc123",
+        )
+        self.assertEqual(packages["platform_plugin"]["version"], "0.4.5")
+        self.assertEqual(len(packages["default_skills"]), 2)
+        restart_gateway.assert_called_once()
+
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 5)
+        self.assertEqual(state["status"], "applied")
+        self.assertIs(state["reported"], True)
+        with open(self._plugin_override_path, encoding="utf-8") as fh:
+            override = json.load(fh)
+        self.assertEqual(override["repo_ref"], "v0.4.5")
+        self.assertEqual(override["resolved_commit_sha"], "abc123")
+
+    def test_post_failure_restarts_once_then_redelivery_reposts_only(self) -> None:
+        cmd = self._command(revision=6)
+        marker = {
+            "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+            "repo_ref": "v0.4.5",
+            "resolved_commit_sha": "abc123",
+            "version": "0.4.5",
+        }
+        self._posted.side_effect = RuntimeError("transient 503")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_1,
+            patch.object(supervisor, "_read_installed_plugin_marker", return_value=marker),
+            patch.object(supervisor, "_missing_default_skill_names", return_value=[]),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_1,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+        installer_1.assert_called_once()
+        restart_1.assert_called_once()
+        self.assertIs(self._read_state()["reported"], False)
+
+        self._posted.reset_mock()
+        self._posted.side_effect = None
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer_2,
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_2,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+        installer_2.assert_not_called()
+        restart_2.assert_not_called()
+        self._posted.assert_called_once()
+        self.assertEqual(self._posted.call_args.kwargs["status"], "applied")
+        self.assertIs(self._read_state()["reported"], True)
+
+    def test_package_install_failure_reports_failed_without_restart(self) -> None:
+        cmd = self._command(revision=7)
+        with (
+            patch.object(
+                supervisor,
+                "ensure_tinyhat_plugin_installed",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+
+        restart_gateway.assert_not_called()
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 7)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("boom", kwargs["diagnostic"])
+
+    def test_missing_default_skill_reports_failed_without_override_or_restart(
+        self,
+    ) -> None:
+        cmd = self._command(revision=8)
+        marker = {
+            "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+            "repo_ref": "v0.4.5",
+            "resolved_commit_sha": "abc123",
+            "version": "0.4.5",
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(supervisor, "_read_installed_plugin_marker", return_value=marker),
+            patch.object(
+                supervisor,
+                "_missing_default_skill_names",
+                return_value=["tinyhat-software-updates"],
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_apply_packages_command(cmd)
+
+        installer.assert_called_once_with(
+            repo_url="https://github.com/tinyhat-ai/tinyhat.git",
+            repo_ref="v0.4.5",
+        )
+        restart_gateway.assert_not_called()
+        self.assertFalse(os.path.exists(self._plugin_override_path))
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 8)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("default skills missing", kwargs["diagnostic"])
+        self.assertEqual(
+            kwargs["installed_packages"]["platform_plugin"]["resolved_commit_sha"],
+            "abc123",
+        )
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 8)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
+
+    def test_malformed_command_is_ignored(self) -> None:
+        supervisor.handle_apply_packages_command({"type": "apply_packages"})
         self._posted.assert_not_called()
 
 
