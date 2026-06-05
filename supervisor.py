@@ -735,13 +735,22 @@ def _is_openclaw_plugin_registered(
 
 
 def _is_chatgpt_subscription_provider_available() -> bool:
-    return _is_openclaw_plugin_registered(
-        "openai",
-        provider_id=CHATGPT_SUBSCRIPTION_PROVIDER,
-    ) or _is_openclaw_plugin_registered(
-        "openai",
-        provider_id=LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER,
+    plugin = _inspect_openclaw_plugin("openai")
+    if plugin is None:
+        return False
+    provider_ids = plugin.get("providerIds") or plugin.get("providers") or []
+    if (
+        CHATGPT_SUBSCRIPTION_PROVIDER in provider_ids
+        or LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER in provider_ids
+    ):
+        return True
+    log.warning(
+        "OpenClaw plugin openai is registered but does not expose provider "
+        "%s or %s",
+        CHATGPT_SUBSCRIPTION_PROVIDER,
+        LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER,
     )
+    return False
 
 
 def ensure_chatgpt_subscription_provider_available() -> bool:
@@ -1471,16 +1480,37 @@ def _allocate_chatgpt_subscription_profile_id(
         index += 1
 
 
-def _replace_profile_id_refs(value: Any, profile_id_map: dict[str, str]) -> Any:
+def _replace_profile_id_refs(
+    value: Any,
+    profile_id_map: dict[str, str],
+    *,
+    replace_dict_keys: bool = False,
+) -> Any:
     if isinstance(value, str):
         return profile_id_map.get(value, value)
     if isinstance(value, list):
-        return [_replace_profile_id_refs(item, profile_id_map) for item in value]
+        return [
+            _replace_profile_id_refs(
+                item,
+                profile_id_map,
+                replace_dict_keys=replace_dict_keys,
+            )
+            for item in value
+        ]
     if isinstance(value, dict):
-        return {
-            key: _replace_profile_id_refs(entry, profile_id_map)
-            for key, entry in value.items()
-        }
+        replaced: dict = {}
+        for key, entry in value.items():
+            next_key = (
+                profile_id_map.get(key, key)
+                if replace_dict_keys and isinstance(key, str)
+                else key
+            )
+            replaced[next_key] = _replace_profile_id_refs(
+                entry,
+                profile_id_map,
+                replace_dict_keys=replace_dict_keys,
+            )
+        return replaced
     return value
 
 
@@ -1543,27 +1573,44 @@ def normalize_chatgpt_subscription_profile_store(
     if not changed:
         return []
 
-    if profile_id_map:
+    ref_map = {
+        LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER: CHATGPT_SUBSCRIPTION_PROVIDER,
+        **profile_id_map,
+    }
+
+    if ref_map:
         for key in ("usageStats", "lastGood"):
             if key in data:
-                data[key] = _replace_profile_id_refs(data[key], profile_id_map)
-        if isinstance(data.get("order"), dict):
-            order = dict(data["order"])
-            legacy_order = order.pop(LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER, None)
-            if isinstance(legacy_order, list):
-                current_order = order.get(CHATGPT_SUBSCRIPTION_PROVIDER)
-                merged = [
-                    *_replace_profile_id_refs(legacy_order, profile_id_map),
-                    *(current_order if isinstance(current_order, list) else []),
-                ]
-                deduped: list[str] = []
-                for entry in merged:
-                    if isinstance(entry, str) and entry not in deduped:
-                        deduped.append(entry)
-                order[CHATGPT_SUBSCRIPTION_PROVIDER] = deduped
-            else:
-                order = _replace_profile_id_refs(order, profile_id_map)
-            data["order"] = order
+                data[key] = _replace_profile_id_refs(
+                    data[key],
+                    ref_map,
+                    replace_dict_keys=True,
+                )
+    if ref_map and isinstance(data.get("order"), dict):
+        order = dict(data["order"])
+        legacy_order = order.pop(LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER, None)
+        if isinstance(legacy_order, list):
+            current_order = order.get(CHATGPT_SUBSCRIPTION_PROVIDER)
+            merged = [
+                *_replace_profile_id_refs(legacy_order, ref_map),
+                *(current_order if isinstance(current_order, list) else []),
+            ]
+            deduped: list[str] = []
+            for entry in merged:
+                if isinstance(entry, str) and entry not in deduped:
+                    deduped.append(entry)
+            order[CHATGPT_SUBSCRIPTION_PROVIDER] = deduped
+        elif legacy_order is not None and CHATGPT_SUBSCRIPTION_PROVIDER not in order:
+            order[CHATGPT_SUBSCRIPTION_PROVIDER] = _replace_profile_id_refs(
+                legacy_order,
+                ref_map,
+                replace_dict_keys=True,
+            )
+        data["order"] = _replace_profile_id_refs(
+            order,
+            ref_map,
+            replace_dict_keys=True,
+        )
 
     data["profiles"] = profiles
     tmp_path = path + ".tmp"

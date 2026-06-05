@@ -648,8 +648,8 @@ class TinyhatPluginInstallTests(unittest.TestCase):
 
                 self.assertEqual(
                     supervisor._tinyhat_plugin_source(),
-                ("https://example.com/new.git", "v2.0.0"),
-            )
+                    ("https://example.com/new.git", "v2.0.0"),
+                )
 
 
 class ChatgptSubscriptionProviderTests(unittest.TestCase):
@@ -697,10 +697,7 @@ class ChatgptSubscriptionProviderTests(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            [
-                ["openclaw", "plugins", "inspect", "openai", "--json"],
-                ["openclaw", "plugins", "inspect", "openai", "--json"],
-            ],
+            [["openclaw", "plugins", "inspect", "openai", "--json"]],
         )
 
     def test_provider_check_raises_when_current_and_legacy_are_missing(self) -> None:
@@ -1220,6 +1217,18 @@ def _seed_legacy_auth_profile(state_dir: str) -> None:
                         "email": "owner@example.com",
                     }
                 },
+                "order": {"openai-codex": ["openai-codex:owner@example.com"]},
+                "usageStats": {
+                    "openai-codex": {
+                        "lastProfileId": "openai-codex:owner@example.com"
+                    },
+                    "openai-codex:owner@example.com": {"requests": 3},
+                },
+                "lastGood": {
+                    "openai-codex": "openai-codex:owner@example.com",
+                    "provider": "openai-codex",
+                    "profileId": "openai-codex:owner@example.com",
+                },
             },
             fh,
         )
@@ -1337,6 +1346,25 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertEqual(
             auth_store["profiles"]["openai:owner@example.com"]["access"],
             "redacted-access",
+        )
+        self.assertEqual(auth_store["order"], {"openai": ["openai:owner@example.com"]})
+        self.assertNotIn("openai-codex", auth_store["usageStats"])
+        self.assertNotIn("openai-codex:owner@example.com", auth_store["usageStats"])
+        self.assertEqual(
+            auth_store["usageStats"]["openai"]["lastProfileId"],
+            "openai:owner@example.com",
+        )
+        self.assertEqual(
+            auth_store["usageStats"]["openai:owner@example.com"],
+            {"requests": 3},
+        )
+        self.assertEqual(
+            auth_store["lastGood"],
+            {
+                "openai": "openai:owner@example.com",
+                "provider": "openai",
+                "profileId": "openai:owner@example.com",
+            },
         )
 
     def test_opted_in_without_profile_stays_on_default_config(self) -> None:
