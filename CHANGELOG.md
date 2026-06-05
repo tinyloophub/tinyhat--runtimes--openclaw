@@ -5,6 +5,20 @@ here. The runtime is consumed by the Tinyhat platform's Computer
 provisioning step, which records the resolved commit SHA + the
 runtime's published `VERSION` on each new Computer row.
 
+## 0.11.7
+
+### Fixed
+
+- Restore ChatGPT/Codex subscription linking on OpenClaw 2026.6.1 by using
+  the current `openai` device-code provider, normalizing legacy
+  `openai-codex:*` OAuth profile metadata to `openai:*`, and writing the
+  non-secret auth profile selection that OpenClaw's native model route needs.
+- Preserve legacy subscription profiles during migration, including
+  provider/profile keyed metadata such as `order`, `usageStats`, and
+  `lastGood`, while keeping token fields local to the Computer.
+- This release pairs with Tinyhat plugin `v0.4.4`, which updates the packaged
+  subscription guidance to match the current OpenAI provider route.
+
 ## 0.11.6
 
 ### Fixed
