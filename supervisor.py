@@ -100,6 +100,9 @@ OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
 CHATGPT_SUBSCRIPTION_PROVIDER = "openai"
 LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+CODEX_SUBSCRIPTION_PLUGIN_ID = "codex"
+CODEX_SUBSCRIPTION_PLUGIN_PACKAGE = "@openclaw/codex"
+CODEX_SUPERVISOR_PLUGIN_ID = "codex-supervisor"
 CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES = ("openai:", "openai-codex:")
 CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS = frozenset(
     {"openai", "openai-codex"}
@@ -129,7 +132,7 @@ GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
 # we restart this unit (with an in-process ``os.execv`` fallback). Override
 # via env if the deployment names the unit differently.
 SUPERVISOR_SYSTEMD_UNIT = (
-    os.environ.get("TINYHAT_SUPERVISOR_UNIT") or "tinyhat-supervisor.service"
+    os.environ.get("TINYHAT_SUPERVISOR_UNIT") or "tinyhat-openclaw.service"
 ).strip()
 PRIVATE_ACCESS_BOOTSTRAP_STATUS_PATH = (
     "/var/lib/tinyhat-private-access/bootstrap-status.json"
@@ -751,6 +754,89 @@ def _is_chatgpt_subscription_provider_available() -> bool:
         LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER,
     )
     return False
+
+
+def _is_codex_subscription_plugin_available() -> bool:
+    """Return True when the official Codex plugin is installed and enabled.
+
+    OpenClaw's current ChatGPT device-code route uses the bundled ``openai``
+    model provider, while older chat-tool paths and Codex-native capabilities
+    require the official ``@openclaw/codex`` plugin to be installed. Keep this
+    as a separate readiness check so a missing optional plugin does not get
+    confused with the bundled OpenAI provider registry.
+    """
+    plugin = _inspect_openclaw_plugin(CODEX_SUBSCRIPTION_PLUGIN_ID)
+    if plugin is None:
+        return False
+    status = plugin.get("status")
+    if plugin.get("enabled") is False or status == "disabled":
+        log.warning("OpenClaw Codex subscription plugin is installed but disabled")
+        return False
+    if status and status != "loaded":
+        log.warning("OpenClaw Codex subscription plugin is not loaded: %s", status)
+        return False
+    provider_ids = plugin.get("providerIds") or plugin.get("providers") or []
+    if CODEX_SUBSCRIPTION_PLUGIN_ID in provider_ids:
+        return True
+    log.warning(
+        "OpenClaw Codex subscription plugin is registered but does not expose "
+        "provider %s",
+        CODEX_SUBSCRIPTION_PLUGIN_ID,
+    )
+    return False
+
+
+def ensure_codex_subscription_plugin_installed() -> bool:
+    """Install OpenClaw's official Codex plugin for subscription linking.
+
+    The plugin install command updates OpenClaw's config and prints "restart
+    the gateway" because a running gateway cannot load a newly installed plugin
+    in-place. During cold boot we call this before writing Tinyhat's generated
+    config and before starting the gateway; the generated config below includes
+    the same plugin entries so the installer's config mutation is not lost.
+    """
+    if _is_codex_subscription_plugin_available():
+        return True
+
+    result = subprocess.run(
+        [
+            "openclaw",
+            "plugins",
+            "install",
+            CODEX_SUBSCRIPTION_PLUGIN_PACKAGE,
+            "--force",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_openclaw_cli_env(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Codex subscription plugin install failed: {detail}")
+    if not _is_codex_subscription_plugin_available():
+        raise RuntimeError(
+            "Codex subscription plugin install completed but provider "
+            f"{CODEX_SUBSCRIPTION_PLUGIN_ID!r} is still unavailable"
+        )
+    log.info(
+        "installed OpenClaw Codex subscription plugin (%s)",
+        CODEX_SUBSCRIPTION_PLUGIN_PACKAGE,
+    )
+    return True
+
+
+def try_install_codex_subscription_plugin() -> bool:
+    """Best-effort install for ChatGPT/Codex subscription link support."""
+    try:
+        return ensure_codex_subscription_plugin_installed()
+    except Exception as exc:
+        log.warning(
+            "Codex subscription plugin unavailable; subscription linking may "
+            "need platform credits or manual repair: %s",
+            exc,
+        )
+        return False
 
 
 def ensure_chatgpt_subscription_provider_available() -> bool:
@@ -1722,6 +1808,7 @@ def write_openclaw_config(
     *,
     enable_tinyhat_plugin: bool = True,
     enable_chatgpt_subscription_provider: bool = True,
+    enable_codex_subscription_plugins: bool = True,
 ) -> None:
     """Write the real OpenClaw gateway config for this binding."""
     owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
@@ -1874,6 +1961,9 @@ def write_openclaw_config(
         "telegram": {"enabled": True},
         "openai": openai_plugin,
     }
+    if enable_codex_subscription_plugins:
+        plugin_entries[CODEX_SUBSCRIPTION_PLUGIN_ID] = {"enabled": True}
+        plugin_entries[CODEX_SUPERVISOR_PLUGIN_ID] = {"enabled": True}
     if enable_tinyhat_plugin:
         plugin_entries[TINYHAT_PLUGIN_ID] = {
             "enabled": True,
@@ -2345,6 +2435,25 @@ _config_apply_state = {
 }
 
 
+def _binding_model_auth_signature(binding: dict) -> tuple[str, str]:
+    """Config-affecting model-auth state for watchdog comparisons.
+
+    Starting the ChatGPT device-code flow flips the platform row to
+    ``chatgpt_subscription`` while the Computer is still waiting for the
+    user to approve and before a local OAuth profile exists. That pending
+    state intentionally writes the same OpenRouter-backed config as
+    platform credits, so it must not restart the gateway in the middle of
+    the chat tool that is trying to render the URL + code. Once the
+    platform reports a linked model ref, the signature moves and the
+    supervisor rewrites config for the subscription profile.
+    """
+    mode = str(binding.get("llm_auth_mode") or "platform_credits")
+    model_ref = str(binding.get("llm_model_ref") or "").strip()
+    if mode == "chatgpt_subscription" and model_ref:
+        return (mode, model_ref)
+    return ("platform_credits", "")
+
+
 def _binding_signature(binding: dict) -> tuple:
     """Identity tuple for an ``/me/binding`` payload.
 
@@ -2354,13 +2463,13 @@ def _binding_signature(binding: dict) -> tuple:
     different owner, or new vault row with a fresh token, or an
     OpenRouter child key + base URL + default model that appeared
     after a transient vault miss on the first poll), OR the owner
-    flipped the LLM auth mode (issue #23 — adding
-    ``llm_auth_mode`` / ``llm_model_ref`` so a platform-credits ->
-    chatgpt_subscription flip triggers rebind and the supervisor
-    rewrites openclaw.json instead of keeping the old
-    OpenClaw + OpenRouter config running). The supervisor must drop
-    its in-memory state and re-run Phase B so openclaw.json gets
-    rewritten with the now-present provider config.
+    linked or unlinked ChatGPT subscription state changed. A pending
+    device-code flow is normalized as platform credits because
+    ``write_openclaw_config`` also keeps the OpenRouter-backed config
+    until the local OAuth profile exists. This prevents the watchdog
+    from restarting the gateway mid-tool while the agent is sending
+    the verification URL + code; the linked model ref still triggers
+    the rebind that rewrites openclaw.json for the subscription.
     """
     return (
         str(binding.get("telegram_bot_user_id") or ""),
@@ -2372,12 +2481,7 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
         json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
-        # ChatGPT BYO subscription (issue #23) — mode/model_ref live
-        # on the binding so the watchdog notices a flip and triggers
-        # a rebind (otherwise write_openclaw_config never runs after
-        # the platform changes the auth mode).
-        str(binding.get("llm_auth_mode") or "platform_credits"),
-        str(binding.get("llm_model_ref") or ""),
+        *_binding_model_auth_signature(binding),
     )
 
 
@@ -3931,6 +4035,9 @@ def _run_one_binding_cycle() -> int:
 
     # Phase C: persist binding + start OpenClaw + report active
     try:
+        codex_subscription_plugin_installed = (
+            try_install_codex_subscription_plugin()
+        )
         chatgpt_subscription_provider_available = (
             try_check_chatgpt_subscription_provider()
         )
@@ -3938,9 +4045,8 @@ def _run_one_binding_cycle() -> int:
         write_openclaw_config(
             binding,
             enable_tinyhat_plugin=tinyhat_plugin_installed,
-            enable_chatgpt_subscription_provider=(
-                chatgpt_subscription_provider_available
-            ),
+            enable_chatgpt_subscription_provider=chatgpt_subscription_provider_available,
+            enable_codex_subscription_plugins=codex_subscription_plugin_installed,
         )
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)

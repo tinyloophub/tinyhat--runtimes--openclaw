@@ -653,6 +653,19 @@ class TinyhatPluginInstallTests(unittest.TestCase):
 
 
 class ChatgptSubscriptionProviderTests(unittest.TestCase):
+    def _codex_plugin_payload(self) -> str:
+        return json.dumps(
+            {
+                "plugin": {
+                    "id": "codex",
+                    "enabled": True,
+                    "status": "loaded",
+                    "providerIds": ["codex"],
+                    "dependencyStatus": {"requiredInstalled": True},
+                }
+            }
+        )
+
     def test_provider_registry_accepts_current_openai_provider(self) -> None:
         def fake_run(cmd, **_kwargs):
             self.assertEqual(cmd, ["openclaw", "plugins", "inspect", "openai", "--json"])
@@ -719,6 +732,156 @@ class ChatgptSubscriptionProviderTests(unittest.TestCase):
         with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(RuntimeError):
                 supervisor.ensure_chatgpt_subscription_provider_available()
+
+    def test_codex_subscription_plugin_skips_install_when_available(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            self.assertEqual(cmd, ["openclaw", "plugins", "inspect", "codex", "--json"])
+            return SimpleNamespace(
+                returncode=0,
+                stdout=self._codex_plugin_payload(),
+                stderr="",
+            )
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(supervisor.ensure_codex_subscription_plugin_installed())
+
+        self.assertEqual(calls, [["openclaw", "plugins", "inspect", "codex", "--json"]])
+
+    def test_codex_subscription_plugin_installs_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    if calls.count(list(cmd)) == 1:
+                        return SimpleNamespace(
+                            returncode=1,
+                            stdout="",
+                            stderr="Plugin not found: codex",
+                        )
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=self._codex_plugin_payload(),
+                        stderr="",
+                    )
+                if cmd == [
+                    "openclaw",
+                    "plugins",
+                    "install",
+                    "@openclaw/codex",
+                    "--force",
+                ]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout="Installed plugin: codex\nRestart the gateway to load plugins.",
+                        stderr="",
+                    )
+                self.fail(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_codex_subscription_plugin_installed())
+
+        self.assertEqual(
+            calls,
+            [
+                ["openclaw", "plugins", "inspect", "codex", "--json"],
+                ["openclaw", "plugins", "install", "@openclaw/codex", "--force"],
+                ["openclaw", "plugins", "inspect", "codex", "--json"],
+            ],
+        )
+
+    def test_codex_subscription_plugin_install_failure_raises(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Plugin not found: codex",
+                )
+            if cmd == [
+                "openclaw",
+                "plugins",
+                "install",
+                "@openclaw/codex",
+                "--force",
+            ]:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="npm registry timeout",
+                )
+            self.fail(f"unexpected command: {cmd}")
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as raised:
+                supervisor.ensure_codex_subscription_plugin_installed()
+
+        self.assertIn("Codex subscription plugin install failed", str(raised.exception))
+        self.assertEqual(
+            calls,
+            [
+                ["openclaw", "plugins", "inspect", "codex", "--json"],
+                ["openclaw", "plugins", "install", "@openclaw/codex", "--force"],
+            ],
+        )
+
+    def test_codex_subscription_plugin_verify_failure_raises(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Plugin not found: codex",
+                )
+            if cmd == [
+                "openclaw",
+                "plugins",
+                "install",
+                "@openclaw/codex",
+                "--force",
+            ]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Installed plugin: codex",
+                    stderr="",
+                )
+            self.fail(f"unexpected command: {cmd}")
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as raised:
+                supervisor.ensure_codex_subscription_plugin_installed()
+
+        self.assertIn(
+            "install completed but provider 'codex' is still unavailable",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            calls,
+            [
+                ["openclaw", "plugins", "inspect", "codex", "--json"],
+                ["openclaw", "plugins", "install", "@openclaw/codex", "--force"],
+                ["openclaw", "plugins", "inspect", "codex", "--json"],
+            ],
+        )
 
     def test_device_code_login_command_uses_current_openai_provider(self) -> None:
         self.assertEqual(
@@ -1252,6 +1415,98 @@ def _seed_other_provider_profile(state_dir: str) -> None:
         json.dump(data, fh)
 
 
+class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update(
+            {
+                "stop": False,
+                "rebind": False,
+                "signature": None,
+                "owner_signature": None,
+            }
+        )
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_codex_plugin_failure_does_not_disable_openai_subscription_provider(
+        self,
+    ) -> None:
+        import threading as threading_mod
+
+        binding = _subscription_binding(with_openrouter=True)
+        captured_config_kwargs: list[dict] = []
+
+        class _NoopThread:
+            def __init__(self, target, daemon):
+                self._target = target
+                self.daemon = daemon
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def fake_write_openclaw_config(config_binding: dict, **kwargs) -> None:
+            self.assertEqual(config_binding, binding)
+            captured_config_kwargs.append(dict(kwargs))
+
+        def fake_gateway_active() -> bool:
+            supervisor._stop_holder["stop"] = True
+            return True
+
+        with (
+            patch.object(supervisor, "post_json", return_value={}),
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={"assigned": True, "binding": binding},
+            ),
+            patch.object(
+                supervisor,
+                "try_install_codex_subscription_plugin",
+                return_value=False,
+            ),
+            patch.object(
+                supervisor,
+                "try_check_chatgpt_subscription_provider",
+                return_value=True,
+            ),
+            patch.object(supervisor, "try_install_tinyhat_plugin", return_value=True),
+            patch.object(
+                supervisor,
+                "write_openclaw_config",
+                side_effect=fake_write_openclaw_config,
+            ),
+            patch.object(supervisor, "delete_telegram_webhook"),
+            patch.object(supervisor, "start_openclaw_gateway", return_value=123.0),
+            patch.object(supervisor, "wait_for_openclaw_start"),
+            patch.object(
+                supervisor,
+                "is_openclaw_gateway_active",
+                side_effect=fake_gateway_active,
+            ),
+            patch.object(supervisor, "stop_openclaw_gateway"),
+            patch.object(supervisor.time, "sleep"),
+            patch.object(threading_mod, "Thread", _NoopThread),
+        ):
+            self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(
+            captured_config_kwargs,
+            [
+                {
+                    "enable_tinyhat_plugin": True,
+                    "enable_chatgpt_subscription_provider": True,
+                    "enable_codex_subscription_plugins": False,
+                }
+            ],
+        )
+
+
 class ChatgptSubscriptionBranchTests(unittest.TestCase):
     """Issue #23 — supervisor branches on auth-profile presence."""
 
@@ -1293,6 +1548,10 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
             config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
         )
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
+        self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
+        self.assertEqual(
+            config["plugins"]["entries"]["codex-supervisor"], {"enabled": True}
+        )
         self.assertEqual(
             config["auth"],
             {
@@ -1390,6 +1649,10 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertNotIn("agentRuntime", defaults)
         _assert_no_provider_runtime_pin(self, config, "openrouter")
         self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
+        self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
+        self.assertEqual(
+            config["plugins"]["entries"]["codex-supervisor"], {"enabled": True}
+        )
 
     def test_profile_without_provider_stays_on_default_config(self) -> None:
         """A saved profile is not enough if the provider plugin is unavailable."""
@@ -1412,7 +1675,44 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         defaults = config["agents"]["defaults"]
         self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
         self.assertNotEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
+        self.assertEqual(
+            config["plugins"]["entries"]["codex-supervisor"], {"enabled": True}
+        )
+
+    def test_profile_uses_subscription_route_when_codex_plugin_unavailable(self) -> None:
+        """The optional Codex plugin should not gate OpenAI model routing.
+
+        Device-code/model auth uses OpenClaw's bundled openai provider, so an
+        existing OAuth profile must keep using the subscription route even if
+        the auxiliary Codex plugin install failed and its config entries are
+        disabled for this boot.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                    enable_chatgpt_subscription_provider=True,
+                    enable_codex_subscription_plugins=False,
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        defaults = config["agents"]["defaults"]
+        self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(
+            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
+        )
+        self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertNotIn("codex", config["plugins"]["entries"])
+        self.assertNotIn("codex-supervisor", config["plugins"]["entries"])
 
     def test_default_binding_uses_provider_runtime_policy(self) -> None:
         """Non-subscription Computers pin the provider runtime instead
@@ -1441,6 +1741,10 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         defaults = config["agents"]["defaults"]
         self.assertNotIn("agentRuntime", defaults)
         _assert_no_provider_runtime_pin(self, config, "openrouter")
+        self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
+        self.assertEqual(
+            config["plugins"]["entries"]["codex-supervisor"], {"enabled": True}
+        )
 
 
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
@@ -1515,15 +1819,15 @@ class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
             "openrouter_default_model": "openai/gpt-5.5",
         }
 
-    def test_signature_moves_when_llm_auth_mode_flips(self) -> None:
+    def test_signature_stays_stable_for_pending_subscription_flow(self) -> None:
         before = self._base_binding()  # implicit platform_credits
         after = dict(before, llm_auth_mode="chatgpt_subscription")
-        self.assertNotEqual(
+        self.assertEqual(
             supervisor._binding_signature(before),
             supervisor._binding_signature(after),
         )
 
-    def test_signature_moves_when_llm_model_ref_changes(self) -> None:
+    def test_signature_moves_when_subscription_model_ref_links(self) -> None:
         before = dict(
             self._base_binding(), llm_auth_mode="chatgpt_subscription"
         )
@@ -2560,6 +2864,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
     def _read_state(self) -> dict:
         with open(self._state_path, encoding="utf-8") as fh:
             return json.load(fh)
+
+    def test_supervisor_restart_unit_matches_bootstrap_unit(self) -> None:
+        self.assertEqual(
+            supervisor.SUPERVISOR_SYSTEMD_UNIT,
+            "tinyhat-openclaw.service",
+        )
 
     def test_state_write_defaults_to_unreported_with_empty_cache(self) -> None:
         # New state shape: reported defaults to False and the cached-result
