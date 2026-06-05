@@ -88,16 +88,22 @@ OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 # explicit params override, so keep Computer chat replies bounded.
 OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 
-# ChatGPT BYO subscription (issue #23): when an `openai-codex` OAuth
-# profile is present in this Computer's per-agent auth store, the
-# supervisor swaps the default OpenClaw+OpenRouter config for the
-# native Codex app-server harness pointed at `openai/gpt-5.5`. The OAuth
-# credential is born on the Computer (either from the Mini App-driven
-# heartbeat-command flow OR from the chat-driven plugin tool running
-# the device-code CLI in-sandbox); the supervisor only reads the
-# resulting file shape on disk.
+# ChatGPT BYO subscription (issue #23): when a ChatGPT/Codex OAuth profile
+# is present in this Computer's per-agent auth store, the supervisor swaps
+# the default OpenClaw+OpenRouter config for OpenClaw's OpenAI provider
+# pointed at `openai/gpt-5.5`. OpenClaw 2026.6.x exposes the device-code
+# flow through provider `openai`; older installs exposed the same flow as
+# `openai-codex`. The OAuth credential is born on the Computer (either
+# from the Mini App-driven heartbeat-command flow OR from the chat-driven
+# plugin tool running the device-code CLI in sandbox); the supervisor only
+# reads the resulting file shape on disk.
 CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
-CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+CHATGPT_SUBSCRIPTION_PROVIDER = "openai"
+LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES = ("openai:", "openai-codex:")
+CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS = frozenset(
+    {"openai", "openai-codex"}
+)
 # Default agent id mirrors the platform's single-agent assumption today.
 # The auth store is per-agent inside the per-Computer OpenClaw state dir.
 DEFAULT_OPENCLAW_AGENT_ID = "main"
@@ -653,6 +659,158 @@ def _read_installed_plugin_marker() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _openclaw_plugin_from_inspect_payload(plugin_id: str, payload: Any) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    plugin = payload.get("plugin")
+    if not isinstance(plugin, dict):
+        plugin = payload
+    resolved_id = str(plugin.get("id") or plugin.get("pluginId") or "").strip()
+    if resolved_id != plugin_id:
+        return None
+    return plugin
+
+
+def _inspect_openclaw_plugin(plugin_id: str) -> dict | None:
+    """Return OpenClaw's plugin-registry entry, or None when missing/broken."""
+    try:
+        result = subprocess.run(
+            ["openclaw", "plugins", "inspect", plugin_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=_openclaw_cli_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("could not inspect OpenClaw plugin %s: %s", plugin_id, exc)
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        log.warning(
+            "OpenClaw plugin %s is not registered: %s",
+            plugin_id,
+            detail[:500] if detail else f"openclaw exited {result.returncode}",
+        )
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        log.warning("OpenClaw plugin %s inspect returned invalid JSON: %s", plugin_id, exc)
+        return None
+    plugin = _openclaw_plugin_from_inspect_payload(plugin_id, payload)
+    if plugin is None:
+        log.warning(
+            "OpenClaw plugin inspect returned unexpected payload for %s",
+            plugin_id,
+        )
+        return None
+    dependency_status = plugin.get("dependencyStatus")
+    if (
+        isinstance(dependency_status, dict)
+        and dependency_status.get("requiredInstalled") is False
+    ):
+        log.warning("OpenClaw plugin %s has missing dependencies", plugin_id)
+        return None
+    return plugin
+
+
+def _is_openclaw_plugin_registered(
+    plugin_id: str, *, provider_id: str | None = None
+) -> bool:
+    plugin = _inspect_openclaw_plugin(plugin_id)
+    if plugin is None:
+        return False
+    if provider_id is None:
+        return True
+    provider_ids = plugin.get("providerIds") or plugin.get("providers") or []
+    if provider_id in provider_ids:
+        return True
+    log.warning(
+        "OpenClaw plugin %s is registered but does not expose provider %s",
+        plugin_id,
+        provider_id,
+    )
+    return False
+
+
+def _is_chatgpt_subscription_provider_available() -> bool:
+    plugin = _inspect_openclaw_plugin("openai")
+    if plugin is None:
+        return False
+    provider_ids = plugin.get("providerIds") or plugin.get("providers") or []
+    if (
+        CHATGPT_SUBSCRIPTION_PROVIDER in provider_ids
+        or LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER in provider_ids
+    ):
+        return True
+    log.warning(
+        "OpenClaw plugin openai is registered but does not expose provider "
+        "%s or %s",
+        CHATGPT_SUBSCRIPTION_PROVIDER,
+        LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER,
+    )
+    return False
+
+
+def ensure_chatgpt_subscription_provider_available() -> bool:
+    """Verify OpenClaw exposes the provider used for ChatGPT device login."""
+    if _is_chatgpt_subscription_provider_available():
+        return True
+    raise RuntimeError(
+        "OpenClaw OpenAI provider plugin is not registered with provider "
+        f"{CHATGPT_SUBSCRIPTION_PROVIDER!r}"
+    )
+
+
+def try_check_chatgpt_subscription_provider() -> bool:
+    try:
+        return ensure_chatgpt_subscription_provider_available()
+    except Exception as exc:
+        log.warning(
+            "ChatGPT subscription OpenAI provider unavailable; continuing with "
+            "platform credits: %s",
+            exc,
+        )
+        return False
+
+
+def _is_tinyhat_plugin_registered() -> bool:
+    return _is_openclaw_plugin_registered(TINYHAT_PLUGIN_ID)
+
+
+def _chatgpt_subscription_model_ref(raw: str) -> str:
+    model = (raw or CHATGPT_SUBSCRIPTION_MODEL).strip() or CHATGPT_SUBSCRIPTION_MODEL
+    for legacy_prefix in ("openai-codex/", "codex/"):
+        if model.startswith(legacy_prefix):
+            return "openai/" + model.split("/", 1)[1]
+    if "/" not in model:
+        return "openai/" + model
+    return model
+
+
+def _is_chatgpt_subscription_profile(profile_id: str, profile: dict) -> bool:
+    credential_type = str(profile.get("type") or "").strip()
+    if credential_type not in {"oauth", "token"}:
+        return False
+    provider = str(profile.get("provider") or "").strip()
+    return provider in CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS or profile_id.startswith(
+        CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES
+    )
+
+
+def _chatgpt_subscription_login_command(openclaw_bin: str) -> list[str]:
+    return [
+        openclaw_bin,
+        "models",
+        "auth",
+        "login",
+        "--provider",
+        CHATGPT_SUBSCRIPTION_PROVIDER,
+        "--device-code",
+    ]
+
+
 _OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
 
 
@@ -839,7 +997,11 @@ def ensure_tinyhat_plugin_installed(
             marker_json = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         marker_json = {}
-    if marker_json == marker_payload and os.path.exists(installed_manifest):
+    if (
+        marker_json == marker_payload
+        and os.path.exists(installed_manifest)
+        and _is_tinyhat_plugin_registered()
+    ):
         log.info(
             "Tinyhat plugin already installed (ref=%s sha=%s version=%s)",
             repo_ref,
@@ -1292,22 +1454,197 @@ def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) ->
     )
 
 
+def _chatgpt_subscription_profile_suffix(profile_id: str) -> str:
+    tail = profile_id.split(":", 1)[1] if ":" in profile_id else profile_id
+    return tail.strip() or "default"
+
+
+def _allocate_chatgpt_subscription_profile_id(
+    legacy_profile_id: str, occupied: set[str]
+) -> str:
+    suffix = _chatgpt_subscription_profile_suffix(legacy_profile_id)
+    direct = f"{CHATGPT_SUBSCRIPTION_PROVIDER}:{suffix}"
+    if direct not in occupied:
+        occupied.add(direct)
+        return direct
+    chatgpt = f"{CHATGPT_SUBSCRIPTION_PROVIDER}:chatgpt-{suffix}"
+    if chatgpt not in occupied:
+        occupied.add(chatgpt)
+        return chatgpt
+    index = 2
+    while True:
+        candidate = f"{chatgpt}-{index}"
+        if candidate not in occupied:
+            occupied.add(candidate)
+            return candidate
+        index += 1
+
+
+def _replace_profile_id_refs(
+    value: Any,
+    profile_id_map: dict[str, str],
+    *,
+    replace_dict_keys: bool = False,
+) -> Any:
+    if isinstance(value, str):
+        return profile_id_map.get(value, value)
+    if isinstance(value, list):
+        return [
+            _replace_profile_id_refs(
+                item,
+                profile_id_map,
+                replace_dict_keys=replace_dict_keys,
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        replaced: dict = {}
+        for key, entry in value.items():
+            next_key = (
+                profile_id_map.get(key, key)
+                if replace_dict_keys and isinstance(key, str)
+                else key
+            )
+            replaced[next_key] = _replace_profile_id_refs(
+                entry,
+                profile_id_map,
+                replace_dict_keys=replace_dict_keys,
+            )
+        return replaced
+    return value
+
+
+def normalize_chatgpt_subscription_profile_store(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> list[tuple[str, str]]:
+    """Migrate legacy OpenAI Codex profile ids to current OpenAI ids.
+
+    OpenClaw 2026.6.x still writes device-code credentials with the legacy
+    ``openai-codex`` profile id/provider in some flows, but the current Codex
+    app-server route resolves auth for the ``openai`` provider. Keep the
+    secret-bearing profile on disk, but rewrite only its non-secret key/provider
+    metadata so OpenClaw can select it for ``openai/*`` models.
+    """
+    path = openclaw_auth_profiles_path(agent_id=agent_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    if not profiles:
+        return []
+
+    occupied = {
+        profile_id
+        for profile_id in profiles
+        if isinstance(profile_id, str)
+        and not profile_id.startswith(f"{LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER}:")
+    }
+    profile_id_map: dict[str, str] = {}
+    changed = False
+    for profile_id, profile in list(profiles.items()):
+        if not isinstance(profile_id, str) or not isinstance(profile, dict):
+            continue
+        legacy_id = profile_id.startswith(f"{LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER}:")
+        legacy_provider = (
+            str(profile.get("provider") or "").strip()
+            == LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER
+        )
+        if not (legacy_id or legacy_provider):
+            continue
+        next_profile_id = (
+            _allocate_chatgpt_subscription_profile_id(profile_id, occupied)
+            if legacy_id
+            else profile_id
+        )
+        next_profile = dict(profile)
+        next_profile["provider"] = CHATGPT_SUBSCRIPTION_PROVIDER
+        if next_profile_id != profile_id:
+            del profiles[profile_id]
+            profile_id_map[profile_id] = next_profile_id
+            changed = True
+        if next_profile != profile:
+            changed = True
+        profiles[next_profile_id] = next_profile
+
+    if not changed:
+        return []
+
+    ref_map = {
+        LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER: CHATGPT_SUBSCRIPTION_PROVIDER,
+        **profile_id_map,
+    }
+
+    if ref_map:
+        for key in ("usageStats", "lastGood"):
+            if key in data:
+                data[key] = _replace_profile_id_refs(
+                    data[key],
+                    ref_map,
+                    replace_dict_keys=True,
+                )
+    if ref_map and isinstance(data.get("order"), dict):
+        order = dict(data["order"])
+        legacy_order = order.pop(LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER, None)
+        if isinstance(legacy_order, list):
+            current_order = order.get(CHATGPT_SUBSCRIPTION_PROVIDER)
+            merged = [
+                *_replace_profile_id_refs(legacy_order, ref_map),
+                *(current_order if isinstance(current_order, list) else []),
+            ]
+            deduped: list[str] = []
+            for entry in merged:
+                if isinstance(entry, str) and entry not in deduped:
+                    deduped.append(entry)
+            order[CHATGPT_SUBSCRIPTION_PROVIDER] = deduped
+        elif legacy_order is not None and CHATGPT_SUBSCRIPTION_PROVIDER not in order:
+            order[CHATGPT_SUBSCRIPTION_PROVIDER] = _replace_profile_id_refs(
+                legacy_order,
+                ref_map,
+                replace_dict_keys=True,
+            )
+        data["order"] = _replace_profile_id_refs(
+            order,
+            ref_map,
+            replace_dict_keys=True,
+        )
+
+    data["profiles"] = profiles
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    return sorted(profile_id_map.items())
+
+
 def read_chatgpt_subscription_profile(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> dict | None:
-    """Return the ``openai-codex:*`` profile entry, if present.
+    """Return the ChatGPT/Codex subscription profile entry, if present.
 
     Returns the first matching profile dict from
-    ``auth-profiles.json`` (typically there's exactly one — OpenClaw's
-    profile id is ``openai-codex:<email>`` and the device-code flow
-    only mints one per Computer). Returns ``None`` when the file is
-    missing, malformed, or has no ``openai-codex:*`` entries.
+    ``auth-profiles.json``. OpenClaw 2026.6.x writes ChatGPT/Codex
+    subscription credentials under the ``openai`` provider, while older
+    runtimes used ``openai-codex``. Returns ``None`` when the file is
+    missing, malformed, or has no subscription credential.
 
     The OAuth token fields (``access``, ``refresh``, ``id``) ARE present
     in the returned dict — callers must NOT log them. The supervisor's
     own use of this function is metadata-only (presence check + email
     for logging); the actual OAuth refresh is OpenClaw's own concern.
     """
+    migrated = normalize_chatgpt_subscription_profile_store(agent_id=agent_id)
+    if migrated:
+        log.info(
+            "normalized ChatGPT subscription auth profile ids: %s",
+            ", ".join(f"{old}->{new}" for old, new in migrated),
+        )
     path = openclaw_auth_profiles_path(agent_id=agent_id)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1320,7 +1657,7 @@ def read_chatgpt_subscription_profile(
     for profile_id, profile in profiles.items():
         if not isinstance(profile_id, str) or not isinstance(profile, dict):
             continue
-        if profile_id.startswith(f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"):
+        if _is_chatgpt_subscription_profile(profile_id, profile):
             # Return a shallow copy with the profile id so callers can
             # log it without re-reading.
             out = dict(profile)
@@ -1332,7 +1669,7 @@ def read_chatgpt_subscription_profile(
 def wipe_chatgpt_subscription_profile(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> list[str]:
-    """Delete the ``openai-codex:*`` entries from the per-agent auth store.
+    """Delete ChatGPT/Codex subscription entries from the per-agent auth store.
 
     Used on unassign / reassign / recycle (the chat plugin's
     ``tinyhat_revert_to_platform_credits`` tool also performs this
@@ -1341,9 +1678,9 @@ def wipe_chatgpt_subscription_profile(
     drop the credential without the agent being involved).
 
     Returns the list of profile ids removed (empty when no matching
-    profile existed). Preserves any non-``openai-codex`` profiles in
-    the file. Writes atomically via a ``.tmp`` rename so a partial
-    write can't strand other-provider entries.
+    profile existed). Preserves non-subscription profiles in the file.
+    Writes atomically via a ``.tmp`` rename so a partial write can't
+    strand other-provider entries.
     """
     path = openclaw_auth_profiles_path(agent_id=agent_id)
     try:
@@ -1358,8 +1695,11 @@ def wipe_chatgpt_subscription_profile(
     profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
     removed: list[str] = []
     for profile_id in list(profiles.keys()):
-        if isinstance(profile_id, str) and profile_id.startswith(
-            f"{CHATGPT_SUBSCRIPTION_PROVIDER}:"
+        profile = profiles.get(profile_id)
+        if (
+            isinstance(profile_id, str)
+            and isinstance(profile, dict)
+            and _is_chatgpt_subscription_profile(profile_id, profile)
         ):
             del profiles[profile_id]
             removed.append(profile_id)
@@ -1381,6 +1721,7 @@ def write_openclaw_config(
     binding: dict,
     *,
     enable_tinyhat_plugin: bool = True,
+    enable_chatgpt_subscription_provider: bool = True,
 ) -> None:
     """Write the real OpenClaw gateway config for this binding."""
     owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
@@ -1492,10 +1833,20 @@ def write_openclaw_config(
     use_chatgpt_subscription = (
         binding_llm_auth_mode == "chatgpt_subscription"
         and subscription_profile is not None
+        and enable_chatgpt_subscription_provider
     )
+    if (
+        binding_llm_auth_mode == "chatgpt_subscription"
+        and subscription_profile is not None
+        and not enable_chatgpt_subscription_provider
+    ):
+        log.warning(
+            "subscription profile is present but OpenAI provider plugin is "
+            "unavailable; keeping platform-credit route"
+        )
 
     if use_chatgpt_subscription:
-        primary_model = binding_llm_model_ref or CHATGPT_SUBSCRIPTION_MODEL
+        primary_model = _chatgpt_subscription_model_ref(binding_llm_model_ref)
     else:
         primary_model = (
             openrouter_model_ref(openrouter_model)
@@ -1568,6 +1919,27 @@ def write_openclaw_config(
         },
         "session": {"dmScope": "per-channel-peer"},
     }
+    if use_chatgpt_subscription and subscription_profile:
+        subscription_profile_id = str(
+            subscription_profile.get("__profile_id") or ""
+        ).strip()
+        if subscription_profile_id:
+            auth_profile: dict[str, str] = {
+                "provider": CHATGPT_SUBSCRIPTION_PROVIDER,
+                "mode": "oauth",
+            }
+            email = str(subscription_profile.get("email") or "").strip()
+            display_name = str(subscription_profile.get("displayName") or "").strip()
+            if email:
+                auth_profile["email"] = email
+            if display_name:
+                auth_profile["displayName"] = display_name
+            config["auth"] = {
+                "profiles": {subscription_profile_id: auth_profile},
+                "order": {
+                    CHATGPT_SUBSCRIPTION_PROVIDER: [subscription_profile_id],
+                },
+            }
     _ensure_tinyhat_secret_provider_config(config)
     # OpenClaw 2026.5.22 rejects provider runtime pins such as
     # models.providers.openrouter.agentRuntime={"id":"openclaw"}, while newer
@@ -2329,6 +2701,27 @@ def _run_chatgpt_device_code_login_in_thread(
         return
 
     try:
+        ensure_chatgpt_subscription_provider_available()
+    except Exception as exc:
+        log.warning(
+            "subscription-link: OpenAI provider plugin unavailable "
+            "session_id=%s: %s",
+            session_id,
+            exc,
+        )
+        with _subscription_link_active_workers_lock:
+            _subscription_link_active_workers.pop(session_id, None)
+        _post_subscription_link_result(
+            session_id=session_id,
+            status="failed",
+            error=(
+                "OpenClaw could not load the OpenAI provider "
+                f"plugin required for subscription linking: {exc}"
+            ),
+        )
+        return
+
+    try:
         pid, fd = pty.fork()
     except OSError as exc:
         log.warning("pty.fork failed for session_id=%s: %s", session_id, exc)
@@ -2360,15 +2753,7 @@ def _run_chatgpt_device_code_login_in_thread(
         try:
             os.execvpe(
                 openclaw_bin,
-                [
-                    openclaw_bin,
-                    "models",
-                    "auth",
-                    "login",
-                    "--provider",
-                    "openai-codex",
-                    "--device-code",
-                ],
+                _chatgpt_subscription_login_command(openclaw_bin),
                 {**os.environ, **_openclaw_cli_env()},
             )
         except OSError as exc:
@@ -2579,7 +2964,10 @@ def _run_chatgpt_device_code_login_in_thread(
                             pending_reported = True
                     if not terminal_posted and (
                         "OpenAI device code complete" in buffer
-                        or "Auth profile: openai-codex:" in buffer
+                        or any(
+                            f"Auth profile: {prefix}" in buffer
+                            for prefix in CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES
+                        )
                     ):
                         log.info(
                             "subscription-link: detected device-code complete for "
@@ -3509,7 +3897,7 @@ def _run_one_binding_cycle() -> int:
         # Phase B observes the unassign. Gating on profile presence
         # would skip the bump+cancel here, the worker would keep
         # polling auth.openai.com, and when the user finally
-        # approved the CLI would write ``openai-codex:old@example.com``
+        # approved the CLI would write a stale ChatGPT subscription profile
         # to the same auth store the next owner is about to inherit.
         #
         # _wipe_on_owner_release is the right entry point for this:
@@ -3543,10 +3931,16 @@ def _run_one_binding_cycle() -> int:
 
     # Phase C: persist binding + start OpenClaw + report active
     try:
+        chatgpt_subscription_provider_available = (
+            try_check_chatgpt_subscription_provider()
+        )
         tinyhat_plugin_installed = try_install_tinyhat_plugin()
         write_openclaw_config(
             binding,
             enable_tinyhat_plugin=tinyhat_plugin_installed,
+            enable_chatgpt_subscription_provider=(
+                chatgpt_subscription_provider_available
+            ),
         )
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)

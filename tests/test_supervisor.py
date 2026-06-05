@@ -457,7 +457,7 @@ class TinyhatPluginInstallTests(unittest.TestCase):
             }
             calls: list[list[str]] = []
 
-            def fake_run(cmd, **_kwargs):
+            def fake_run(cmd, **kwargs):
                 calls.append(list(cmd))
                 if cmd == ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url]:
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -477,6 +477,23 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                     return SimpleNamespace(
                         returncode=0,
                         stdout=f"{plugin_sha}\n",
+                        stderr="",
+                    )
+                if cmd == ["openclaw", "plugins", "inspect", "tinyhat", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps(
+                            {
+                                "plugin": {
+                                    "id": "tinyhat",
+                                    "status": "disabled",
+                                    "dependencyStatus": {
+                                        "requiredInstalled": True,
+                                    },
+                                }
+                            }
+                        ),
                         stderr="",
                     )
                 self.fail(f"unexpected command: {cmd}")
@@ -502,7 +519,115 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                     ],
                     ["git", "-C", plugin_dir, "checkout", repo_ref],
                     ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+                    ["openclaw", "plugins", "inspect", "tinyhat", "--json"],
                 ],
+            )
+
+    def test_stale_marker_reinstalls_when_openclaw_registry_is_missing_plugin(
+        self,
+    ) -> None:
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "main"
+        plugin_sha = "fedcba9876543210"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = os.path.join(tmpdir, "tinyhat-plugin")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            with open(
+                os.path.join(plugin_dir, "openclaw.plugin.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(plugin_dir, "package.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"version": "0.5.0"}, fh)
+            os.makedirs(os.path.join(tmpdir, "extensions", "tinyhat"))
+            with open(
+                os.path.join(
+                    tmpdir,
+                    "extensions",
+                    "tinyhat",
+                    "openclaw.plugin.json",
+                ),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(tmpdir, "tinyhat-plugin.version"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump(
+                    {
+                        "repo_ref": repo_ref,
+                        "repo_url": repo_url,
+                        "resolved_commit_sha": plugin_sha,
+                        "version": "0.5.0",
+                    },
+                    fh,
+                )
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if cmd == ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "fetch",
+                    "--tags",
+                    "--prune",
+                    "origin",
+                ]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f"{plugin_sha}\n",
+                        stderr="",
+                    )
+                if cmd == ["openclaw", "plugins", "inspect", "tinyhat", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="Plugin not found: tinyhat",
+                    )
+                if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                self.fail(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
+            self.assertIn(
+                ["openclaw", "plugins", "inspect", "tinyhat", "--json"],
+                calls,
+            )
+            self.assertIn(
+                ["openclaw", "plugins", "install", plugin_dir, "--force"],
+                calls,
             )
 
     def test_plugin_source_prefers_component_update_override(self) -> None:
@@ -525,6 +650,129 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                     supervisor._tinyhat_plugin_source(),
                     ("https://example.com/new.git", "v2.0.0"),
                 )
+
+
+class ChatgptSubscriptionProviderTests(unittest.TestCase):
+    def test_provider_registry_accepts_current_openai_provider(self) -> None:
+        def fake_run(cmd, **_kwargs):
+            self.assertEqual(cmd, ["openclaw", "plugins", "inspect", "openai", "--json"])
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "plugin": {
+                            "id": "openai",
+                            "providerIds": ["openai"],
+                            "dependencyStatus": {"requiredInstalled": True},
+                        }
+                    }
+                ),
+                stderr="",
+            )
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(supervisor._is_chatgpt_subscription_provider_available())
+
+    def test_provider_registry_accepts_legacy_openai_codex_provider(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "plugin": {
+                            "id": "openai",
+                            "providerIds": ["openai-codex"],
+                            "dependencyStatus": {"requiredInstalled": True},
+                        }
+                    }
+                ),
+                stderr="",
+            )
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(supervisor._is_chatgpt_subscription_provider_available())
+
+        self.assertEqual(
+            calls,
+            [["openclaw", "plugins", "inspect", "openai", "--json"]],
+        )
+
+    def test_provider_check_raises_when_current_and_legacy_are_missing(self) -> None:
+        def fake_run(_cmd, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "plugin": {
+                            "id": "openai",
+                            "providerIds": ["api-key-only"],
+                            "dependencyStatus": {"requiredInstalled": True},
+                        }
+                    }
+                ),
+                stderr="",
+            )
+
+        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError):
+                supervisor.ensure_chatgpt_subscription_provider_available()
+
+    def test_device_code_login_command_uses_current_openai_provider(self) -> None:
+        self.assertEqual(
+            supervisor._chatgpt_subscription_login_command("openclaw"),
+            [
+                "openclaw",
+                "models",
+                "auth",
+                "login",
+                "--provider",
+                "openai",
+                "--device-code",
+            ],
+        )
+
+    def test_subscription_profiles_accept_current_and_legacy_shapes(self) -> None:
+        self.assertTrue(
+            supervisor._is_chatgpt_subscription_profile(
+                "openai:default",
+                {"type": "oauth", "provider": "openai"},
+            )
+        )
+        self.assertTrue(
+            supervisor._is_chatgpt_subscription_profile(
+                "openai-codex:owner@example.com",
+                {"type": "oauth", "provider": "openai-codex"},
+            )
+        )
+        self.assertFalse(
+            supervisor._is_chatgpt_subscription_profile(
+                "codex:default",
+                {"type": "oauth", "provider": "codex"},
+            )
+        )
+        self.assertFalse(
+            supervisor._is_chatgpt_subscription_profile(
+                "xai:default",
+                {"type": "oauth", "provider": "xai"},
+            )
+        )
+
+    def test_subscription_model_refs_normalize_to_openai_provider(self) -> None:
+        self.assertEqual(
+            supervisor._chatgpt_subscription_model_ref("openai/gpt-5.5"),
+            "openai/gpt-5.5",
+        )
+        self.assertEqual(
+            supervisor._chatgpt_subscription_model_ref("openai-codex/gpt-5.5"),
+            "openai/gpt-5.5",
+        )
+        self.assertEqual(
+            supervisor._chatgpt_subscription_model_ref("codex/gpt-5.5"),
+            "openai/gpt-5.5",
+        )
 
 
 class RuntimeSecretEnvBlockTests(unittest.TestCase):
@@ -913,6 +1161,8 @@ def _subscription_binding(*, with_openrouter: bool) -> dict:
         "telegram_bot_token": "123456:ABC",
         "telegram_bot_username": "Tinychattestbot",
         "llm_auth_mode": "chatgpt_subscription",
+        # Platform records may still carry legacy provider refs; the
+        # supervisor normalizes subscription mode to the current OpenAI provider.
         "llm_model_ref": "openai/gpt-5.5",
     }
     if with_openrouter:
@@ -927,7 +1177,30 @@ def _subscription_binding(*, with_openrouter: bool) -> dict:
 
 
 def _seed_auth_profile(state_dir: str) -> None:
-    """Drop an openai-codex profile into the agent's auth store."""
+    """Drop a current ChatGPT/Codex subscription profile into the auth store."""
+    path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": 1,
+                "profiles": {
+                    "openai:default": {
+                        "type": "oauth",
+                        "provider": "openai",
+                        "access": "redacted-access",
+                        "refresh": "redacted-refresh",
+                        "expires": 9999999999999,
+                        "email": "owner@example.com",
+                    }
+                },
+            },
+            fh,
+        )
+
+
+def _seed_legacy_auth_profile(state_dir: str) -> None:
+    """Drop the legacy openai-codex profile shape into the auth store."""
     path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -944,13 +1217,25 @@ def _seed_auth_profile(state_dir: str) -> None:
                         "email": "owner@example.com",
                     }
                 },
+                "order": {"openai-codex": ["openai-codex:owner@example.com"]},
+                "usageStats": {
+                    "openai-codex": {
+                        "lastProfileId": "openai-codex:owner@example.com"
+                    },
+                    "openai-codex:owner@example.com": {"requests": 3},
+                },
+                "lastGood": {
+                    "openai-codex": "openai-codex:owner@example.com",
+                    "provider": "openai-codex",
+                    "profileId": "openai-codex:owner@example.com",
+                },
             },
             fh,
         )
 
 
 def _seed_other_provider_profile(state_dir: str) -> None:
-    """Drop a non-openai-codex profile to test the wipe preserves it."""
+    """Drop a non-subscription profile to test the wipe preserves it."""
     path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -991,7 +1276,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
-        # No whole-agent runtime pin — let OpenClaw auto-select the Codex harness.
+        # No whole-agent runtime pin — let OpenClaw auto-select the harness.
         self.assertNotIn("agentRuntime", defaults)
         # No openai SecretRef — the OAuth profile owns auth.
         self.assertNotIn("models", defaults.get("models", {}))
@@ -1006,6 +1291,80 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         # OpenRouter env stays set so the fallback has an auth path.
         self.assertEqual(
             config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
+        )
+        self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
+        self.assertEqual(
+            config["auth"],
+            {
+                "profiles": {
+                    "openai:default": {
+                        "provider": "openai",
+                        "mode": "oauth",
+                        "email": "owner@example.com",
+                    },
+                },
+                "order": {"openai": ["openai:default"]},
+            },
+        )
+
+    def test_legacy_profile_is_normalized_for_codex_native_auth(self) -> None:
+        """OpenClaw 2026.6.x still writes some device-code profiles as
+        openai-codex, but the native Codex route resolves auth under openai."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_legacy_auth_profile(supervisor.openclaw_state_dir())
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                auth_path = supervisor.openclaw_auth_profiles_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+                with open(auth_path, encoding="utf-8") as fh:
+                    auth_store = json.load(fh)
+
+        self.assertEqual(config["agents"]["defaults"]["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(
+            config["auth"]["profiles"]["openai:owner@example.com"],
+            {
+                "provider": "openai",
+                "mode": "oauth",
+                "email": "owner@example.com",
+            },
+        )
+        self.assertEqual(config["auth"]["order"], {"openai": ["openai:owner@example.com"]})
+        self.assertNotIn("openai-codex:owner@example.com", auth_store["profiles"])
+        self.assertEqual(
+            auth_store["profiles"]["openai:owner@example.com"]["provider"],
+            "openai",
+        )
+        self.assertEqual(
+            auth_store["profiles"]["openai:owner@example.com"]["access"],
+            "redacted-access",
+        )
+        self.assertEqual(auth_store["order"], {"openai": ["openai:owner@example.com"]})
+        self.assertNotIn("openai-codex", auth_store["usageStats"])
+        self.assertNotIn("openai-codex:owner@example.com", auth_store["usageStats"])
+        self.assertEqual(
+            auth_store["usageStats"]["openai"]["lastProfileId"],
+            "openai:owner@example.com",
+        )
+        self.assertEqual(
+            auth_store["usageStats"]["openai:owner@example.com"],
+            {"requests": 3},
+        )
+        self.assertEqual(
+            auth_store["lastGood"],
+            {
+                "openai": "openai:owner@example.com",
+                "provider": "openai",
+                "profileId": "openai:owner@example.com",
+            },
         )
 
     def test_opted_in_without_profile_stays_on_default_config(self) -> None:
@@ -1031,6 +1390,29 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertNotIn("agentRuntime", defaults)
         _assert_no_provider_runtime_pin(self, config, "openrouter")
         self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
+
+    def test_profile_without_provider_stays_on_default_config(self) -> None:
+        """A saved profile is not enough if the provider plugin is unavailable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                    enable_chatgpt_subscription_provider=False,
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        defaults = config["agents"]["defaults"]
+        self.assertTrue(defaults["model"]["primary"].startswith("openrouter/"))
+        self.assertNotEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertNotIn("codex", config["plugins"]["entries"])
 
     def test_default_binding_uses_provider_runtime_policy(self) -> None:
         """Non-subscription Computers pin the provider runtime instead
@@ -1064,7 +1446,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
     """Issue #23 — admin-driven wipe of the per-agent OAuth credential."""
 
-    def test_wipe_removes_openai_codex_and_preserves_others(self) -> None:
+    def test_wipe_removes_current_openai_profile_and_preserves_others(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
                 "TINYHAT_DEV_RUNTIME": "1",
@@ -1076,19 +1458,37 @@ class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
                 _seed_other_provider_profile(state_dir)
 
                 removed = supervisor.wipe_chatgpt_subscription_profile()
-                self.assertEqual(removed, ["openai-codex:owner@example.com"])
+                self.assertEqual(removed, ["openai:default"])
 
-                # File still exists with the non-openai-codex profile.
+                # File still exists with the non-subscription profile.
                 path = supervisor.openclaw_auth_profiles_path()
                 with open(path, encoding="utf-8") as fh:
                     after = json.load(fh)
-                self.assertNotIn(
-                    "openai-codex:owner@example.com", after["profiles"]
-                )
+                self.assertNotIn("openai:default", after["profiles"])
                 self.assertIn("xai:other@example.com", after["profiles"])
 
                 # Second call is a no-op (idempotent).
                 self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
+
+    def test_wipe_removes_legacy_openai_codex_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_legacy_auth_profile(supervisor.openclaw_state_dir())
+
+                removed = supervisor.wipe_chatgpt_subscription_profile()
+                self.assertEqual(removed, ["openai-codex:owner@example.com"])
+
+                path = supervisor.openclaw_auth_profiles_path()
+                with open(path, encoding="utf-8") as fh:
+                    after = json.load(fh)
+                self.assertNotIn(
+                    "openai-codex:owner@example.com",
+                    after["profiles"],
+                )
 
     def test_wipe_on_missing_file_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1204,7 +1604,7 @@ class StaleProfileCarryoverGuardTests(unittest.TestCase):
     """Issue #23 / PR #24 review #2 — stale-profile carryover regression test.
 
     Simulates the failure mode Codex called out: an admin-driven
-    unassign leaves the previous owner's openai-codex profile on
+    unassign leaves the previous owner's subscription profile on
     disk; a later subscription-mode binding for a different owner
     would then make ``write_openclaw_config`` treat the stale
     profile as valid and run against the prior user's subscription.
@@ -1444,7 +1844,14 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
             calls.append((path, body))
             return {}
 
-        with patch.object(supervisor, "post_json", side_effect=_fake_post_json):
+        with (
+            patch.object(supervisor, "post_json", side_effect=_fake_post_json),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                return_value=True,
+            ),
+        ):
             supervisor._run_chatgpt_device_code_login_in_thread(
                 session_id="quick-exit-test",
                 openclaw_bin="/bin/false",
@@ -1468,8 +1875,17 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
     def test_quick_exit_posts_once_even_with_late_drain(self) -> None:
         """No double-post: only ONE terminal status per invocation."""
         calls: list[tuple[str, dict]] = []
-        with patch.object(
-            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
+        with (
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda p, b: calls.append((p, b)) or {},
+            ),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                return_value=True,
+            ),
         ):
             supervisor._run_chatgpt_device_code_login_in_thread(
                 session_id="dup-guard-test",
@@ -1478,7 +1894,9 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
                 overall_timeout_s=5.0,
             )
         # Only one terminal post, not two.
-        terminal_posts = [b for _, b in calls if b.get("status") in ("linked", "failed")]
+        terminal_posts = [
+            b for _, b in calls if b.get("status") in ("linked", "failed")
+        ]
         self.assertEqual(len(terminal_posts), 1, f"got {terminal_posts}")
 
     def test_pty_fork_failure_posts_terminal_failed(self) -> None:
@@ -1487,9 +1905,19 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         calls: list[tuple[str, dict]] = []
         import pty as pty_mod
 
-        with patch.object(
-            supervisor, "post_json", side_effect=lambda p, b: calls.append((p, b)) or {}
-        ), patch.object(pty_mod, "fork", side_effect=OSError("no ptys")):
+        with (
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda p, b: calls.append((p, b)) or {},
+            ),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                return_value=True,
+            ),
+            patch.object(pty_mod, "fork", side_effect=OSError("no ptys")),
+        ):
             supervisor._run_chatgpt_device_code_login_in_thread(
                 session_id="pty-fail-test",
                 openclaw_bin="/bin/false",
@@ -1499,6 +1927,35 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         self.assertEqual(body["status"], "failed")
         self.assertIn("pseudo-terminal", body["error"])
 
+    def test_provider_check_failure_posts_terminal_failed(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        with (
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda p, b: calls.append((p, b)) or {},
+            ),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                side_effect=RuntimeError("Provider not found: openai"),
+            ),
+        ):
+            supervisor._run_chatgpt_device_code_login_in_thread(
+                session_id="provider-missing-test",
+                openclaw_bin="/bin/false",
+            )
+
+        self.assertEqual(len(calls), 1)
+        path, body = calls[0]
+        self.assertEqual(
+            path, "/hapi/v1/computers/me/subscription-link-result"
+        )
+        self.assertEqual(body["session_id"], "provider-missing-test")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("OpenAI provider plugin", body["error"])
+
 
 class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
     """PR #24 review at 01:19Z — late-arriving worker + cold-start.
@@ -1506,7 +1963,7 @@ class CrossOwnerCredentialLeakGuardTests(unittest.TestCase):
     Codex's exact reproduction: owner A starts the device-code flow,
     the Computer is unassigned/reassigned before the user approves,
     owner A approves after the wipe; the previously still-alive
-    worker's CLI must not write an openai-codex profile back to the
+    worker's CLI must not write a subscription profile back to the
     shared auth store the new owner will inherit.
     """
 
@@ -1689,7 +2146,7 @@ class ColdStartOrphanProfileWipeTests(unittest.TestCase):
         → no profile on disk). Phase B observes `assigned=false`.
         Phase B's cold-start branch MUST cancel the worker via the
         owner-release path even though the wipe-file step is a no-op,
-        so the worker can't write `openai-codex:old@example.com` to
+        so the worker can't write `openai:old@example.com` to
         the auth store after the user finally approves.
 
         Without this fix (gated `if profile is not None: _wipe...`):
