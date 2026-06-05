@@ -189,6 +189,21 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         _assert_no_provider_runtime_pin(self, config, "openrouter")
         self.assertEqual(config["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
 
+    def test_writes_compaction_reserve_floor(self) -> None:
+        package = {
+            "default_model": "deepseek/deepseek-v4-flash",
+            "default_role": "default",
+            "enabled_roles": ["default"],
+            "models": {"default": "deepseek/deepseek-v4-flash"},
+        }
+
+        config = _write_config_in_temp_runtime(_openrouter_binding(package))
+
+        self.assertEqual(
+            config["agents"]["defaults"]["compaction"],
+            {"reserveTokensFloor": 20000},
+        )
+
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:
         package = {
             "default_model": "deepseek/deepseek-v4-flash:free",
