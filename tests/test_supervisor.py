@@ -3025,20 +3025,28 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
     def test_component_update_restart_waits_for_fresh_gateway_health(self) -> None:
         supervisor._stop_holder["stop"] = False
         supervisor._stop_holder["rebind"] = False
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+
+        def fake_wait(_started_at):
+            self.assertTrue(supervisor._stop_holder["component_update_restart"])
+
         with (
             patch.object(
                 supervisor,
                 "start_openclaw_gateway",
                 return_value=1234.5,
             ) as start,
-            patch.object(supervisor, "wait_for_openclaw_start") as wait,
+            patch.object(
+                supervisor, "wait_for_openclaw_start", side_effect=fake_wait
+            ) as wait,
         ):
-            supervisor._restart_gateway_for_component_update()
+            supervisor._restart_gateway_for_component_update(binding)
 
-        start.assert_called_once_with({})
+        start.assert_called_once_with(binding)
         wait.assert_called_once_with(1234.5)
         self.assertFalse(supervisor._stop_holder["stop"])
         self.assertFalse(supervisor._stop_holder["rebind"])
+        self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
     def test_component_update_restart_propagates_readiness_failure(self) -> None:
         with (
@@ -3055,6 +3063,7 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "telegram did not reconnect"):
                 supervisor._restart_gateway_for_component_update()
+        self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
 
 class UpdateComponentCommandTests(unittest.TestCase):
@@ -3158,7 +3167,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
         }
         with patch.object(supervisor, "handle_update_component_command") as handler:
             supervisor.handle_heartbeat_command(cmd)
-        handler.assert_called_once_with(cmd)
+        handler.assert_called_once_with(cmd, binding=None)
 
     def test_dispatch_routes_apply_packages_to_handler(self) -> None:
         cmd = {
@@ -3172,7 +3181,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
         }
         with patch.object(supervisor, "handle_apply_packages_command") as handler:
             supervisor.handle_heartbeat_command(cmd)
-        handler.assert_called_once_with(cmd)
+        handler.assert_called_once_with(cmd, binding=None)
 
     def test_plugin_only_target_installs_ref_restarts_and_reports_applied(
         self,
@@ -3201,7 +3210,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
             patch.object(
                 supervisor,
                 "_restart_gateway_for_component_update",
-                side_effect=lambda: order.append("restart"),
+                side_effect=lambda *_args, **_kwargs: order.append("restart"),
             ) as restart_gateway,
             patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
         ):
@@ -3233,6 +3242,41 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self.assertEqual(override["repo_ref"], "v2.0.0")
         self.assertEqual(override["resolved_commit_sha"], "abc123")
         self.assertEqual(override["version"], "2.0.0")
+
+    def test_component_restart_failure_reports_failed_without_raising(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 32,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(
+                supervisor,
+                "_restart_gateway_for_component_update",
+                side_effect=RuntimeError("telegram did not reconnect"),
+            ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        restart_gateway.assert_called_once()
+        restart_supervisor.assert_not_called()
+        self._posted.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 32)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("gateway restart after component update failed", kwargs["diagnostic"])
+        self.assertIn("telegram did not reconnect", kwargs["diagnostic"])
+        state = self._read_state()
+        self.assertEqual(state["last_revision"], 32)
+        self.assertEqual(state["status"], "failed")
+        self.assertIs(state["reported"], True)
 
     def test_plugin_update_persists_ref_for_later_rebind_without_mutating_env(
         self,
@@ -3291,6 +3335,39 @@ class UpdateComponentCommandTests(unittest.TestCase):
         restart_gateway.assert_called_once()
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 4)
+        self.assertEqual(kwargs["status"], "applied")
+
+    def test_plugin_and_framework_targets_restart_gateway_once(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 33,
+            "targets": {
+                "plugin": {"ref": "v2.0.0"},
+                "framework": {"version": "1.5.0"},
+            },
+        }
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor.subprocess, "run", return_value=ok),
+            patch.object(
+                supervisor, "_read_openclaw_framework_version", return_value="1.5.0"
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        installer.assert_called_once()
+        restart_gateway.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 33)
         self.assertEqual(kwargs["status"], "applied")
 
     def test_framework_version_mismatch_marks_failed(self) -> None:
@@ -3409,6 +3486,45 @@ class UpdateComponentCommandTests(unittest.TestCase):
         # The applied-result POST must land BEFORE the supervisor restart, so
         # the platform records success even if the restart kills this process.
         self.assertEqual(order, ["post", "restart"])
+
+    def test_runtime_success_with_plugin_skips_redundant_gateway_restart(
+        self,
+    ) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 34,
+            "targets": {
+                "plugin": {"ref": "v2.0.0"},
+                "runtime": {"ref": "v0.10.2"},
+            },
+        }
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
+            patch.object(
+                supervisor,
+                "_read_installed_plugin_marker",
+                return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
+            ),
+            patch.object(supervisor.subprocess, "run", return_value=ok),
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value="0.10.2"
+            ),
+            patch.object(
+                supervisor, "_read_runtime_git_sha", return_value="newsha"
+            ),
+            patch.object(
+                supervisor, "_restart_gateway_for_component_update"
+            ) as restart_gateway,
+            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        restart_gateway.assert_not_called()
+        restart_supervisor.assert_called_once()
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 34)
+        self.assertEqual(kwargs["status"], "applied")
 
     def test_runtime_checkout_failure_does_not_restart(self) -> None:
         cmd = {
@@ -3776,7 +3892,7 @@ class ApplyPackagesCommandTests(unittest.TestCase):
             patch.object(
                 supervisor,
                 "_restart_gateway_for_component_update",
-                side_effect=lambda: order.append("restart"),
+                side_effect=lambda *_args, **_kwargs: order.append("restart"),
             ) as restart_gateway,
         ):
             supervisor.handle_apply_packages_command(cmd)
