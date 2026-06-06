@@ -2210,7 +2210,7 @@ def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProces
 # In dev mode the supervisor owns the OpenClaw gateway process
 # directly instead of delegating to systemd. The Popen handle lives
 # here so the four lifecycle entry points share state.
-_dev_gateway: dict = {"proc": None, "log_path": None}
+_dev_gateway: dict = {"proc": None, "log_path": None, "log_offset": 0}
 
 
 def _dev_gateway_log_path() -> str:
@@ -2236,6 +2236,10 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
     state_dir = openclaw_state_dir()
     os.makedirs(state_dir, exist_ok=True)
     log_path = _dev_gateway_log_path()
+    try:
+        log_offset = os.path.getsize(log_path)
+    except FileNotFoundError:
+        log_offset = 0
     # ``log_fh`` is kept open intentionally — subprocess.Popen
     # inherits it as its stdout/stderr and writes for the lifetime
     # of the gateway. Closing here would lose every log line.
@@ -2281,6 +2285,7 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
     )
     _dev_gateway["proc"] = proc
     _dev_gateway["log_path"] = log_path
+    _dev_gateway["log_offset"] = log_offset
     return time.time()
 
 
@@ -2295,6 +2300,9 @@ def _probe_openclaw_gateway_health_dev(
     log_path = _dev_gateway.get("log_path") or _dev_gateway_log_path()
     try:
         with open(log_path, encoding="utf-8", errors="replace") as fh:
+            log_offset = int(_dev_gateway.get("log_offset") or 0)
+            if log_offset > 0:
+                fh.seek(min(log_offset, os.path.getsize(log_path)))
             tail = fh.read()
     except FileNotFoundError:
         return False, "gateway log file not created yet"
@@ -3663,23 +3671,22 @@ def _write_component_update_state(
 def _restart_gateway_for_component_update() -> None:
     """Restart the OpenClaw gateway so a plugin/framework update takes effect.
 
-    Reuses the supervisor's existing restart primitive rather than inventing
-    a parallel path: setting the rebind flag makes ``main()`` stop the
-    gateway and re-run Phase B (re-read ``/me/binding`` -> rewrite
-    openclaw.json -> restart the gateway with the correct binding). This is
-    the same lever ``_signal_rebind_for_secrets`` pulls for an env-block
-    change, so it respects whatever the binding watchdog is doing and does
-    not fight a config-apply that is mid-flight.
+    A successful package/framework update is not complete until a fresh
+    gateway process has loaded the updated package tree and Telegram long
+    polling has reconnected. Do the process-level gateway restart now and
+    reuse the same readiness gate that boot uses, instead of deferring a
+    rebind and reporting success while the old gateway is still alive.
 
     Note this does NOT reload ``supervisor.py`` itself — a runtime
     self-update needs ``_restart_supervisor`` instead.
     """
     log.info(
-        "component update: signaling gateway rebind so the updated "
-        "plugin/framework is picked up"
+        "component update: restarting OpenClaw gateway so the updated "
+        "plugin/framework package tree is picked up"
     )
-    _stop_holder["rebind"] = True
-    _stop_holder["stop"] = True
+    started_at = start_openclaw_gateway({})
+    wait_for_openclaw_start(started_at)
+    log.info("component update: OpenClaw gateway restarted and healthy")
 
 
 def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
@@ -4233,6 +4240,17 @@ def handle_apply_packages_command(command: dict) -> None:
 
     log.info("heartbeat command: applying Tinyhat packages revision=%d", revision)
     ok, diagnostic, installed_packages = _apply_tinyhat_packages(command)
+    if ok:
+        try:
+            _restart_gateway_for_component_update()
+        except Exception as exc:  # noqa: BLE001 - report the failed apply
+            ok = False
+            restart_diagnostic = f"gateway restart after package apply failed: {exc}"
+            diagnostic = (
+                f"{diagnostic}; {restart_diagnostic}"
+                if diagnostic
+                else restart_diagnostic
+            )
     status = "applied" if ok else "failed"
     _write_package_apply_state(
         revision,
@@ -4247,8 +4265,6 @@ def handle_apply_packages_command(command: dict) -> None:
         diagnostic=diagnostic,
         installed_packages=installed_packages,
     )
-    if ok:
-        _restart_gateway_for_component_update()
 
 
 def handle_update_component_command(command: dict) -> None:
