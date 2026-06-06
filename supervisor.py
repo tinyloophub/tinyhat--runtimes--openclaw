@@ -2210,7 +2210,7 @@ def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProces
 # In dev mode the supervisor owns the OpenClaw gateway process
 # directly instead of delegating to systemd. The Popen handle lives
 # here so the four lifecycle entry points share state.
-_dev_gateway: dict = {"proc": None, "log_path": None}
+_dev_gateway: dict = {"proc": None, "log_path": None, "log_offset": 0}
 
 
 def _dev_gateway_log_path() -> str:
@@ -2236,6 +2236,10 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
     state_dir = openclaw_state_dir()
     os.makedirs(state_dir, exist_ok=True)
     log_path = _dev_gateway_log_path()
+    try:
+        log_offset = os.path.getsize(log_path)
+    except FileNotFoundError:
+        log_offset = 0
     # ``log_fh`` is kept open intentionally — subprocess.Popen
     # inherits it as its stdout/stderr and writes for the lifetime
     # of the gateway. Closing here would lose every log line.
@@ -2281,6 +2285,7 @@ def _start_openclaw_gateway_dev(binding: dict) -> float:
     )
     _dev_gateway["proc"] = proc
     _dev_gateway["log_path"] = log_path
+    _dev_gateway["log_offset"] = log_offset
     return time.time()
 
 
@@ -2295,6 +2300,9 @@ def _probe_openclaw_gateway_health_dev(
     log_path = _dev_gateway.get("log_path") or _dev_gateway_log_path()
     try:
         with open(log_path, encoding="utf-8", errors="replace") as fh:
+            log_offset = int(_dev_gateway.get("log_offset") or 0)
+            if log_offset > 0:
+                fh.seek(min(log_offset, os.path.getsize(log_path)))
             tail = fh.read()
     except FileNotFoundError:
         return False, "gateway log file not created yet"
@@ -2506,12 +2514,23 @@ def stop_openclaw_gateway() -> None:
 #                 ``assigned=true`` response). Causes ``main()`` to
 #                 stop the gateway + jump back to Phase B without
 #                 tearing down the supervisor process.
+# ``component_update_restart``
+#              — set while the heartbeat thread is synchronously restarting
+#                 the gateway after a package/framework update. The Phase D
+#                 monitor suppresses its inactive-gateway grace counter while
+#                 this is true so the update handler can report restart
+#                 failures instead of racing the monitor's broken-state path.
 # ``signature`` — current binding's identity tuple set at the start
 #                 of Phase D. The watchdog compares this against
 #                 every fresh ``/me/binding`` response so a fast
 #                 unassign + reassign that lands inside the heartbeat
 #                 window still triggers a clean rebind.
-_stop_holder = {"stop": False, "rebind": False, "signature": None}
+_stop_holder = {
+    "stop": False,
+    "rebind": False,
+    "component_update_restart": False,
+    "signature": None,
+}
 _config_apply_state = {
     "failed_revision": None,
     "failed_diagnostic": None,
@@ -3660,30 +3679,34 @@ def _write_component_update_state(
         log.warning("failed to persist component-update state: %s", exc)
 
 
-def _restart_gateway_for_component_update() -> None:
+def _restart_gateway_for_component_update(binding: dict | None = None) -> None:
     """Restart the OpenClaw gateway so a plugin/framework update takes effect.
 
-    Reuses the supervisor's existing restart primitive rather than inventing
-    a parallel path: setting the rebind flag makes ``main()`` stop the
-    gateway and re-run Phase B (re-read ``/me/binding`` -> rewrite
-    openclaw.json -> restart the gateway with the correct binding). This is
-    the same lever ``_signal_rebind_for_secrets`` pulls for an env-block
-    change, so it respects whatever the binding watchdog is doing and does
-    not fight a config-apply that is mid-flight.
+    A successful package/framework update is not complete until a fresh
+    gateway process has loaded the updated package tree and Telegram long
+    polling has reconnected. Do the process-level gateway restart now and
+    reuse the same readiness gate that boot uses, instead of deferring a
+    rebind and reporting success while the old gateway is still alive.
 
     Note this does NOT reload ``supervisor.py`` itself — a runtime
     self-update needs ``_restart_supervisor`` instead.
     """
     log.info(
-        "component update: signaling gateway rebind so the updated "
-        "plugin/framework is picked up"
+        "component update: restarting OpenClaw gateway so the updated "
+        "plugin/framework package tree is picked up"
     )
-    _stop_holder["rebind"] = True
-    _stop_holder["stop"] = True
+    previous_marker = bool(_stop_holder.get("component_update_restart"))
+    _stop_holder["component_update_restart"] = True
+    try:
+        started_at = start_openclaw_gateway(binding or {})
+        wait_for_openclaw_start(started_at)
+        log.info("component update: OpenClaw gateway restarted and healthy")
+    finally:
+        _stop_holder["component_update_restart"] = previous_marker
 
 
 def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
-    """Update the Tinyhat plugin to ``ref`` in place; restart the gateway.
+    """Update the Tinyhat plugin to ``ref`` in place.
 
     The boot-time ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` stays pinned to the
     VM's original provisioning manifest, so a component update cannot be just
@@ -3709,7 +3732,6 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
         return False, f"plugin update to {ref} failed: {exc}"
     sha = str(marker.get("resolved_commit_sha") or "")
     log.info("component update: plugin now at ref=%s sha=%s", ref, sha[:12])
-    _restart_gateway_for_component_update()
     return True, None
 
 
@@ -3718,9 +3740,8 @@ def _update_framework_component(version: str) -> tuple[bool, str | None]:
 
     Mirrors the bootstrap install style (``npm install -g`` with the
     non-interactive flags). Verifies the installed version matches the
-    target via ``_read_openclaw_framework_version`` before declaring
-    success, then restarts the gateway. Returns ``(ok, diagnostic)``;
-    never raises.
+    target via ``_read_openclaw_framework_version`` before declaring success.
+    Returns ``(ok, diagnostic)``; never raises.
     """
     try:
         install = subprocess.run(
@@ -3745,7 +3766,6 @@ def _update_framework_component(version: str) -> tuple[bool, str | None]:
             f"wanted {version}, got {installed or 'unknown'}",
         )
     log.info("component update: framework now at %s", version)
-    _restart_gateway_for_component_update()
     return True, None
 
 
@@ -4206,7 +4226,7 @@ def _apply_tinyhat_packages(command: dict) -> tuple[bool, str | None, dict]:
     return True, None, installed_packages
 
 
-def handle_apply_packages_command(command: dict) -> None:
+def handle_apply_packages_command(command: dict, binding: dict | None = None) -> None:
     revision = _command_revision(command)
     if revision is None:
         log.warning("ignoring malformed apply_packages command: %r", command)
@@ -4233,6 +4253,17 @@ def handle_apply_packages_command(command: dict) -> None:
 
     log.info("heartbeat command: applying Tinyhat packages revision=%d", revision)
     ok, diagnostic, installed_packages = _apply_tinyhat_packages(command)
+    if ok:
+        try:
+            _restart_gateway_for_component_update(binding)
+        except Exception as exc:  # noqa: BLE001 - report the failed apply
+            ok = False
+            restart_diagnostic = f"gateway restart after package apply failed: {exc}"
+            diagnostic = (
+                f"{diagnostic}; {restart_diagnostic}"
+                if diagnostic
+                else restart_diagnostic
+            )
     status = "applied" if ok else "failed"
     _write_package_apply_state(
         revision,
@@ -4247,11 +4278,11 @@ def handle_apply_packages_command(command: dict) -> None:
         diagnostic=diagnostic,
         installed_packages=installed_packages,
     )
-    if ok:
-        _restart_gateway_for_component_update()
 
 
-def handle_update_component_command(command: dict) -> None:
+def handle_update_component_command(
+    command: dict, binding: dict | None = None
+) -> None:
     """Handle one heartbeat-delivered ``update_component`` command.
 
     See the section header above for the command shape and ordering
@@ -4303,6 +4334,7 @@ def handle_update_component_command(command: dict) -> None:
     log.info("heartbeat command: applying component update revision=%d", revision)
     diagnostics: list[str] = []
     all_ok = True
+    gateway_restart_needed = False
 
     # Order: plugin -> framework -> runtime. The runtime self-update is the
     # riskiest (rewrites the repo the supervisor runs from and must restart
@@ -4313,6 +4345,7 @@ def handle_update_component_command(command: dict) -> None:
     if isinstance(plugin_target, dict) and str(plugin_target.get("ref") or "").strip():
         ok, diag = _update_plugin_component(str(plugin_target["ref"]).strip())
         all_ok = all_ok and ok
+        gateway_restart_needed = gateway_restart_needed or ok
         if diag:
             diagnostics.append(diag)
 
@@ -4322,6 +4355,7 @@ def handle_update_component_command(command: dict) -> None:
     ).strip():
         ok, diag = _update_framework_component(str(framework_target["version"]).strip())
         all_ok = all_ok and ok
+        gateway_restart_needed = gateway_restart_needed or ok
         if diag:
             diagnostics.append(diag)
 
@@ -4342,6 +4376,19 @@ def handle_update_component_command(command: dict) -> None:
         # restart to take effect. Dev mode returns ok with a "skipped"
         # diagnostic and must not restart.
         runtime_needs_restart = ok and not _dev_mode()
+
+    # These handlers run inside the heartbeat thread. Blocking that thread
+    # through the restart/readiness wait is intentional: the update result
+    # must reflect whether the updated gateway process actually loaded and
+    # reconnected Telegram. The Phase D monitor suppresses its inactive
+    # gateway counter while this marker is set so restart failures can be
+    # reported here rather than racing the broken-state path.
+    if gateway_restart_needed and not runtime_needs_restart:
+        try:
+            _restart_gateway_for_component_update(binding)
+        except Exception as exc:  # noqa: BLE001 - report the failed update
+            all_ok = False
+            diagnostics.append(f"gateway restart after component update failed: {exc}")
 
     status = "applied" if all_ok else "failed"
     diagnostic = "; ".join(diagnostics) if diagnostics else None
@@ -4387,7 +4434,7 @@ def handle_update_component_command(command: dict) -> None:
         _restart_supervisor()
 
 
-def handle_heartbeat_command(command: dict) -> None:
+def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None:
     """Dispatch a heartbeat-delivered command to its handler.
 
     The platform piggybacks at most one command on a heartbeat response.
@@ -4401,9 +4448,9 @@ def handle_heartbeat_command(command: dict) -> None:
     elif cmd_type == "start_chatgpt_link":
         handle_start_chatgpt_link_command(command)
     elif cmd_type == "update_component":
-        handle_update_component_command(command)
+        handle_update_component_command(command, binding=binding)
     elif cmd_type == "apply_packages":
-        handle_apply_packages_command(command)
+        handle_apply_packages_command(command, binding=binding)
     else:
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 
@@ -4624,7 +4671,7 @@ def _run_one_binding_cycle() -> int:
                 )
                 command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
                 if isinstance(command, dict):
-                    handle_heartbeat_command(command)
+                    handle_heartbeat_command(command, binding=binding)
             except Exception as exc:
                 log.warning("/me/heartbeat POST failed: %s", exc)
             # Watchdog: did the platform unassign us OR swap the
@@ -4721,7 +4768,9 @@ def _run_one_binding_cycle() -> int:
     try:
         inactive_for_seconds = 0
         while not _stop_holder["stop"]:
-            if is_openclaw_gateway_active():
+            if _stop_holder.get("component_update_restart"):
+                inactive_for_seconds = 0
+            elif is_openclaw_gateway_active():
                 inactive_for_seconds = 0
             else:
                 inactive_for_seconds += 1
