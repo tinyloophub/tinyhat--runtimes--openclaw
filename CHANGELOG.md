@@ -7,6 +7,18 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.10
+
+### Fixed
+
+- Gate plugin/framework Software update success on a fresh OpenClaw gateway
+  restart and readiness probe, so the platform does not mark an update
+  complete when the updated gateway process fails to load.
+- Restart OpenClaw only once for multi-component plugin/framework updates,
+  preserve bot/owner context in restart logs, suppress the Phase D inactivity
+  monitor during the intentional restart, and report restart failures back to
+  the platform instead of leaving the update command to retry forever.
+
 ## 0.11.9
 
 ### Fixed
