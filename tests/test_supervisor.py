@@ -18,15 +18,23 @@ from unittest.mock import patch
 import supervisor
 
 
-def _write_config_in_temp_runtime(binding: dict) -> dict:
+def _write_config_in_temp_runtime(
+    binding: dict,
+    *,
+    secrets: dict[str, str] | None = None,
+) -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
+        secrets_path = os.path.join(
+            tmpdir,
+            "tinyhat-secrets.json",
+        )
+        if secrets is not None:
+            with open(secrets_path, "w", encoding="utf-8") as fh:
+                json.dump(secrets, fh)
         env = {
             "TINYHAT_DEV_RUNTIME": "1",
             "TINYHAT_RUNTIME_HOME": tmpdir,
-            "TINYHAT_SECRETS_PATH": os.path.join(
-                tmpdir,
-                "tinyhat-secrets.json",
-            ),
+            "TINYHAT_SECRETS_PATH": secrets_path,
         }
         with patch.dict(os.environ, env, clear=False):
             supervisor.write_openclaw_config(binding)
@@ -1600,6 +1608,9 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 ],
             },
         )
+        # Automated coverage stops at configuring OpenAI first plus OpenRouter
+        # fallback; the HTTP 500-to-fallback recovery is OpenClaw runtime
+        # behavior and is covered by live Telegram E2E.
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
         self.assertEqual(
@@ -1812,6 +1823,46 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
             },
         )
         self.assertNotIn("imageModel", config["agents"]["defaults"])
+
+    def test_openai_secret_prefers_openai_audio_without_image_pin(self) -> None:
+        """BYO OpenAI key uses OpenAI STT without changing the image route."""
+        config = _write_config_in_temp_runtime(
+            _openrouter_binding(
+                {
+                    "default_model": "moonshotai/kimi-k2.6",
+                    "models": {"default": "moonshotai/kimi-k2.6"},
+                    "enabled_roles": ["default"],
+                }
+            ),
+            secrets={"OPENAI_API_KEY": "sk-openai-test"},
+        )
+
+        self.assertEqual(
+            config["tools"]["media"]["audio"],
+            {
+                "enabled": True,
+                "models": [
+                    {"provider": "openai", "model": "gpt-4o-transcribe"},
+                    {
+                        "provider": "openrouter",
+                        "model": "openai/whisper-large-v3-turbo",
+                    },
+                ],
+            },
+        )
+        self.assertNotIn("imageModel", config["agents"]["defaults"])
+        self.assertEqual(
+            config["models"]["providers"]["openai"]["apiKey"],
+            {
+                "source": "file",
+                "provider": supervisor.TINYHAT_SECRETS_PROVIDER,
+                "id": supervisor.TINYHAT_OPENAI_API_KEY_POINTER,
+            },
+        )
+        self.assertEqual(
+            config.get("env"),
+            {"OPENROUTER_API_KEY": "sk-or-v1-child"},
+        )
 
     def test_default_binding_uses_provider_runtime_policy(self) -> None:
         """Non-subscription Computers pin the provider runtime instead

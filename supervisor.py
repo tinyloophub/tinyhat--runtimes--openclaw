@@ -2088,6 +2088,9 @@ def write_openclaw_config(
         "workspace": workspace_dir,
         "model": text_model_config,
         **(
+            # Only subscription mode pins images because its primary model is
+            # OpenAI. A non-subscription BYO key can pay for audio STT without
+            # silently moving image turns away from the configured text route.
             {"imageModel": {"primary": primary_model}}
             if use_chatgpt_subscription
             else {}

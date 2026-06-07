@@ -7,6 +7,12 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Fixed
+
+- Prefer user-owned OpenAI auth for Telegram media transcription and image
+  understanding when ChatGPT/Codex auth is connected, while keeping managed
+  OpenRouter media transcription as the fallback rail.
+
 ## 0.11.11
 
 ### Changed
