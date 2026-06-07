@@ -7,6 +7,18 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.11
+
+### Changed
+
+- Sharpen the runtime repo's release and test guidance for critical Tinyhat
+  paths: ChatGPT subscription linking, provider-plugin installation, software
+  updates, component restarts, and `/restart` now explicitly require Docker
+  Computer and live Telegram evidence when user-visible behavior changes.
+- Align the runtime repo's `open-pr` and `define-tests` skills with the
+  Tinyloop monorepo's critical runtime/plugin QA gates from
+  tinyloophub/tinyloop#626.
+
 ## 0.11.10
 
 ### Fixed
