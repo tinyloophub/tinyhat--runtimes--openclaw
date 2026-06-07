@@ -1570,6 +1570,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                     config = json.load(fh)
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
         # No whole-agent runtime pin — let OpenClaw auto-select the harness.
         self.assertNotIn("agentRuntime", defaults)
         # No openai SecretRef — the OAuth profile owns auth.
@@ -1585,6 +1586,19 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         # OpenRouter env stays set so the fallback has an auth path.
         self.assertEqual(
             config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
+        )
+        self.assertEqual(
+            config["tools"]["media"]["audio"],
+            {
+                "enabled": True,
+                "models": [
+                    {"provider": "openai", "model": "gpt-4o-transcribe"},
+                    {
+                        "provider": "openrouter",
+                        "model": "openai/whisper-large-v3-turbo",
+                    },
+                ],
+            },
         )
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
@@ -1627,6 +1641,10 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                     auth_store = json.load(fh)
 
         self.assertEqual(config["agents"]["defaults"]["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(
+            config["agents"]["defaults"]["imageModel"],
+            {"primary": "openai/gpt-5.5"},
+        )
         self.assertEqual(
             config["auth"]["profiles"]["openai:owner@example.com"],
             {
@@ -1692,6 +1710,15 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertEqual(
             config["plugins"]["entries"]["codex-supervisor"], {"enabled": True}
         )
+        self.assertEqual(
+            config["tools"]["media"]["audio"]["models"],
+            [
+                {
+                    "provider": "openrouter",
+                    "model": "openai/whisper-large-v3-turbo",
+                }
+            ],
+        )
 
     def test_profile_without_provider_stays_on_default_config(self) -> None:
         """A saved profile is not enough if the provider plugin is unavailable."""
@@ -1746,12 +1773,45 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
         self.assertEqual(
             defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
         )
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertNotIn("codex", config["plugins"]["entries"])
         self.assertNotIn("codex-supervisor", config["plugins"]["entries"])
+
+    def test_platform_credit_route_configures_openrouter_audio_stt(self) -> None:
+        """Fresh Computers should use provider STT instead of local CLI audio.
+
+        OpenClaw auto-detects local whisper-style CLIs before some provider
+        fallbacks. Tinyhat-managed Computers already receive an OpenRouter key,
+        so generate an explicit provider transcription list and keep voice-note
+        UX off the slower terminal transcription path.
+        """
+        config = _write_config_in_temp_runtime(
+            _openrouter_binding(
+                {
+                    "default_model": "moonshotai/kimi-k2.6",
+                    "models": {"default": "moonshotai/kimi-k2.6"},
+                    "enabled_roles": ["default"],
+                }
+            )
+        )
+
+        self.assertEqual(
+            config["tools"]["media"]["audio"],
+            {
+                "enabled": True,
+                "models": [
+                    {
+                        "provider": "openrouter",
+                        "model": "openai/whisper-large-v3-turbo",
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("imageModel", config["agents"]["defaults"])
 
     def test_default_binding_uses_provider_runtime_policy(self) -> None:
         """Non-subscription Computers pin the provider runtime instead

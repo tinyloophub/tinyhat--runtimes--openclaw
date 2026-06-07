@@ -100,6 +100,8 @@ OPENROUTER_COMPLETION_TOKEN_CAP = 8192
 CHATGPT_SUBSCRIPTION_MODEL = "openai/gpt-5.5"
 CHATGPT_SUBSCRIPTION_PROVIDER = "openai"
 LEGACY_CHATGPT_SUBSCRIPTION_PROVIDER = "openai-codex"
+OPENAI_AUDIO_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+OPENROUTER_AUDIO_TRANSCRIPTION_MODEL = "openai/whisper-large-v3-turbo"
 CODEX_SUBSCRIPTION_PLUGIN_ID = "codex"
 CODEX_SUBSCRIPTION_PLUGIN_PACKAGE = "@openclaw/codex"
 CODEX_SUPERVISOR_PLUGIN_ID = "codex-supervisor"
@@ -1986,6 +1988,7 @@ def write_openclaw_config(
 
     openrouter_enabled = bool(openrouter_key and openrouter_base)
     model_package = openrouter_model_package() if openrouter_enabled else {}
+    current_secrets = read_tinyhat_secrets_file()
 
     # ── ChatGPT BYO subscription branch (issue #23) ─────────────────
     # The platform may advertise `llm_auth_mode = chatgpt_subscription`
@@ -2040,6 +2043,29 @@ def write_openclaw_config(
         # controller required.
         text_model_config["fallbacks"] = [openrouter_model_ref(openrouter_model)]
 
+    def media_audio_model_entries() -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        has_openai_auth = use_chatgpt_subscription or bool(
+            (current_secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip()
+        )
+        if has_openai_auth:
+            # User-owned OpenAI auth should pay for the primary media path.
+            # Keep the managed OpenRouter key as a later fallback only.
+            entries.append(
+                {
+                    "provider": "openai",
+                    "model": OPENAI_AUDIO_TRANSCRIPTION_MODEL,
+                }
+            )
+        if openrouter_enabled:
+            entries.append(
+                {
+                    "provider": "openrouter",
+                    "model": OPENROUTER_AUDIO_TRANSCRIPTION_MODEL,
+                }
+            )
+        return entries
+
     openai_plugin = {"enabled": True}
     plugin_entries = {
         "telegram": {"enabled": True},
@@ -2061,6 +2087,11 @@ def write_openclaw_config(
     agents_defaults: dict[str, object] = {
         "workspace": workspace_dir,
         "model": text_model_config,
+        **(
+            {"imageModel": {"primary": primary_model}}
+            if use_chatgpt_subscription
+            else {}
+        ),
         # Reserve reply headroom so auto-compaction can recover a turn instead
         # of failing with "Auto-compaction could not recover this turn." Without
         # a floor the gateway leaves no room after compacting and bails on every
@@ -2093,6 +2124,16 @@ def write_openclaw_config(
         },
         "session": {"dmScope": "per-channel-peer"},
     }
+    audio_models = media_audio_model_entries()
+    if audio_models:
+        config["tools"] = {
+            "media": {
+                "audio": {
+                    "enabled": True,
+                    "models": audio_models,
+                },
+            },
+        }
     if use_chatgpt_subscription and subscription_profile:
         subscription_profile_id = str(
             subscription_profile.get("__profile_id") or ""
@@ -2123,7 +2164,6 @@ def write_openclaw_config(
         config["agents"]["defaults"]["models"] = openrouter_enabled_model_catalog(
             model_package
         )
-    current_secrets = read_tinyhat_secrets_file()
     if not use_chatgpt_subscription:
         # Subscription mode owns its auth via the per-agent
         # `auth-profiles.json`; we explicitly leave the
