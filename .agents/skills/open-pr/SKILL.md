@@ -26,10 +26,10 @@ python3 scripts/check_dev_skills.py
 Add runtime checks from `define-tests` for any touched runtime surface.
 For provider plugins, ChatGPT subscription linking, software update,
 component restart, or `/restart`, the PR is not ready with unit-test-only
-evidence. Include the local Docker Computer proof and, when the user-visible
-path is Telegram-delivered, live Telegram proof up to the observable pass
-condition. For ChatGPT linking, that pass condition is a native sign-in
-button plus a separate bare device-code message; redact the actual code.
+evidence. Follow the repo-local `local-e2e` skill and include its evidence
+report when the user-visible path is Telegram-delivered. For ChatGPT linking,
+the minimum pass condition is a native sign-in button plus a separate bare
+device-code message; redact the actual code.
 
 ## PR Creation
 
@@ -46,7 +46,6 @@ The PR body should include:
 - What changed and why.
 - Runtime-vs-plugin boundary notes when plugin install behavior changes.
 - Exact verification commands and results.
-- Critical-path evidence for subscription/update/restart changes: runtime and
-  plugin SHAs or versions, dev Computer id, ordered runtime log lines, and
-  Telegram driver/chat used.
+- A `Local E2E:` report for provider auth, media, subscription, update, or
+  restart changes, following `.agents/skills/local-e2e/SKILL.md`.
 - Dependency links to Tinyloop monorepo or `tinyhat-ai/tinyhat` PRs when relevant.

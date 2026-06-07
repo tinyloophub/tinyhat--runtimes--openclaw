@@ -12,14 +12,16 @@ REQUIRED_SKILLS = (
     "codex",
     "commit",
     "define-tests",
+    "local-e2e",
     "open-pr",
     "review",
     "release",
     "sharpen-skill",
     "update-guidance",
 )
+RUNTIME_ONLY_SKILLS = ("local-e2e", "update-guidance")
 PARENT_ALIGNED_SKILLS = tuple(
-    skill for skill in REQUIRED_SKILLS if skill != "update-guidance"
+    skill for skill in REQUIRED_SKILLS if skill not in RUNTIME_ONLY_SKILLS
 )
 
 

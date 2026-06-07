@@ -30,6 +30,7 @@ From the repo root, the default parent path is `../../../.agents/skills`; from i
 | Codex GitHub identity/writeback | [codex](.agents/skills/codex/SKILL.md) |
 | Commit | [commit](.agents/skills/commit/SKILL.md) |
 | Pick tests | [define-tests](.agents/skills/define-tests/SKILL.md) |
+| Run local Telegram E2E | [local-e2e](.agents/skills/local-e2e/SKILL.md) |
 | Open a PR | [open-pr](.agents/skills/open-pr/SKILL.md) |
 | Review a PR | [review](.agents/skills/review/SKILL.md) |
 | Cut/check a release | [release](.agents/skills/release/SKILL.md) |
