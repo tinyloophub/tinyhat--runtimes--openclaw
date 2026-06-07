@@ -7,6 +7,8 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.12
+
 ### Fixed
 
 - Prefer user-owned OpenAI auth for Telegram media transcription and image
