@@ -56,9 +56,11 @@ backend therefore authenticates as nothing and is rejected.
 
 from __future__ import annotations
 
+import grp
 import json
 import logging
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -168,6 +170,8 @@ _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
 )
 TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
+TINYHAT_OPENCLAW_RUNTIME_USER_ENV = "TINYHAT_OPENCLAW_RUNTIME_USER"
+TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV = "TINYHAT_OPENCLAW_RUNTIME_GROUP"
 
 # Instance-metadata keys the platform writes at insert time and can
 # update later via ``compute.instances.setMetadata``. Both are
@@ -1225,15 +1229,72 @@ def try_install_tinyhat_plugin() -> bool:
         return False
 
 
-def _atomic_write_json(path: str, payload: dict, *, mode: int = 0o600) -> None:
+def _runtime_ownership_ids() -> tuple[int, int] | None:
+    """Return the gateway runtime uid/gid when this root process can chown."""
+    user = (os.environ.get(TINYHAT_OPENCLAW_RUNTIME_USER_ENV) or "").strip()
+    if not user:
+        return None
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    group = (
+        os.environ.get(TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV) or user
+    ).strip() or user
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError as exc:
+        log.warning(
+            "runtime ownership target is unavailable (%s=%s %s=%s): %s",
+            TINYHAT_OPENCLAW_RUNTIME_USER_ENV,
+            user,
+            TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV,
+            group,
+            exc,
+        )
+        return None
+    return uid, gid
+
+
+def _chown_runtime_owned_path(path: str) -> None:
+    ownership = _runtime_ownership_ids()
+    if ownership is None:
+        return
+    uid, gid = ownership
+    try:
+        os.chown(path, uid, gid)
+    except OSError as exc:
+        log.warning("failed to set runtime ownership on %s: %s", path, exc)
+
+
+def _prepare_runtime_owned_dir(path: str, *, mode: int = 0o700) -> None:
+    os.makedirs(path, mode=mode, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        log.warning("failed to chmod runtime-owned dir %s: %s", path, exc)
+    _chown_runtime_owned_path(path)
+
+
+def _atomic_write_json(
+    path: str,
+    payload: dict,
+    *,
+    mode: int = 0o600,
+    runtime_owned: bool = False,
+) -> None:
     parent = os.path.dirname(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if runtime_owned:
+        _prepare_runtime_owned_dir(parent)
+    else:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
             fh.write("\n")
         os.chmod(tmp, mode)
+        if runtime_owned:
+            _chown_runtime_owned_path(tmp)
         os.replace(tmp, path)
         os.chmod(path, mode)
     finally:
@@ -1391,7 +1452,7 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> bool:
     _sync_openai_api_key_ref(config, secrets)
     _apply_runtime_secret_env_block(config, secrets)
     current_env = dict(config.get("env") or {})
-    _atomic_write_json(config_path, config)
+    _atomic_write_json(config_path, config, runtime_owned=True)
     env_block_changed = previous_env != current_env
     log.info(
         "synced OpenClaw SecretRef config (provider=%s openai_ref=%s "
@@ -1431,7 +1492,7 @@ def write_tinyhat_secrets_file(secrets: dict[str, str]) -> None:
         if str(name).strip()
     }
     path = tinyhat_secrets_path()
-    _atomic_write_json(path, normalized)
+    _atomic_write_json(path, normalized, runtime_owned=True)
     log.info(
         "wrote Tinyhat runtime secrets file to %s (keys=%d)",
         path,
@@ -1785,13 +1846,7 @@ def normalize_chatgpt_subscription_profile_store(
         )
 
     data["profiles"] = profiles
-    tmp_path = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+    _atomic_write_json(path, data, runtime_owned=True)
     return sorted(profile_id_map.items())
 
 
@@ -1879,13 +1934,7 @@ def wipe_chatgpt_subscription_profile(
         return []
     version = data.get("version") if isinstance(data.get("version"), int) else 1
     next_data = {"version": version, "profiles": profiles}
-    tmp_path = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(next_data, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+    _atomic_write_json(path, next_data, runtime_owned=True)
     return removed
 
 
@@ -1907,9 +1956,9 @@ def write_openclaw_config(
     config_path = openclaw_config_path()
     state_dir = openclaw_state_dir()
     workspace_dir = openclaw_workspace_dir()
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    os.makedirs(state_dir, mode=0o700, exist_ok=True)
-    os.makedirs(workspace_dir, mode=0o700, exist_ok=True)
+    _prepare_runtime_owned_dir(os.path.dirname(config_path))
+    _prepare_runtime_owned_dir(state_dir)
+    _prepare_runtime_owned_dir(workspace_dir)
 
     # OpenRouter runtime config when the platform delivered it on
     # this binding. OpenClaw's OpenRouter provider reads
@@ -2180,7 +2229,7 @@ def write_openclaw_config(
         # the cross-provider fallback above has a working auth path.
         config["env"] = {TINYHAT_OPENROUTER_API_KEY_NAME: openrouter_key}
     _apply_runtime_secret_env_block(config, current_secrets)
-    _atomic_write_json(config_path, config)
+    _atomic_write_json(config_path, config, runtime_owned=True)
     # Log only non-secret summary; never log the API key or OAuth token.
     log.info(
         "wrote OpenClaw config to %s "

@@ -18,6 +18,27 @@ from unittest.mock import patch
 import supervisor
 
 
+def _runtime_repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _bootstrap_script_text() -> str:
+    with open(
+        os.path.join(_runtime_repo_root(), "bootstrap.sh"),
+        encoding="utf-8",
+    ) as fh:
+        return fh.read()
+
+
+def _bootstrap_unit_block(unit_var: str) -> str:
+    text = _bootstrap_script_text()
+    marker = f'cat > "${{{unit_var}}}" <<UNIT'
+    start = text.index(marker)
+    start = text.index("\n", start) + 1
+    end = text.index("\nUNIT", start)
+    return text[start:end]
+
+
 def _write_config_in_temp_runtime(
     binding: dict,
     *,
@@ -1362,6 +1383,109 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         # refreshed by `openclaw secrets reload`; the gateway must NOT restart.
         self.assertFalse(supervisor._stop_holder["rebind"])
         self.assertFalse(supervisor._stop_holder["stop"])
+
+
+class RuntimeOwnershipTests(unittest.TestCase):
+    def test_runtime_owned_json_write_chowns_parent_and_temp_before_replace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "openclaw.json")
+            chown_calls: list[tuple[str, int, int]] = []
+
+            def fake_chown(target: str, uid: int, gid: int) -> None:
+                chown_calls.append((target, uid, gid))
+
+            real_replace = supervisor.os.replace
+            replace_calls: list[tuple[str, str]] = []
+
+            def fake_replace(source: str, target: str) -> None:
+                replace_calls.append((source, target))
+                self.assertIn((source, 123, 456), chown_calls)
+                real_replace(source, target)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_USER_ENV: "tinyhat",
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV: "tinyhat",
+                    },
+                    clear=False,
+                ),
+                patch.object(supervisor.os, "geteuid", return_value=0),
+                patch.object(
+                    supervisor.pwd,
+                    "getpwnam",
+                    return_value=SimpleNamespace(pw_uid=123),
+                ),
+                patch.object(
+                    supervisor.grp,
+                    "getgrnam",
+                    return_value=SimpleNamespace(gr_gid=456),
+                ),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "replace", side_effect=fake_replace),
+            ):
+                supervisor._atomic_write_json(
+                    path,
+                    {"ok": True},
+                    runtime_owned=True,
+                )
+
+            self.assertEqual(chown_calls[0], (tmpdir, 123, 456))
+            self.assertEqual(len(replace_calls), 1)
+            self.assertEqual(replace_calls[0][1], path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_runtime_owned_json_write_does_not_chown_when_not_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "openclaw.json")
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_OPENCLAW_RUNTIME_USER_ENV: "tinyhat"},
+                    clear=False,
+                ),
+                patch.object(supervisor.os, "geteuid", return_value=501),
+                patch.object(supervisor.os, "chown") as chown,
+            ):
+                supervisor._atomic_write_json(
+                    path,
+                    {"ok": True},
+                    runtime_owned=True,
+                )
+
+            chown.assert_not_called()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_runtime_owned_json_write_does_not_chown_without_runtime_user(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "openclaw.json")
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_USER_ENV: "",
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV: "",
+                    },
+                    clear=False,
+                ),
+                patch.object(supervisor.os, "geteuid", return_value=0),
+                patch.object(supervisor.os, "chown") as chown,
+            ):
+                supervisor._atomic_write_json(
+                    path,
+                    {"ok": True},
+                    runtime_owned=True,
+                )
+
+            chown.assert_not_called()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
 def _subscription_binding(*, with_openrouter: bool) -> dict:
@@ -3123,6 +3247,77 @@ class CollectComponentVersionsTests(unittest.TestCase):
         self.assertEqual(
             components["framework"], {"version": "2026.5.28", "sha": None}
         )
+
+
+class BootstrapSystemdIsolationTests(unittest.TestCase):
+    def test_bootstrap_creates_unprivileged_runtime_user(self) -> None:
+        script = _bootstrap_script_text()
+
+        self.assertIn(
+            'TINYHAT_RUNTIME_USER="${TINYHAT_OPENCLAW_RUNTIME_USER:-tinyhat}"',
+            script,
+        )
+        self.assertIn(
+            'TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"',
+            script,
+        )
+        self.assertIn('groupadd --system "${TINYHAT_RUNTIME_GROUP}"', script)
+        self.assertIn('--gid "${TINYHAT_RUNTIME_GROUP}"', script)
+        self.assertIn('--home-dir "${OPENCLAW_STATE_DIR}"', script)
+        self.assertIn('chown -R \\', script)
+        self.assertIn('"${OPENCLAW_CONFIG_DIR}"', script)
+        self.assertIn('"${OPENCLAW_STATE_DIR}"', script)
+        # Bootstrap chowns once before install and again after plugin install,
+        # because npm/OpenClaw plugin commands can create root-owned state.
+        self.assertGreaterEqual(script.count("chown_runtime_paths"), 3)
+
+    def test_gateway_unit_is_bounded_unprivileged_workload(self) -> None:
+        unit = _bootstrap_unit_block("GATEWAY_UNIT")
+
+        for directive in (
+            "User=${TINYHAT_RUNTIME_USER}",
+            "Group=${TINYHAT_RUNTIME_GROUP}",
+            "UMask=0077",
+            "Slice=tinyhat-openclaw-workload.slice",
+            "MemoryAccounting=true",
+            "MemoryHigh=2400M",
+            "MemoryMax=3072M",
+            "CPUAccounting=true",
+            "CPUQuota=175%",
+            "TasksAccounting=true",
+            "TasksMax=512",
+            "OOMPolicy=stop",
+            "OOMScoreAdjust=500",
+            "Nice=5",
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "ProtectSystem=full",
+            "ProtectHome=true",
+            "ReadWritePaths=${OPENCLAW_CONFIG_DIR} ${OPENCLAW_STATE_DIR}",
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+        ):
+            self.assertIn(directive, unit)
+
+    def test_supervisor_unit_is_protected_control_plane(self) -> None:
+        unit = _bootstrap_unit_block("SUPERVISOR_UNIT")
+
+        for directive in (
+            "Environment=TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}",
+            "Environment=TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}",
+            "Slice=tinyhat-openclaw-control.slice",
+            "MemoryAccounting=true",
+            "MemoryHigh=512M",
+            "MemoryMax=1536M",
+            "CPUAccounting=true",
+            "CPUQuota=100%",
+            "TasksAccounting=true",
+            "TasksMax=512",
+            "OOMPolicy=continue",
+            "OOMScoreAdjust=-800",
+            "Restart=always",
+        ):
+            self.assertIn(directive, unit)
 
 
 class ComponentUpdateGatewayRestartTests(unittest.TestCase):

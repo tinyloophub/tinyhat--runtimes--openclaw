@@ -38,12 +38,15 @@ GATEWAY_UNIT="/etc/systemd/system/tinyhat-openclaw-gateway.service"
 RUNTIME_ENV_FILE="/etc/tinyhat/runtime.env"
 
 OPENCLAW_CONFIG_PATH="/etc/openclaw/openclaw.json"
+OPENCLAW_CONFIG_DIR="$(dirname "${OPENCLAW_CONFIG_PATH}")"
 OPENCLAW_STATE_DIR="/var/lib/tinyhat-openclaw"
 RUNTIME_BOOTSTRAP_STATUS_PATH="${OPENCLAW_STATE_DIR}/bootstrap-status.json"
 OPENCLAW_GATEWAY_PORT="18789"
 OPENCLAW_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-}"
 CODEX_SUBSCRIPTION_PLUGIN_PACKAGE="@openclaw/codex"
 PRIVATE_ACCESS_PROVIDER="${TINYHAT_PRIVATE_ACCESS_PROVIDER:-disabled}"
+TINYHAT_RUNTIME_USER="${TINYHAT_OPENCLAW_RUNTIME_USER:-tinyhat}"
+TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"
 
 echo "[tinyhat-runtime] bootstrap starting from ${RUNTIME_DIR}"
 
@@ -53,6 +56,29 @@ write_runtime_bootstrap_status() {
   mkdir -p "${OPENCLAW_STATE_DIR}"
   printf '{"provider":"openclaw","state":"%s","diagnostic":"%s"}\n' \
     "${state}" "${diagnostic}" > "${RUNTIME_BOOTSTRAP_STATUS_PATH}"
+}
+
+ensure_runtime_user() {
+  if ! getent group "${TINYHAT_RUNTIME_GROUP}" >/dev/null 2>&1; then
+    groupadd --system "${TINYHAT_RUNTIME_GROUP}"
+  fi
+  if ! id -u "${TINYHAT_RUNTIME_USER}" >/dev/null 2>&1; then
+    useradd \
+      --system \
+      --gid "${TINYHAT_RUNTIME_GROUP}" \
+      --home-dir "${OPENCLAW_STATE_DIR}" \
+      --shell /usr/sbin/nologin \
+      "${TINYHAT_RUNTIME_USER}"
+  fi
+}
+
+chown_runtime_paths() {
+  mkdir -p "${OPENCLAW_CONFIG_DIR}" "${OPENCLAW_STATE_DIR}"
+  chown -R \
+    "${TINYHAT_RUNTIME_USER}:${TINYHAT_RUNTIME_GROUP}" \
+    "${OPENCLAW_CONFIG_DIR}" \
+    "${OPENCLAW_STATE_DIR}"
+  chmod 0700 "${OPENCLAW_CONFIG_DIR}" "${OPENCLAW_STATE_DIR}"
 }
 
 verify_codex_subscription_plugin() {
@@ -79,7 +105,9 @@ node --version
 npm --version
 git --version
 
+ensure_runtime_user
 mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access
+chown_runtime_paths
 
 if [[ "${PRIVATE_ACCESS_PROVIDER}" == "tailscale" ]]; then
   TAILSCALE_AUTH_KEY="${TINYHAT_TAILSCALE_AUTH_KEY:-}"
@@ -159,6 +187,7 @@ else
   write_runtime_bootstrap_status "ready" "codex subscription plugin verify pending supervisor self-heal"
   echo "[tinyhat-runtime] WARNING: codex plugin is not registered yet; supervisor will retry during gateway boot" >&2
 fi
+chown_runtime_paths
 
 # Fallback runtime config. The supervisor prefers GCE instance
 # metadata (tinyhat-backend-audience / tinyhat-platform-base-url)
@@ -168,6 +197,8 @@ fi
   echo "TINYHAT_PLATFORM_BASE_URL=${TINYHAT_PLATFORM_BASE_URL:-}"
   echo "TINYHAT_PLATFORM_PLUGIN_REPO_URL=${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}"
   echo "TINYHAT_PLATFORM_PLUGIN_REPO_REF=${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}"
+  echo "TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}"
+  echo "TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}"
 } > "${RUNTIME_ENV_FILE}"
 chmod 0644 "${RUNTIME_ENV_FILE}"
 
@@ -183,11 +214,32 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=${TINYHAT_RUNTIME_USER}
+Group=${TINYHAT_RUNTIME_GROUP}
+UMask=0077
 Environment=OPENCLAW_CONFIG_PATH=${OPENCLAW_CONFIG_PATH}
 Environment=OPENCLAW_STATE_DIR=${OPENCLAW_STATE_DIR}
 Environment=HOME=${OPENCLAW_STATE_DIR}
 WorkingDirectory=${OPENCLAW_STATE_DIR}
 ExecStart=/usr/bin/env openclaw gateway run --force --allow-unconfigured --port ${OPENCLAW_GATEWAY_PORT} --bind loopback --auth none --tailscale off --verbose
+Slice=tinyhat-openclaw-workload.slice
+MemoryAccounting=true
+MemoryHigh=2400M
+MemoryMax=3072M
+CPUAccounting=true
+CPUQuota=175%
+TasksAccounting=true
+TasksMax=512
+OOMPolicy=stop
+OOMScoreAdjust=500
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=${OPENCLAW_CONFIG_DIR} ${OPENCLAW_STATE_DIR}
+CapabilityBoundingSet=
+AmbientCapabilities=
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
@@ -207,7 +259,19 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-${RUNTIME_ENV_FILE}
+Environment=TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}
+Environment=TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}
 ExecStart=/usr/bin/python3 ${SUPERVISOR_PATH}
+Slice=tinyhat-openclaw-control.slice
+MemoryAccounting=true
+MemoryHigh=512M
+MemoryMax=1536M
+CPUAccounting=true
+CPUQuota=100%
+TasksAccounting=true
+TasksMax=512
+OOMPolicy=continue
+OOMScoreAdjust=-800
 Restart=always
 RestartSec=10
 StandardOutput=journal
