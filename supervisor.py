@@ -1293,10 +1293,10 @@ def _atomic_write_json(
             json.dump(payload, fh, indent=2, sort_keys=True)
             fh.write("\n")
         os.chmod(tmp, mode)
+        if runtime_owned:
+            _chown_runtime_owned_path(tmp)
         os.replace(tmp, path)
         os.chmod(path, mode)
-        if runtime_owned:
-            _chown_runtime_owned_path(path)
     finally:
         try:
             if os.path.exists(tmp):
@@ -1846,14 +1846,7 @@ def normalize_chatgpt_subscription_profile_store(
         )
 
     data["profiles"] = profiles
-    tmp_path = path + ".tmp"
-    _prepare_runtime_owned_dir(os.path.dirname(path))
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
-    _chown_runtime_owned_path(path)
+    _atomic_write_json(path, data, runtime_owned=True)
     return sorted(profile_id_map.items())
 
 
@@ -1941,14 +1934,7 @@ def wipe_chatgpt_subscription_profile(
         return []
     version = data.get("version") if isinstance(data.get("version"), int) else 1
     next_data = {"version": version, "profiles": profiles}
-    tmp_path = path + ".tmp"
-    _prepare_runtime_owned_dir(os.path.dirname(path))
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(next_data, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
-    _chown_runtime_owned_path(path)
+    _atomic_write_json(path, next_data, runtime_owned=True)
     return removed
 
 

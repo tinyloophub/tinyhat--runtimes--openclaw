@@ -1386,13 +1386,23 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
 
 
 class RuntimeOwnershipTests(unittest.TestCase):
-    def test_runtime_owned_json_write_chowns_parent_and_file(self) -> None:
+    def test_runtime_owned_json_write_chowns_parent_and_temp_before_replace(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "openclaw.json")
             chown_calls: list[tuple[str, int, int]] = []
 
             def fake_chown(target: str, uid: int, gid: int) -> None:
                 chown_calls.append((target, uid, gid))
+
+            real_replace = supervisor.os.replace
+            replace_calls: list[tuple[str, str]] = []
+
+            def fake_replace(source: str, target: str) -> None:
+                replace_calls.append((source, target))
+                self.assertIn((source, 123, 456), chown_calls)
+                real_replace(source, target)
 
             with (
                 patch.dict(
@@ -1415,6 +1425,7 @@ class RuntimeOwnershipTests(unittest.TestCase):
                     return_value=SimpleNamespace(gr_gid=456),
                 ),
                 patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "replace", side_effect=fake_replace),
             ):
                 supervisor._atomic_write_json(
                     path,
@@ -1423,7 +1434,57 @@ class RuntimeOwnershipTests(unittest.TestCase):
                 )
 
             self.assertEqual(chown_calls[0], (tmpdir, 123, 456))
-            self.assertIn((path, 123, 456), chown_calls)
+            self.assertEqual(len(replace_calls), 1)
+            self.assertEqual(replace_calls[0][1], path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_runtime_owned_json_write_does_not_chown_when_not_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "openclaw.json")
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_OPENCLAW_RUNTIME_USER_ENV: "tinyhat"},
+                    clear=False,
+                ),
+                patch.object(supervisor.os, "geteuid", return_value=501),
+                patch.object(supervisor.os, "chown") as chown,
+            ):
+                supervisor._atomic_write_json(
+                    path,
+                    {"ok": True},
+                    runtime_owned=True,
+                )
+
+            chown.assert_not_called()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_runtime_owned_json_write_does_not_chown_without_runtime_user(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "openclaw.json")
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_USER_ENV: "",
+                        supervisor.TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV: "",
+                    },
+                    clear=False,
+                ),
+                patch.object(supervisor.os, "geteuid", return_value=0),
+                patch.object(supervisor.os, "chown") as chown,
+            ):
+                supervisor._atomic_write_json(
+                    path,
+                    {"ok": True},
+                    runtime_owned=True,
+                )
+
+            chown.assert_not_called()
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
