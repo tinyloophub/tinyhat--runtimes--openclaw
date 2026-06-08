@@ -7,6 +7,19 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.13
+
+### Fixed
+
+- Run the OpenClaw gateway as an unprivileged, bounded systemd workload while
+  keeping the Tinyhat supervisor protected enough to report, update, and
+  recover Computers when the gateway is stopped or OOM-killed.
+- Publish runtime-owned config, auth profile, and secret files with the correct
+  gateway-readable ownership atomically, so supervisor-written files are usable
+  by the non-root OpenClaw process immediately after restart.
+- This release pairs with the Tinyloop admin Computer recovery path in
+  tinyloophub/tinyloop#639. No Tinyhat plugin release is required.
+
 ## 0.11.12
 
 ### Fixed
