@@ -7,6 +7,14 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.11.14
+
+### Changed
+
+- Publish a no-op patch release to exercise Tinyhat's runtime Software update
+  flow against a fresh runtime version. No runtime behavior changes are
+  included in this release.
+
 ## 0.11.13
 
 ### Fixed
