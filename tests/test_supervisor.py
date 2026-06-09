@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import supervisor
 
@@ -360,6 +360,52 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
         self.assertIn("openclaw gateway failed to start", str(raised.exception))
         self.assertEqual(sleep.call_args_list, [])
 
+    def test_wait_keeps_90s_budget_and_checkpoints_while_openclaw_warms_up(
+        self,
+    ) -> None:
+        self.assertEqual(supervisor.OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS, 90)
+        now = [0.0]
+        probes = []
+
+        def fake_time() -> float:
+            return now[0]
+
+        def fake_sleep(seconds: float) -> None:
+            now[0] += 16 * seconds
+
+        def fake_probe(_started_at: float) -> tuple[bool, str]:
+            probes.append(now[0])
+            if len(probes) >= 4:
+                return True, "ok"
+            return False, "waiting for OpenClaw gateway ready"
+
+        with (
+            patch.object(supervisor.time, "time", side_effect=fake_time),
+            patch.object(supervisor.time, "sleep", side_effect=fake_sleep),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(
+                supervisor,
+                "probe_openclaw_gateway_health",
+                side_effect=fake_probe,
+            ),
+            patch.object(supervisor, "checkpoint_supervisor_progress") as checkpoint,
+        ):
+            supervisor.wait_for_openclaw_start(123.0)
+
+        self.assertEqual(
+            checkpoint.call_args_list,
+            [
+                call(
+                    "phase-c-openclaw-wait",
+                    inspect_gateway=True,
+                ),
+                call(
+                    "phase-c-openclaw-wait",
+                    inspect_gateway=True,
+                ),
+            ],
+        )
+
     def test_dev_health_probe_ignores_logs_before_current_gateway_start(
         self,
     ) -> None:
@@ -400,6 +446,13 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
 
 
 class SupervisorWatchdogContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._last_watchdog_checkpoint_ts = supervisor._last_watchdog_checkpoint_ts
+        supervisor._last_watchdog_checkpoint_ts = 0.0
+
+    def tearDown(self) -> None:
+        supervisor._last_watchdog_checkpoint_ts = self._last_watchdog_checkpoint_ts
+
     def test_ready_notification_does_not_feed_watchdog(self) -> None:
         with patch.object(
             supervisor,
@@ -430,6 +483,51 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertIn("WATCHDOG=1", message)
         self.assertIn("STATUS=checkpoint phase-d:-heartbeat-ok", message)
         self.assertNotIn("READY=1", message)
+
+    def test_watchdog_checkpoint_warns_when_gap_exceeds_target(self) -> None:
+        supervisor._last_watchdog_checkpoint_ts = 10.0
+        with (
+            patch.object(supervisor.time, "time", return_value=60.5),
+            patch.object(supervisor, "_sd_notify", return_value=True),
+            self.assertLogs("tinyhat-supervisor", level="WARNING") as logs,
+        ):
+            self.assertTrue(supervisor.notify_watchdog_checkpoint("late phase"))
+
+        self.assertIn("watchdog checkpoint gap exceeded", "\n".join(logs.output))
+        self.assertEqual(supervisor._last_watchdog_checkpoint_ts, 60.5)
+
+    def test_sd_notify_supports_abstract_namespace_socket(self) -> None:
+        events = []
+
+        class _FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def connect(self, address):
+                events.append(("connect", address))
+
+            def sendall(self, payload):
+                events.append(("sendall", payload))
+
+        with (
+            patch.dict(os.environ, {"NOTIFY_SOCKET": "@tinyhat-notify"}, clear=False),
+            patch.object(
+                supervisor.socket,
+                "socket",
+                return_value=_FakeSocket(),
+            ) as socket_ctor,
+        ):
+            self.assertTrue(supervisor._sd_notify("WATCHDOG=1"))
+
+        socket_ctor.assert_called_once_with(
+            supervisor.socket.AF_UNIX,
+            supervisor.socket.SOCK_DGRAM,
+        )
+        self.assertEqual(events[0], ("connect", "\0tinyhat-notify"))
+        self.assertEqual(events[1], ("sendall", b"WATCHDOG=1"))
 
     def test_progress_checkpoint_reads_locals_and_cgroup_before_notify(
         self,
@@ -527,6 +625,25 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertEqual(snapshot["memory_current_bytes"], 12345)
         self.assertEqual(snapshot["memory_max_bytes"], "max")
         self.assertEqual(snapshot["memory_events"]["oom_kill"], 1)
+
+    def test_gateway_cgroup_memory_snapshot_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(supervisor, "_dev_mode", return_value=False),
+                patch.object(
+                    supervisor,
+                    "_run_systemctl",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout="../../outside",
+                    ),
+                ),
+                patch.dict(os.environ, {"TINYHAT_CGROUP_ROOT": tmpdir}, clear=False),
+            ):
+                snapshot = supervisor.gateway_cgroup_memory_snapshot()
+
+        self.assertEqual(snapshot["available"], False)
+        self.assertEqual(snapshot["reason"], "invalid-control-group-path")
 
     def test_platform_http_timeouts_are_bounded(self) -> None:
         observed_timeouts = []

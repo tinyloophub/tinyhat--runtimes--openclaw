@@ -194,7 +194,9 @@ PLATFORM_REQUEST_TIMEOUT_SECONDS = 10
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5
 SYSTEMCTL_TIMEOUT_SECONDS = 20
 GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS = 30
-OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS = 30
+GATEWAY_CHILD_KILL_WAIT_TIMEOUT_SECONDS = 5
+OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS = 90
+OPENCLAW_GATEWAY_WAIT_CHECKPOINT_SECONDS = 15
 SUPERVISOR_LOOP_BUDGET_SECONDS = 75
 WATCHDOG_MAX_CHECKPOINT_GAP_SECONDS = 45
 OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS = 12
@@ -303,6 +305,7 @@ log = logging.getLogger("tinyhat-supervisor")
 
 _base_url_cache = {"value": None, "ts": 0.0}
 _audience_cache = {"value": None, "ts": 0.0}
+_last_watchdog_checkpoint_ts = 0.0
 
 
 def _read_metadata_value(key: str, timeout: int = 5) -> str:
@@ -487,9 +490,23 @@ def notify_supervisor_ready() -> bool:
 
 def notify_watchdog_checkpoint(checkpoint: str) -> bool:
     """Feed systemd's watchdog after a completed progress checkpoint."""
+    global _last_watchdog_checkpoint_ts
     safe_checkpoint = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", checkpoint).strip("-")
     if not safe_checkpoint:
         safe_checkpoint = "checkpoint"
+    now = time.time()
+    if (
+        _last_watchdog_checkpoint_ts
+        and now - _last_watchdog_checkpoint_ts > WATCHDOG_MAX_CHECKPOINT_GAP_SECONDS
+    ):
+        log.warning(
+            "watchdog checkpoint gap exceeded: %.1fs since previous checkpoint "
+            "(target <= %ss); checkpoint=%s",
+            now - _last_watchdog_checkpoint_ts,
+            WATCHDOG_MAX_CHECKPOINT_GAP_SECONDS,
+            safe_checkpoint,
+        )
+    _last_watchdog_checkpoint_ts = now
     return _sd_notify(f"WATCHDOG=1\nSTATUS=checkpoint {safe_checkpoint}")
 
 
@@ -2665,7 +2682,7 @@ def _stop_openclaw_gateway_dev() -> None:
         log.warning("dev: gateway did not exit on SIGTERM, sending SIGKILL")
         proc.kill()
         try:
-            proc.wait(timeout=GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS)
+            proc.wait(timeout=GATEWAY_CHILD_KILL_WAIT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             log.error("dev: gateway did not exit on SIGKILL either")
     _dev_gateway["proc"] = None
@@ -2758,7 +2775,19 @@ def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
 def wait_for_openclaw_start(started_at: float) -> None:
     """Wait until OpenClaw reports the gateway is healthy."""
     deadline = time.time() + OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS
+    last_checkpoint = time.time()
     last_probe = ""
+
+    def _checkpoint_if_due() -> None:
+        nonlocal last_checkpoint
+        now = time.time()
+        if now - last_checkpoint >= OPENCLAW_GATEWAY_WAIT_CHECKPOINT_SECONDS:
+            checkpoint_supervisor_progress(
+                "phase-c-openclaw-wait",
+                inspect_gateway=True,
+            )
+            last_checkpoint = now
+
     while time.time() < deadline:
         if not is_openclaw_gateway_active():
             ok, detail = probe_openclaw_gateway_health(started_at)
@@ -2773,6 +2802,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
                 else "systemd unit is not active"
             )
             last_probe = detail if detail else inactive_detail
+            _checkpoint_if_due()
             time.sleep(1)
             continue
         ok, detail = probe_openclaw_gateway_health(started_at)
@@ -2782,6 +2812,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
         if _is_openclaw_gateway_startup_failure(detail):
             raise RuntimeError("openclaw gateway failed to start: " + detail)
         last_probe = detail
+        _checkpoint_if_due()
         time.sleep(1)
     raise RuntimeError(
         "openclaw gateway did not become healthy within "
@@ -5120,6 +5151,8 @@ def _run_one_binding_cycle() -> int:
     heartbeat_thread.start()
 
     try:
+        # Systemd watchdog checkpoints are fed by the heartbeat thread above;
+        # keep this monitor loop bounded and non-blocking.
         inactive_for_seconds = 0
         while not _stop_holder["stop"]:
             if _stop_holder.get("component_update_restart"):
