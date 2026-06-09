@@ -147,12 +147,32 @@ no code at runtime; that matches prod.)
    `dev: starting OpenClaw gateway subprocess`, the readiness probe,
    the heartbeat ticks, the rebind watchdog — are what flow to
    `docker logs`.
-6. Supervisor waits for `[gateway] ready` + `[telegram] connected`
-   to gateway` log lines before writing local runtime health
+6. Supervisor waits for `[gateway] ready` +
+   `[telegram] connected to gateway` log lines before writing local runtime health
    `healthy` and POSTing lifecycle `state=active`.
 7. Supervisor heartbeats every 30s. A watchdog thread re-polls
    `/me/binding` and triggers rebind if the platform unassigns
    this Computer.
+
+## Manual recovery markers
+
+The supervisor writes local runtime health to
+`$TINYHAT_RUNTIME_HOME/tinyhat-control/runtime-state.json` in dev
+mode, mirroring the production control-plane path
+`/var/lib/tinyhat-control/runtime-state.json`.
+
+An operator can intentionally hold recovery by creating
+`$TINYHAT_RUNTIME_HOME/tinyhat-control/unrecoverable-manual`
+(`TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH` overrides the path). On the
+next binding cycle, the supervisor records runtime state
+`unrecoverable_manual`, reports lifecycle `broken`, and exits non-zero
+so the service manager owns backoff instead of hot-spinning.
+
+After completing manual repair, create
+`$TINYHAT_RUNTIME_HOME/tinyhat-control/clear-unrecoverable-manual`
+(`TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH` overrides the path). The
+supervisor consumes the clear marker, removes the manual marker if
+present, and resumes normal gateway recovery.
 
 When the container receives `SIGTERM` (`docker stop`), the
 supervisor stops the gateway subprocess cleanly and exits.

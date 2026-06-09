@@ -13,8 +13,8 @@ runtime's published `VERSION` on each new Computer row.
   persisted runtime state and current config fingerprint match, so supervisor
   restarts do not disrupt Telegram long polling.
 - Persist root-owned local runtime health state for gateway startup/reattach,
-  including `openclaw_not_ready` before bounded recovery and a manual-recovery
-  block for prior `unrecoverable_manual` state.
+  including `openclaw_not_ready` before bounded recovery and operator
+  marker/clear-marker handling for `unrecoverable_manual` state.
 
 ## 0.11.14
 

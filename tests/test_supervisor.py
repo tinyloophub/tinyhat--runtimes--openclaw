@@ -634,15 +634,65 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
         delete.assert_not_called()
         start.assert_not_called()
 
+    def test_manual_recovery_marker_writes_unrecoverable_manual_first(
+        self,
+    ) -> None:
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+        fingerprint = self._fingerprint()
+        writes: list[str] = []
+
+        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+            writes.append(state)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manual_marker_path = os.path.join(tmpdir, "unrecoverable-manual")
+            with open(manual_marker_path, "w", encoding="utf-8") as fh:
+                fh.write("operator requested manual recovery\n")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV: (
+                    manual_marker_path
+                ),
+                supervisor.TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV: os.path.join(
+                    tmpdir,
+                    "clear-unrecoverable-manual",
+                ),
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "read_runtime_state", return_value={}),
+                patch.object(
+                    supervisor, "is_openclaw_gateway_active", return_value=True
+                ),
+                patch.object(
+                    supervisor,
+                    "_write_runtime_state",
+                    side_effect=fake_write_runtime_state,
+                ),
+                patch.object(supervisor, "delete_telegram_webhook") as delete,
+                patch.object(supervisor, "start_openclaw_gateway") as start,
+            ):
+                with self.assertRaises(supervisor.ManualRecoveryRequired):
+                    supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
+
+        self.assertEqual(writes, ["unrecoverable_manual"])
+        delete.assert_not_called()
+        start.assert_not_called()
+
     def test_unrecoverable_manual_clear_marker_allows_recovery(self) -> None:
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint()
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            manual_marker_path = os.path.join(tmpdir, "unrecoverable-manual")
+            with open(manual_marker_path, "w", encoding="utf-8") as fh:
+                fh.write("manual recovery requested\n")
             marker_path = os.path.join(tmpdir, "clear-unrecoverable-manual")
             with open(marker_path, "w", encoding="utf-8") as fh:
                 fh.write("operator cleared\n")
             env = {
+                supervisor.TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV: (
+                    manual_marker_path
+                ),
                 supervisor.TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV: marker_path
             }
             with (
@@ -671,6 +721,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                 )
 
             self.assertFalse(os.path.exists(marker_path))
+            self.assertFalse(os.path.exists(manual_marker_path))
 
         self.assertEqual(result["action"], "started")
         delete.assert_called_once_with(binding)
@@ -2262,6 +2313,85 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                     "enable_codex_subscription_plugins": False,
                 }
             ],
+        )
+
+
+class BindingCycleManualRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update(
+            {
+                "stop": False,
+                "rebind": False,
+                "signature": None,
+                "owner_signature": None,
+            }
+        )
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_manual_recovery_returns_nonzero_to_avoid_outer_loop_spin(
+        self,
+    ) -> None:
+        binding = _subscription_binding(with_openrouter=True)
+        config_fingerprint = {
+            "algorithm": "sha256",
+            "source": "openclaw_config",
+            "path": "/etc/openclaw/openclaw.json",
+            "value": "test",
+        }
+
+        with (
+            patch.object(supervisor, "post_json", return_value={}) as post_json,
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={"assigned": True, "binding": binding},
+            ),
+            patch.object(
+                supervisor,
+                "try_install_codex_subscription_plugin",
+                return_value=True,
+            ),
+            patch.object(
+                supervisor,
+                "try_check_chatgpt_subscription_provider",
+                return_value=True,
+            ),
+            patch.object(supervisor, "try_install_tinyhat_plugin", return_value=True),
+            patch.object(supervisor, "write_openclaw_config"),
+            patch.object(
+                supervisor,
+                "_openclaw_config_fingerprint",
+                return_value=config_fingerprint,
+            ),
+            patch.object(
+                supervisor,
+                "ensure_openclaw_gateway_ready",
+                side_effect=supervisor.ManualRecoveryRequired(
+                    "manual recovery required; automatic gateway recovery blocked"
+                ),
+            ),
+            patch.object(supervisor, "checkpoint_supervisor_progress"),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gateway,
+        ):
+            self.assertEqual(supervisor._run_one_binding_cycle(), 1)
+
+        stop_gateway.assert_not_called()
+        post_json.assert_any_call(
+            "/hapi/v1/computers/me/state",
+            {"state": "ready", "detail": "bootstrap complete"},
+        )
+        post_json.assert_any_call(
+            "/hapi/v1/computers/me/state",
+            {
+                "state": "broken",
+                "detail": (
+                    "manual recovery required; automatic gateway recovery blocked"
+                ),
+            },
         )
 
 

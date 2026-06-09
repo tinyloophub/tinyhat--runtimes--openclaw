@@ -86,6 +86,9 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 _DEFAULT_RUNTIME_ENV_FILE = "/etc/tinyhat/runtime.env"
 _DEFAULT_RUNTIME_STATE_PATH = "/var/lib/tinyhat-control/runtime-state.json"
+_DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH = (
+    "/var/lib/tinyhat-control/unrecoverable-manual"
+)
 _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
     "/var/lib/tinyhat-control/clear-unrecoverable-manual"
 )
@@ -178,6 +181,9 @@ _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
 TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
 TINYHAT_RUNTIME_STATE_PATH_ENV = "TINYHAT_RUNTIME_STATE_PATH"
+TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV = (
+    "TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH"
+)
 TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV = (
     "TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH"
 )
@@ -284,6 +290,19 @@ def runtime_state_path() -> str:
             _runtime_home(), "tinyhat-control", "runtime-state.json"
         )
     return _DEFAULT_RUNTIME_STATE_PATH
+
+
+def runtime_state_manual_marker_path() -> str:
+    configured = (
+        os.environ.get(TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV) or ""
+    ).strip()
+    if configured:
+        return configured
+    if _dev_mode():
+        return os.path.join(
+            _runtime_home(), "tinyhat-control", "unrecoverable-manual"
+        )
+    return _DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH
 
 
 def runtime_state_clear_manual_path() -> str:
@@ -1564,6 +1583,10 @@ def _runtime_state_is_unrecoverable_manual(state: dict[str, Any]) -> bool:
     )
 
 
+def _runtime_manual_recovery_requested() -> bool:
+    return os.path.exists(runtime_state_manual_marker_path())
+
+
 def _consume_runtime_manual_clear_marker() -> bool:
     marker_path = runtime_state_clear_manual_path()
     if not os.path.exists(marker_path):
@@ -1575,10 +1598,20 @@ def _consume_runtime_manual_clear_marker() -> bool:
             "manual recovery clear marker exists but could not be consumed: "
             + str(exc)
         ) from exc
+    manual_marker_path = runtime_state_manual_marker_path()
+    try:
+        os.unlink(manual_marker_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ManualRecoveryRequired(
+            "manual recovery marker could not be cleared: " + str(exc)
+        ) from exc
     log.info(
         "manual recovery clear marker consumed; automatic recovery may resume "
-        "(marker=%s)",
+        "(marker=%s manual_marker=%s)",
         marker_path,
+        manual_marker_path,
     )
     return True
 
@@ -1602,6 +1635,7 @@ def _write_runtime_state(
         "detail": detail,
         "updated_at_unix": int(time.time()),
         "manual_recovery_required": state == "unrecoverable_manual",
+        "manual_recovery_marker_path": runtime_state_manual_marker_path(),
         "manual_recovery_clear_marker_path": runtime_state_clear_manual_path(),
         "gateway": {
             "unit": GATEWAY_SYSTEMD_UNIT,
@@ -2972,7 +3006,10 @@ def ensure_openclaw_gateway_ready(
 ) -> dict[str, Any]:
     """Reattach to a healthy matching gateway or restart it boundedly."""
     previous_state = read_runtime_state()
-    if _runtime_state_is_unrecoverable_manual(previous_state):
+    if (
+        _runtime_state_is_unrecoverable_manual(previous_state)
+        or _runtime_manual_recovery_requested()
+    ):
         if not _consume_runtime_manual_clear_marker():
             detail = "manual recovery required; automatic gateway recovery blocked"
             _write_runtime_state(
@@ -5241,7 +5278,7 @@ def _run_one_binding_cycle() -> int:
             "/hapi/v1/computers/me/state",
             {"state": "broken", "detail": str(exc)},
         )
-        return 0
+        return 1
     except Exception as exc:
         log.exception("OpenClaw gateway start failed: %s", exc)
         stop_openclaw_gateway()
