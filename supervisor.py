@@ -57,6 +57,7 @@ backend therefore authenticates as nothing and is rejected.
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import logging
 import os
@@ -85,6 +86,12 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 _DEFAULT_RUNTIME_ENV_FILE = "/etc/tinyhat/runtime.env"
 _DEFAULT_RUNTIME_STATE_PATH = "/var/lib/tinyhat-control/runtime-state.json"
+_DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH = (
+    "/var/lib/tinyhat-control/unrecoverable-manual"
+)
+_DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
+    "/var/lib/tinyhat-control/clear-unrecoverable-manual"
+)
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 # OpenRouter's catalog can report very large per-model completion ceilings
@@ -173,6 +180,13 @@ _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
 )
 TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
+TINYHAT_RUNTIME_STATE_PATH_ENV = "TINYHAT_RUNTIME_STATE_PATH"
+TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV = (
+    "TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH"
+)
+TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV = (
+    "TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH"
+)
 TINYHAT_OPENCLAW_RUNTIME_USER_ENV = "TINYHAT_OPENCLAW_RUNTIME_USER"
 TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV = "TINYHAT_OPENCLAW_RUNTIME_GROUP"
 
@@ -265,6 +279,43 @@ def tinyhat_secrets_path() -> str:
     return (
         os.environ.get("TINYHAT_SECRETS_PATH") or _DEFAULT_TINYHAT_SECRETS_PATH
     ).strip()
+
+
+def runtime_state_path() -> str:
+    configured = (os.environ.get(TINYHAT_RUNTIME_STATE_PATH_ENV) or "").strip()
+    if configured:
+        return configured
+    if _dev_mode():
+        return os.path.join(
+            _runtime_home(), "tinyhat-control", "runtime-state.json"
+        )
+    return _DEFAULT_RUNTIME_STATE_PATH
+
+
+def runtime_state_manual_marker_path() -> str:
+    configured = (
+        os.environ.get(TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV) or ""
+    ).strip()
+    if configured:
+        return configured
+    if _dev_mode():
+        return os.path.join(
+            _runtime_home(), "tinyhat-control", "unrecoverable-manual"
+        )
+    return _DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH
+
+
+def runtime_state_clear_manual_path() -> str:
+    configured = (
+        os.environ.get(TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV) or ""
+    ).strip()
+    if configured:
+        return configured
+    if _dev_mode():
+        return os.path.join(
+            _runtime_home(), "tinyhat-control", "clear-unrecoverable-manual"
+        )
+    return _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH
 
 
 def runtime_dir() -> str:
@@ -530,16 +581,13 @@ def _file_metadata_snapshot(path: str) -> dict[str, Any]:
 
 def local_watchdog_manifest_snapshot() -> dict[str, Any]:
     """Read local, non-secret config/manifest pointers for a checkpoint."""
-    runtime_state_path = (
-        os.environ.get("TINYHAT_RUNTIME_STATE_PATH") or _DEFAULT_RUNTIME_STATE_PATH
-    ).strip()
     return {
         "openclaw_config": _file_metadata_snapshot(openclaw_config_path()),
         "runtime_env": _file_metadata_snapshot(_DEFAULT_RUNTIME_ENV_FILE),
         "bootstrap_status": _file_metadata_snapshot(
             os.path.join(openclaw_state_dir(), "bootstrap-status.json")
         ),
-        "runtime_state": _file_metadata_snapshot(runtime_state_path),
+        "runtime_state": _file_metadata_snapshot(runtime_state_path()),
     }
 
 
@@ -1493,6 +1541,144 @@ def _atomic_write_json(
                 os.unlink(tmp)
         except OSError:
             pass
+
+
+class ManualRecoveryRequired(RuntimeError):
+    """Raised when persisted runtime state blocks automatic recovery."""
+
+
+def _prepare_control_plane_state_dir(path: str) -> None:
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError as exc:
+        log.warning("failed to chmod control-plane state dir %s: %s", path, exc)
+
+
+def read_runtime_state() -> dict[str, Any]:
+    path = runtime_state_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001 - corrupt state must not crash boot
+        log.warning("failed to read runtime state from %s: %s", path, exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _runtime_state_name(state: dict[str, Any]) -> str:
+    for key in ("state", "runtime_state", "health", "primary"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _runtime_state_is_unrecoverable_manual(state: dict[str, Any]) -> bool:
+    return (
+        _runtime_state_name(state) == "unrecoverable_manual"
+        or state.get("manual_recovery_required") is True
+    )
+
+
+def _runtime_manual_recovery_requested() -> bool:
+    return os.path.exists(runtime_state_manual_marker_path())
+
+
+def _consume_runtime_manual_clear_marker() -> bool:
+    marker_path = runtime_state_clear_manual_path()
+    if not os.path.exists(marker_path):
+        return False
+    try:
+        os.unlink(marker_path)
+    except OSError as exc:
+        raise ManualRecoveryRequired(
+            "manual recovery clear marker exists but could not be consumed: "
+            + str(exc)
+        ) from exc
+    manual_marker_path = runtime_state_manual_marker_path()
+    try:
+        os.unlink(manual_marker_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ManualRecoveryRequired(
+            "manual recovery marker could not be cleared: " + str(exc)
+        ) from exc
+    log.info(
+        "manual recovery clear marker consumed; automatic recovery may resume "
+        "(marker=%s manual_marker=%s)",
+        marker_path,
+        manual_marker_path,
+    )
+    return True
+
+
+def _write_runtime_state(
+    state: str,
+    detail: str,
+    *,
+    config_fingerprint: dict[str, str] | None = None,
+    gateway_active: bool | None = None,
+    gateway_action: str | None = None,
+    openclaw_ready: bool | None = None,
+) -> None:
+    path = runtime_state_path()
+    parent = os.path.dirname(path)
+    _prepare_control_plane_state_dir(parent)
+    payload: dict[str, Any] = {
+        "schema": "tinyhat_runtime_state_v1",
+        "schema_version": 1,
+        "state": state,
+        "detail": detail,
+        "updated_at_unix": int(time.time()),
+        "manual_recovery_required": state == "unrecoverable_manual",
+        "manual_recovery_marker_path": runtime_state_manual_marker_path(),
+        "manual_recovery_clear_marker_path": runtime_state_clear_manual_path(),
+        "gateway": {
+            "unit": GATEWAY_SYSTEMD_UNIT,
+        },
+        "openclaw": {},
+    }
+    if gateway_active is not None:
+        payload["gateway"]["active"] = bool(gateway_active)
+    if gateway_action:
+        payload["gateway"]["action"] = gateway_action
+    if openclaw_ready is not None:
+        payload["openclaw"]["ready"] = bool(openclaw_ready)
+    if config_fingerprint:
+        payload["config_fingerprint"] = dict(config_fingerprint)
+    _atomic_write_json(path, payload, mode=0o600)
+
+
+def _openclaw_config_fingerprint() -> dict[str, str]:
+    path = openclaw_config_path()
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "algorithm": "sha256",
+        "source": "openclaw_config",
+        "path": path,
+        "value": digest.hexdigest(),
+    }
+
+
+def _runtime_state_config_fingerprint_matches(
+    state: dict[str, Any],
+    desired: dict[str, str],
+) -> bool:
+    previous = state.get("config_fingerprint")
+    if not isinstance(previous, dict):
+        return False
+    return (
+        previous.get("algorithm") == desired.get("algorithm")
+        and previous.get("source") == desired.get("source")
+        and previous.get("value") == desired.get("value")
+    )
 
 
 def _secret_ref_for_openai_api_key() -> dict:
@@ -2721,42 +2907,24 @@ def is_openclaw_gateway_active() -> bool:
     )
 
 
-def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
-    """Inspect OpenClaw's logs for channel readiness.
-
-    ``openclaw gateway health --url ...`` requires explicit gateway
-    credentials even for this unauthenticated loopback setup, so the
-    readiness gate follows the gateway's own log output and waits
-    for the two lines that matter here: the gateway is ready and
-    Telegram is connected for long polling. In production those logs
-    flow through journald; in dev mode they go to a flat file.
-    """
-    if _dev_mode():
-        return _probe_openclaw_gateway_health_dev(started_at)
-    since = f"@{int(started_at)}"
-    try:
-        result = subprocess.run(
-            [
-                "journalctl",
-                "-u",
-                GATEWAY_SYSTEMD_UNIT,
-                "--since",
-                since,
-                "--no-pager",
-                "-n",
-                "300",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=GATEWAY_HEALTH_TIMEOUT_SECONDS,
+def _openclaw_gateway_current_journal_since() -> str | None:
+    for prop in ("ExecMainStartTimestamp", "ActiveEnterTimestamp"):
+        result = _run_systemctl(
+            "show",
+            GATEWAY_SYSTEMD_UNIT,
+            f"--property={prop}",
+            "--value",
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return False, "journalctl readiness probe timed out"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        return False, detail or f"journalctl exited {result.returncode}"
-    logs = result.stdout or ""
+        if result.returncode != 0:
+            continue
+        value = (result.stdout or "").strip()
+        if value and value.lower() != "n/a":
+            return value
+    return None
+
+
+def _openclaw_gateway_readiness_from_logs(logs: str) -> tuple[bool, str]:
     startup_failure = _openclaw_gateway_startup_failure_from_logs(logs)
     if startup_failure:
         return False, startup_failure
@@ -2770,6 +2938,152 @@ def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
     if not telegram_connected:
         missing.append("telegram connected")
     return False, "waiting for OpenClaw " + ", ".join(missing)
+
+
+def _probe_openclaw_gateway_health_journal(
+    *,
+    since: str | None,
+    tail_lines: int | None,
+) -> tuple[bool, str]:
+    cmd = [
+        "journalctl",
+        "-u",
+        GATEWAY_SYSTEMD_UNIT,
+        "--no-pager",
+    ]
+    if since:
+        cmd.extend(["--since", since])
+    if tail_lines is not None:
+        cmd.extend(["-n", str(tail_lines)])
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=GATEWAY_HEALTH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "journalctl readiness probe timed out"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, detail or f"journalctl exited {result.returncode}"
+    return _openclaw_gateway_readiness_from_logs(result.stdout or "")
+
+
+def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
+    """Inspect OpenClaw's logs for channel readiness.
+
+    ``openclaw gateway health --url ...`` requires explicit gateway
+    credentials even for this unauthenticated loopback setup, so the
+    readiness gate follows the gateway's own log output and waits
+    for the two lines that matter here: the gateway is ready and
+    Telegram is connected for long polling. In production those logs
+    flow through journald; in dev mode they go to a flat file.
+    """
+    if _dev_mode():
+        return _probe_openclaw_gateway_health_dev(started_at)
+    return _probe_openclaw_gateway_health_journal(
+        since=f"@{int(started_at)}",
+        tail_lines=300,
+    )
+
+
+def probe_current_openclaw_gateway_health() -> tuple[bool, str]:
+    """Probe readiness for the already-running gateway process."""
+    if _dev_mode():
+        return _probe_openclaw_gateway_health_dev(time.time())
+    since = _openclaw_gateway_current_journal_since()
+    return _probe_openclaw_gateway_health_journal(
+        since=since,
+        tail_lines=None if since else 1000,
+    )
+
+
+def ensure_openclaw_gateway_ready(
+    binding: dict,
+    config_fingerprint: dict[str, str],
+) -> dict[str, Any]:
+    """Reattach to a healthy matching gateway or restart it boundedly."""
+    previous_state = read_runtime_state()
+    if (
+        _runtime_state_is_unrecoverable_manual(previous_state)
+        or _runtime_manual_recovery_requested()
+    ):
+        if not _consume_runtime_manual_clear_marker():
+            detail = "manual recovery required; automatic gateway recovery blocked"
+            _write_runtime_state(
+                "unrecoverable_manual",
+                detail,
+                config_fingerprint=config_fingerprint,
+                gateway_active=is_openclaw_gateway_active(),
+                gateway_action="blocked",
+                openclaw_ready=False,
+            )
+            raise ManualRecoveryRequired(detail)
+
+    if is_openclaw_gateway_active():
+        ok, detail = probe_current_openclaw_gateway_health()
+        fingerprint_matches = _runtime_state_config_fingerprint_matches(
+            previous_state,
+            config_fingerprint,
+        )
+        if ok and fingerprint_matches:
+            log.info(
+                "reattaching to healthy OpenClaw gateway without restart "
+                "(bot=@%s owner=%s)",
+                binding.get("telegram_bot_username"),
+                binding.get("telegram_owner_user_id"),
+            )
+            _write_runtime_state(
+                "healthy",
+                "openclaw gateway reattached",
+                config_fingerprint=config_fingerprint,
+                gateway_active=True,
+                gateway_action="reattached",
+                openclaw_ready=True,
+            )
+            return {
+                "action": "reattached",
+                "started_at": None,
+                "detail": "openclaw gateway reattached",
+            }
+        if not ok:
+            log.warning(
+                "OpenClaw gateway active but not ready; attempting bounded "
+                "restart: %s",
+                detail,
+            )
+            _write_runtime_state(
+                "openclaw_not_ready",
+                detail,
+                config_fingerprint=config_fingerprint,
+                gateway_active=True,
+                gateway_action="restart",
+                openclaw_ready=False,
+            )
+        else:
+            log.info(
+                "OpenClaw gateway is healthy but config fingerprint changed; "
+                "restarting to apply current binding"
+            )
+
+    delete_telegram_webhook(binding)
+    started_at = start_openclaw_gateway(binding)
+    wait_for_openclaw_start(started_at)
+    _write_runtime_state(
+        "healthy",
+        "openclaw gateway started",
+        config_fingerprint=config_fingerprint,
+        gateway_active=True,
+        gateway_action="started",
+        openclaw_ready=True,
+    )
+    return {
+        "action": "started",
+        "started_at": started_at,
+        "detail": "openclaw gateway started",
+    }
 
 
 def wait_for_openclaw_start(started_at: float) -> None:
@@ -4942,13 +5256,29 @@ def _run_one_binding_cycle() -> int:
             enable_chatgpt_subscription_provider=chatgpt_subscription_provider_available,
             enable_codex_subscription_plugins=codex_subscription_plugin_installed,
         )
-        delete_telegram_webhook(binding)
-        gateway_started_at = start_openclaw_gateway(binding)
-        wait_for_openclaw_start(gateway_started_at)
+        gateway_result = ensure_openclaw_gateway_ready(
+            binding,
+            _openclaw_config_fingerprint(),
+        )
         checkpoint_supervisor_progress(
-            "phase-c-gateway-started",
+            (
+                "phase-c-gateway-reattached"
+                if gateway_result["action"] == "reattached"
+                else "phase-c-gateway-started"
+            ),
             inspect_gateway=True,
         )
+    except ManualRecoveryRequired as exc:
+        log.error("OpenClaw gateway automatic recovery blocked: %s", exc)
+        checkpoint_supervisor_progress(
+            "phase-c-manual-recovery-required",
+            inspect_gateway=True,
+        )
+        post_json(
+            "/hapi/v1/computers/me/state",
+            {"state": "broken", "detail": str(exc)},
+        )
+        return 1
     except Exception as exc:
         log.exception("OpenClaw gateway start failed: %s", exc)
         stop_openclaw_gateway()
@@ -4961,7 +5291,7 @@ def _run_one_binding_cycle() -> int:
     try:
         post_json(
             "/hapi/v1/computers/me/state",
-            {"state": "active", "detail": "openclaw gateway started"},
+            {"state": "active", "detail": gateway_result["detail"]},
         )
         log.info("reported state=active")
         checkpoint_supervisor_progress(
