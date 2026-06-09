@@ -64,6 +64,7 @@ import pwd
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -82,6 +83,8 @@ _DEFAULT_OPENCLAW_CONFIG_PATH = "/etc/openclaw/openclaw.json"
 _DEFAULT_OPENCLAW_STATE_DIR = "/var/lib/tinyhat-openclaw"
 _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
+_DEFAULT_RUNTIME_ENV_FILE = "/etc/tinyhat/runtime.env"
+_DEFAULT_RUNTIME_STATE_PATH = "/var/lib/tinyhat-control/runtime-state.json"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 # OpenRouter's catalog can report very large per-model completion ceilings
@@ -186,6 +189,14 @@ BINDING_POLL_BASE_SECONDS = 3
 BINDING_POLL_IDLE_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
+GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS = 5
+PLATFORM_REQUEST_TIMEOUT_SECONDS = 10
+GATEWAY_HEALTH_TIMEOUT_SECONDS = 5
+SYSTEMCTL_TIMEOUT_SECONDS = 20
+GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS = 30
+OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS = 30
+SUPERVISOR_LOOP_BUDGET_SECONDS = 75
+WATCHDOG_MAX_CHECKPOINT_GAP_SECONDS = 45
 OPENCLAW_SECRETS_RELOAD_TIMEOUT_SECONDS = 12
 OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (5, 10, 20, 30, 30)
 OPENCLAW_SECRETS_RELOAD_ATTEMPTS = (
@@ -402,7 +413,10 @@ def fetch_identity_token() -> str:
         f"?audience={audience}&format=full"
     )
     req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(
+        req,
+        timeout=GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS,
+    ) as resp:
         return resp.read().decode("utf-8").strip()
 
 
@@ -418,7 +432,10 @@ def post_json(path: str, body: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(
+        req,
+        timeout=PLATFORM_REQUEST_TIMEOUT_SECONDS,
+    ) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
@@ -430,8 +447,164 @@ def get_json(path: str) -> dict:
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(
+        req,
+        timeout=PLATFORM_REQUEST_TIMEOUT_SECONDS,
+    ) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _sd_notify(message: str) -> bool:
+    """Send a best-effort systemd notification datagram.
+
+    Python's stdlib has no sd_notify wrapper, but the protocol is a
+    single datagram to ``NOTIFY_SOCKET``. Missing or unreachable
+    sockets are non-fatal so dev mode and non-systemd tests keep the
+    same control flow as production.
+    """
+    notify_socket = (os.environ.get("NOTIFY_SOCKET") or "").strip()
+    if not notify_socket:
+        return False
+    address: str
+    if notify_socket.startswith("@"):
+        address = "\0" + notify_socket[1:]
+    else:
+        address = notify_socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(message.encode("utf-8"))
+    except OSError as exc:
+        log.warning("systemd notify failed: %s", exc)
+        return False
+    return True
+
+
+def notify_supervisor_ready() -> bool:
+    """Mark the notify-type supervisor unit ready without feeding watchdog."""
+    return _sd_notify("READY=1\nSTATUS=supervisor ready")
+
+
+def notify_watchdog_checkpoint(checkpoint: str) -> bool:
+    """Feed systemd's watchdog after a completed progress checkpoint."""
+    safe_checkpoint = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", checkpoint).strip("-")
+    if not safe_checkpoint:
+        safe_checkpoint = "checkpoint"
+    return _sd_notify(f"WATCHDOG=1\nSTATUS=checkpoint {safe_checkpoint}")
+
+
+def _file_metadata_snapshot(path: str) -> dict[str, Any]:
+    """Return non-secret local file metadata for watchdog diagnostics."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return {"present": False}
+    except Exception as exc:
+        return {"present": None, "error": exc.__class__.__name__}
+    return {
+        "present": True,
+        "mode": oct(st.st_mode & 0o777),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "size_bytes": st.st_size,
+        "mtime_seconds": int(st.st_mtime),
+    }
+
+
+def local_watchdog_manifest_snapshot() -> dict[str, Any]:
+    """Read local, non-secret config/manifest pointers for a checkpoint."""
+    runtime_state_path = (
+        os.environ.get("TINYHAT_RUNTIME_STATE_PATH") or _DEFAULT_RUNTIME_STATE_PATH
+    ).strip()
+    return {
+        "openclaw_config": _file_metadata_snapshot(openclaw_config_path()),
+        "runtime_env": _file_metadata_snapshot(_DEFAULT_RUNTIME_ENV_FILE),
+        "bootstrap_status": _file_metadata_snapshot(
+            os.path.join(openclaw_state_dir(), "bootstrap-status.json")
+        ),
+        "runtime_state": _file_metadata_snapshot(runtime_state_path),
+    }
+
+
+def _read_int_file(path: str) -> int | str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = fh.read().strip()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    if value == "max":
+        return "max"
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def gateway_cgroup_memory_snapshot() -> dict[str, Any]:
+    """Best-effort gateway cgroup memory read for watchdog checkpoints."""
+    if _dev_mode():
+        return {"available": False, "reason": "dev-mode"}
+    result = _run_systemctl(
+        "show",
+        GATEWAY_SYSTEMD_UNIT,
+        "--property=ControlGroup",
+        "--value",
+        check=False,
+    )
+    if result.returncode != 0:
+        return {"available": False, "reason": "systemctl-show-failed"}
+    control_group = (result.stdout or "").strip()
+    if not control_group:
+        return {"available": False, "reason": "no-control-group"}
+    cgroup_root = (
+        os.environ.get("TINYHAT_CGROUP_ROOT") or "/sys/fs/cgroup"
+    ).rstrip("/")
+    cgroup_path = os.path.normpath(
+        os.path.join(cgroup_root, control_group.lstrip("/"))
+    )
+    root_prefix = os.path.normpath(cgroup_root) + os.sep
+    if not (cgroup_path + os.sep).startswith(root_prefix):
+        return {"available": False, "reason": "invalid-control-group-path"}
+    snapshot: dict[str, Any] = {
+        "available": True,
+        "control_group": control_group,
+        "memory_current_bytes": _read_int_file(
+            os.path.join(cgroup_path, "memory.current")
+        ),
+        "memory_max_bytes": _read_int_file(os.path.join(cgroup_path, "memory.max")),
+    }
+    events_path = os.path.join(cgroup_path, "memory.events.local")
+    events: dict[str, int] = {}
+    try:
+        with open(events_path, encoding="utf-8") as fh:
+            for line in fh:
+                key, _, raw_value = line.strip().partition(" ")
+                if key and raw_value:
+                    try:
+                        events[key] = int(raw_value)
+                    except ValueError:
+                        continue
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        snapshot["events_error"] = exc.__class__.__name__
+    if events:
+        snapshot["memory_events"] = events
+    return snapshot
+
+
+def checkpoint_supervisor_progress(
+    checkpoint: str,
+    *,
+    inspect_gateway: bool = False,
+) -> bool:
+    """Complete the local checkpoint reads before feeding systemd watchdog."""
+    local_watchdog_manifest_snapshot()
+    if inspect_gateway:
+        gateway_cgroup_memory_snapshot()
+    return notify_watchdog_checkpoint(checkpoint)
 
 
 def private_access_report() -> dict | None:
@@ -2292,7 +2465,35 @@ def delete_telegram_webhook(binding: dict) -> None:
 
 
 def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(["systemctl", *args], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["systemctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if not check:
+            return subprocess.CompletedProcess(
+                ["systemctl", *args],
+                124,
+                stdout="",
+                stderr="timed out",
+            )
+        raise RuntimeError(
+            "systemctl " + " ".join(args) + " timed out"
+        ) from exc
+    except OSError as exc:
+        if not check:
+            return subprocess.CompletedProcess(
+                ["systemctl", *args],
+                127,
+                stdout="",
+                stderr=str(exc),
+            )
+        raise RuntimeError(
+            "systemctl " + " ".join(args) + " failed: " + str(exc)
+        ) from exc
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError("systemctl " + " ".join(args) + " failed: " + detail)
@@ -2459,12 +2660,12 @@ def _stop_openclaw_gateway_dev() -> None:
         _dev_gateway["proc"] = None
         return
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         log.warning("dev: gateway did not exit on SIGTERM, sending SIGKILL")
         proc.kill()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             log.error("dev: gateway did not exit on SIGKILL either")
     _dev_gateway["proc"] = None
@@ -2530,7 +2731,7 @@ def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=GATEWAY_HEALTH_TIMEOUT_SECONDS,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -2556,7 +2757,7 @@ def probe_openclaw_gateway_health(started_at: float) -> tuple[bool, str]:
 
 def wait_for_openclaw_start(started_at: float) -> None:
     """Wait until OpenClaw reports the gateway is healthy."""
-    deadline = time.time() + 90
+    deadline = time.time() + OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS
     last_probe = ""
     while time.time() < deadline:
         if not is_openclaw_gateway_active():
@@ -2583,7 +2784,8 @@ def wait_for_openclaw_start(started_at: float) -> None:
         last_probe = detail
         time.sleep(1)
     raise RuntimeError(
-        "openclaw gateway did not become healthy within 90s"
+        "openclaw gateway did not become healthy within "
+        f"{OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS}s"
         + (f": {last_probe}" if last_probe else "")
     )
 
@@ -4555,6 +4757,7 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+    notify_supervisor_ready()
 
     # Outer rebind loop: every iteration is one full
     # bind->active->OpenClaw cycle. The heartbeat watchdog flips
@@ -4601,6 +4804,7 @@ def _run_one_binding_cycle() -> int:
                 {"state": "ready", "detail": "bootstrap complete"},
             )
             log.info("reported state=ready (attempt %d)", attempt)
+            checkpoint_supervisor_progress("phase-a-ready-post")
             break
         except urllib.error.HTTPError as http_exc:
             if http_exc.code == 400:
@@ -4609,12 +4813,14 @@ def _run_one_binding_cycle() -> int:
                     "(status 400) — row is likely already past "
                     "provisioning. Proceeding to Phase B."
                 )
+                checkpoint_supervisor_progress("phase-a-ready-refused")
                 break
             log.warning(
                 "initial /me/state ready POST failed (attempt %d): %s",
                 attempt,
                 http_exc,
             )
+            checkpoint_supervisor_progress("phase-a-ready-post-failed")
             time.sleep(min(2 * attempt, 30))
         except Exception as exc:
             log.warning(
@@ -4622,6 +4828,7 @@ def _run_one_binding_cycle() -> int:
                 attempt,
                 exc,
             )
+            checkpoint_supervisor_progress("phase-a-ready-post-failed")
             time.sleep(min(2 * attempt, 30))
 
     # Phase B: poll for binding
@@ -4638,10 +4845,12 @@ def _run_one_binding_cycle() -> int:
             resp = get_json("/hapi/v1/computers/me/binding")
         except Exception as exc:
             log.warning("/me/binding GET failed: %s", exc)
+            checkpoint_supervisor_progress("phase-b-binding-get-failed")
             time.sleep(poll)
             continue
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
+            checkpoint_supervisor_progress("phase-b-binding-assigned")
             break
         # Cold-start owner-release (Codex 01:19Z + 01:32Z reviews —
         # two attack paths that share the same root cause).
@@ -4682,6 +4891,7 @@ def _run_one_binding_cycle() -> int:
         empty_count += 1
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS
+        checkpoint_supervisor_progress("phase-b-binding-empty")
         time.sleep(poll)
     if _stop_holder["stop"]:
         return 0
@@ -4704,6 +4914,10 @@ def _run_one_binding_cycle() -> int:
         delete_telegram_webhook(binding)
         gateway_started_at = start_openclaw_gateway(binding)
         wait_for_openclaw_start(gateway_started_at)
+        checkpoint_supervisor_progress(
+            "phase-c-gateway-started",
+            inspect_gateway=True,
+        )
     except Exception as exc:
         log.exception("OpenClaw gateway start failed: %s", exc)
         stop_openclaw_gateway()
@@ -4719,6 +4933,10 @@ def _run_one_binding_cycle() -> int:
             {"state": "active", "detail": "openclaw gateway started"},
         )
         log.info("reported state=active")
+        checkpoint_supervisor_progress(
+            "phase-c-active-post",
+            inspect_gateway=True,
+        )
     except Exception as exc:
         log.exception("active /me/state POST failed: %s", exc)
 
@@ -4746,26 +4964,52 @@ def _run_one_binding_cycle() -> int:
     def _heartbeat_loop():
         while not _stop_holder["stop"]:
             gateway_alive = is_openclaw_gateway_active()
+            local_manifest = local_watchdog_manifest_snapshot()
+            gateway_cgroup = gateway_cgroup_memory_snapshot()
+            component_versions = collect_component_versions()
             metrics = {
                 "gateway_alive": gateway_alive,
                 "supervisor_uptime_seconds": int(time.time()),
+                "watchdog": {
+                    "loop_budget_seconds": SUPERVISOR_LOOP_BUDGET_SECONDS,
+                    "max_checkpoint_gap_seconds": WATCHDOG_MAX_CHECKPOINT_GAP_SECONDS,
+                    "local_manifest": local_manifest,
+                    "gateway_cgroup": gateway_cgroup,
+                },
             }
             private_access = private_access_report()
             if private_access is not None:
                 metrics["private_access"] = private_access
+            heartbeat_status = "not_attempted"
+            binding_status = "not_attempted"
+            active_reconfirm_status = "not_attempted"
+            command = None
             try:
                 heartbeat = post_json(
                     "/hapi/v1/computers/me/heartbeat",
                     {
                         "metrics": metrics,
-                        "component_versions": collect_component_versions(),
+                        "component_versions": component_versions,
                     },
                 )
-                command = heartbeat.get("command") if isinstance(heartbeat, dict) else None
-                if isinstance(command, dict):
-                    handle_heartbeat_command(command, binding=binding)
+                heartbeat_status = "ok"
+                command = (
+                    heartbeat.get("command")
+                    if isinstance(heartbeat, dict)
+                    else None
+                )
             except Exception as exc:
+                heartbeat_status = exc.__class__.__name__
                 log.warning("/me/heartbeat POST failed: %s", exc)
+            log.info(
+                "watchdog checkpoint phase-d-platform-heartbeat: "
+                "gateway_alive=%s heartbeat=%s",
+                gateway_alive,
+                heartbeat_status,
+            )
+            notify_watchdog_checkpoint("phase-d-platform-heartbeat")
+            if isinstance(command, dict):
+                handle_heartbeat_command(command, binding=binding)
             # Watchdog: did the platform unassign us OR swap the
             # binding under us? Both cases must trigger rebind. The
             # unassign + immediate reassign path can land inside the
@@ -4779,6 +5023,7 @@ def _run_one_binding_cycle() -> int:
             # in.
             try:
                 resp = get_json("/hapi/v1/computers/me/binding")
+                binding_status = "ok"
                 if resp.get("assigned") is False:
                     log.info(
                         "binding watchdog: platform reports assigned=false; "
@@ -4793,6 +5038,7 @@ def _run_one_binding_cycle() -> int:
                     _wipe_on_owner_release(reason="unassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
+                    notify_watchdog_checkpoint("phase-d-rebind-unassigned")
                     return
                 new_binding = resp.get("binding") or {}
                 new_sig = _binding_signature(new_binding)
@@ -4817,11 +5063,13 @@ def _run_one_binding_cycle() -> int:
                         _wipe_on_owner_release(reason="reassign")
                     _stop_holder["rebind"] = True
                     _stop_holder["stop"] = True
+                    notify_watchdog_checkpoint("phase-d-rebind-identity-changed")
                     return
             except Exception as exc:
                 # Transient — don't trip rebind on a single GET
                 # failure (the rest of the loop stays alive while the
                 # platform comes back).
+                binding_status = exc.__class__.__name__
                 log.warning("/me/binding watchdog GET failed: %s", exc)
 
             # Idempotent state=active re-confirm. After a SAME-bot
@@ -4838,6 +5086,7 @@ def _run_one_binding_cycle() -> int:
                     "/hapi/v1/computers/me/state",
                     {"state": "active", "detail": "watchdog re-confirm"},
                 )
+                active_reconfirm_status = "ok"
                 log.info(
                     "watchdog: re-confirmed state=active (row was in assigned "
                     "after a reassign)"
@@ -4847,8 +5096,21 @@ def _run_one_binding_cycle() -> int:
                     log.warning(
                         "watchdog state=active POST failed: %s", http_exc
                     )
+                    active_reconfirm_status = f"HTTPError:{http_exc.code}"
+                else:
+                    active_reconfirm_status = "already-active"
             except Exception as exc:
+                active_reconfirm_status = exc.__class__.__name__
                 log.warning("watchdog state=active POST failed: %s", exc)
+            log.info(
+                "watchdog checkpoint phase-d-heartbeat: gateway_alive=%s "
+                "heartbeat=%s binding=%s active_reconfirm=%s",
+                gateway_alive,
+                heartbeat_status,
+                binding_status,
+                active_reconfirm_status,
+            )
+            notify_watchdog_checkpoint("phase-d-heartbeat")
             for _ in range(HEARTBEAT_INTERVAL_SECONDS):
                 if _stop_holder["stop"]:
                     return

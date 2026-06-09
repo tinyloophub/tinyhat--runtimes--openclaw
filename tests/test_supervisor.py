@@ -399,6 +399,225 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
             supervisor._dev_gateway.update(previous_gateway)
 
 
+class SupervisorWatchdogContractTests(unittest.TestCase):
+    def test_ready_notification_does_not_feed_watchdog(self) -> None:
+        with patch.object(
+            supervisor,
+            "_sd_notify",
+            return_value=True,
+        ) as sd_notify:
+            self.assertTrue(supervisor.notify_supervisor_ready())
+
+        sd_notify.assert_called_once()
+        message = sd_notify.call_args.args[0]
+        self.assertIn("READY=1", message)
+        self.assertNotIn("WATCHDOG=1", message)
+
+    def test_watchdog_checkpoint_sends_watchdog_after_sanitizing_status(
+        self,
+    ) -> None:
+        with patch.object(
+            supervisor,
+            "_sd_notify",
+            return_value=True,
+        ) as sd_notify:
+            self.assertTrue(
+                supervisor.notify_watchdog_checkpoint("phase d: heartbeat ok")
+            )
+
+        sd_notify.assert_called_once()
+        message = sd_notify.call_args.args[0]
+        self.assertIn("WATCHDOG=1", message)
+        self.assertIn("STATUS=checkpoint phase-d:-heartbeat-ok", message)
+        self.assertNotIn("READY=1", message)
+
+    def test_progress_checkpoint_reads_locals_and_cgroup_before_notify(
+        self,
+    ) -> None:
+        calls = []
+
+        def _local_snapshot():
+            calls.append("local")
+            return {}
+
+        def _cgroup_snapshot():
+            calls.append("cgroup")
+            return {}
+
+        def _notify(checkpoint):
+            calls.append(f"notify:{checkpoint}")
+            return True
+
+        with (
+            patch.object(
+                supervisor,
+                "local_watchdog_manifest_snapshot",
+                side_effect=_local_snapshot,
+            ),
+            patch.object(
+                supervisor,
+                "gateway_cgroup_memory_snapshot",
+                side_effect=_cgroup_snapshot,
+            ),
+            patch.object(
+                supervisor,
+                "notify_watchdog_checkpoint",
+                side_effect=_notify,
+            ),
+        ):
+            self.assertTrue(
+                supervisor.checkpoint_supervisor_progress(
+                    "phase-c-gateway-started",
+                    inspect_gateway=True,
+                )
+            )
+
+        self.assertEqual(
+            calls,
+            ["local", "cgroup", "notify:phase-c-gateway-started"],
+        )
+
+    def test_gateway_cgroup_memory_snapshot_reads_cgroup_v2_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cgroup = "system.slice/tinyhat-openclaw-gateway.service"
+            cgroup_dir = os.path.join(tmpdir, cgroup)
+            os.makedirs(cgroup_dir, exist_ok=True)
+            with open(
+                os.path.join(cgroup_dir, "memory.current"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("12345\n")
+            with open(
+                os.path.join(cgroup_dir, "memory.max"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("max\n")
+            with open(
+                os.path.join(cgroup_dir, "memory.events.local"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("low 0\nhigh 2\nmax 0\noom 1\noom_kill 1\n")
+
+            with (
+                patch.object(supervisor, "_dev_mode", return_value=False),
+                patch.object(
+                    supervisor,
+                    "_run_systemctl",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout="/" + cgroup,
+                    ),
+                ) as run_systemctl,
+                patch.dict(os.environ, {"TINYHAT_CGROUP_ROOT": tmpdir}, clear=False),
+            ):
+                snapshot = supervisor.gateway_cgroup_memory_snapshot()
+
+        run_systemctl.assert_called_once_with(
+            "show",
+            supervisor.GATEWAY_SYSTEMD_UNIT,
+            "--property=ControlGroup",
+            "--value",
+            check=False,
+        )
+        self.assertEqual(snapshot["available"], True)
+        self.assertEqual(snapshot["control_group"], "/" + cgroup)
+        self.assertEqual(snapshot["memory_current_bytes"], 12345)
+        self.assertEqual(snapshot["memory_max_bytes"], "max")
+        self.assertEqual(snapshot["memory_events"]["oom_kill"], 1)
+
+    def test_platform_http_timeouts_are_bounded(self) -> None:
+        observed_timeouts = []
+
+        class _Resp:
+            def __init__(self, payload: bytes):
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        def _urlopen(_req, timeout):
+            observed_timeouts.append(timeout)
+            return _Resp(b"{}")
+
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=False),
+            patch.object(supervisor, "get_backend_base_url", return_value="https://p"),
+            patch.object(supervisor, "fetch_identity_token", return_value="tok"),
+            patch.object(supervisor.urllib.request, "urlopen", side_effect=_urlopen),
+        ):
+            supervisor.post_json("/x", {})
+            supervisor.get_json("/x")
+
+        self.assertEqual(
+            observed_timeouts,
+            [
+                supervisor.PLATFORM_REQUEST_TIMEOUT_SECONDS,
+                supervisor.PLATFORM_REQUEST_TIMEOUT_SECONDS,
+            ],
+        )
+
+    def test_gce_identity_timeout_is_bounded(self) -> None:
+        observed_timeouts = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b"identity-token"
+
+        def _urlopen(_req, timeout):
+            observed_timeouts.append(timeout)
+            return _Resp()
+
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=False),
+            patch.object(supervisor, "get_backend_audience", return_value="aud"),
+            patch.object(supervisor.urllib.request, "urlopen", side_effect=_urlopen),
+        ):
+            self.assertEqual(supervisor.fetch_identity_token(), "identity-token")
+
+        self.assertEqual(
+            observed_timeouts,
+            [supervisor.GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS],
+        )
+
+    def test_systemctl_timeout_is_reported_without_hanging_inspection(self) -> None:
+        def _timeout(*_args, **_kwargs):
+            raise supervisor.subprocess.TimeoutExpired(
+                cmd=["systemctl", "show"],
+                timeout=supervisor.SYSTEMCTL_TIMEOUT_SECONDS,
+            )
+
+        with patch.object(supervisor.subprocess, "run", side_effect=_timeout):
+            result = supervisor._run_systemctl("show", check=False)
+            self.assertEqual(result.returncode, 124)
+            self.assertEqual(result.stderr, "timed out")
+            with self.assertRaisesRegex(RuntimeError, "systemctl show timed out"):
+                supervisor._run_systemctl("show")
+
+        with patch.object(
+            supervisor.subprocess,
+            "run",
+            side_effect=FileNotFoundError("systemctl"),
+        ):
+            result = supervisor._run_systemctl("show", check=False)
+            self.assertEqual(result.returncode, 127)
+            self.assertIn("systemctl", result.stderr)
+
+
 class TinyhatPluginInstallTests(unittest.TestCase):
     def test_install_clones_public_repo_and_records_marker(self) -> None:
         repo_url = "https://example.com/tinyhat.git"
@@ -3275,6 +3494,10 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         unit = _bootstrap_unit_block("GATEWAY_UNIT")
 
         for directive in (
+            "PartOf=${SUPERVISOR_UNIT_NAME}",
+            "After=network-online.target ${SUPERVISOR_UNIT_NAME}",
+            "StartLimitIntervalSec=10min",
+            "StartLimitBurst=3",
             "User=${TINYHAT_RUNTIME_USER}",
             "Group=${TINYHAT_RUNTIME_GROUP}",
             "UMask=0077",
@@ -3296,6 +3519,7 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             "ReadWritePaths=${OPENCLAW_CONFIG_DIR} ${OPENCLAW_STATE_DIR}",
             "CapabilityBoundingSet=",
             "AmbientCapabilities=",
+            "Restart=on-failure",
         ):
             self.assertIn(directive, unit)
 
@@ -3303,6 +3527,11 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         unit = _bootstrap_unit_block("SUPERVISOR_UNIT")
 
         for directive in (
+            "Type=notify",
+            "NotifyAccess=main",
+            "WatchdogSec=180s",
+            "StartLimitIntervalSec=10min",
+            "StartLimitBurst=6",
             "Environment=TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}",
             "Environment=TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}",
             "Slice=tinyhat-openclaw-control.slice",
@@ -3315,7 +3544,8 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             "TasksMax=512",
             "OOMPolicy=continue",
             "OOMScoreAdjust=-800",
-            "Restart=always",
+            "Restart=on-failure",
+            "TimeoutStopSec=30",
         ):
             self.assertIn(directive, unit)
 

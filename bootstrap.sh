@@ -33,8 +33,10 @@ set -euo pipefail
 
 RUNTIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SUPERVISOR_PATH="${RUNTIME_DIR}/supervisor.py"
-SUPERVISOR_UNIT="/etc/systemd/system/tinyhat-openclaw.service"
-GATEWAY_UNIT="/etc/systemd/system/tinyhat-openclaw-gateway.service"
+SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"
+GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"
+SUPERVISOR_UNIT="/etc/systemd/system/${SUPERVISOR_UNIT_NAME}"
+GATEWAY_UNIT="/etc/systemd/system/${GATEWAY_UNIT_NAME}"
 RUNTIME_ENV_FILE="/etc/tinyhat/runtime.env"
 
 OPENCLAW_CONFIG_PATH="/etc/openclaw/openclaw.json"
@@ -209,8 +211,11 @@ chmod 0644 "${RUNTIME_ENV_FILE}"
 cat > "${GATEWAY_UNIT}" <<UNIT
 [Unit]
 Description=Tinyhat OpenClaw gateway
-After=network-online.target
+PartOf=${SUPERVISOR_UNIT_NAME}
+After=network-online.target ${SUPERVISOR_UNIT_NAME}
 Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -240,7 +245,7 @@ ProtectHome=true
 ReadWritePaths=${OPENCLAW_CONFIG_DIR} ${OPENCLAW_STATE_DIR}
 CapabilityBoundingSet=
 AmbientCapabilities=
-Restart=always
+Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
@@ -255,9 +260,13 @@ cat > "${SUPERVISOR_UNIT}" <<UNIT
 Description=Tinyhat OpenClaw Computer supervisor
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=6
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=180s
 EnvironmentFile=-${RUNTIME_ENV_FILE}
 Environment=TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}
 Environment=TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}
@@ -272,8 +281,9 @@ TasksAccounting=true
 TasksMax=512
 OOMPolicy=continue
 OOMScoreAdjust=-800
-Restart=always
+Restart=on-failure
 RestartSec=10
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
@@ -282,6 +292,6 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now tinyhat-openclaw.service
+systemctl enable --now "${SUPERVISOR_UNIT_NAME}"
 
 echo "[tinyhat-runtime] bootstrap complete"
