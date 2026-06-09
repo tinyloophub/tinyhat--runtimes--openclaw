@@ -445,6 +445,239 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
             supervisor._dev_gateway.update(previous_gateway)
 
 
+class OpenClawGatewayReattachTests(unittest.TestCase):
+    def _fingerprint(self, value: str = "abc123") -> dict[str, str]:
+        return {
+            "algorithm": "sha256",
+            "source": "openclaw_config",
+            "path": "/etc/openclaw/openclaw.json",
+            "value": value,
+        }
+
+    def test_reattach_keeps_healthy_matching_gateway_running(self) -> None:
+        binding = {
+            "telegram_bot_username": "Tinychattestbot",
+            "telegram_owner_user_id": "123456",
+        }
+        fingerprint = self._fingerprint()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            marker_path = os.path.join(tmpdir, "clear-unrecoverable-manual")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV: marker_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "previous healthy start",
+                    config_fingerprint=fingerprint,
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                with (
+                    patch.object(
+                        supervisor, "is_openclaw_gateway_active", return_value=True
+                    ),
+                    patch.object(
+                        supervisor,
+                        "probe_current_openclaw_gateway_health",
+                        return_value=(True, "ok"),
+                    ),
+                    patch.object(supervisor, "delete_telegram_webhook") as delete,
+                    patch.object(supervisor, "start_openclaw_gateway") as start,
+                    patch.object(supervisor, "wait_for_openclaw_start") as wait,
+                ):
+                    result = supervisor.ensure_openclaw_gateway_ready(
+                        binding,
+                        fingerprint,
+                    )
+
+                self.assertEqual(result["action"], "reattached")
+                delete.assert_not_called()
+                start.assert_not_called()
+                wait.assert_not_called()
+                with open(state_path, encoding="utf-8") as fh:
+                    state = json.load(fh)
+                self.assertEqual(state["state"], "healthy")
+                self.assertEqual(state["gateway"]["action"], "reattached")
+                self.assertTrue(state["openclaw"]["ready"])
+                self.assertEqual(state["config_fingerprint"], fingerprint)
+
+    def test_active_not_ready_records_degradation_before_restart(self) -> None:
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+        fingerprint = self._fingerprint()
+        writes: list[str] = []
+
+        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+            writes.append(state)
+
+        with (
+            patch.object(
+                supervisor,
+                "read_runtime_state",
+                return_value={
+                    "state": "healthy",
+                    "config_fingerprint": fingerprint,
+                },
+            ),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(
+                supervisor,
+                "probe_current_openclaw_gateway_health",
+                return_value=(False, "waiting for OpenClaw telegram connected"),
+            ),
+            patch.object(
+                supervisor,
+                "_write_runtime_state",
+                side_effect=fake_write_runtime_state,
+            ),
+            patch.object(supervisor, "delete_telegram_webhook") as delete,
+            patch.object(
+                supervisor, "start_openclaw_gateway", return_value=123.0
+            ) as start,
+            patch.object(supervisor, "wait_for_openclaw_start") as wait,
+        ):
+            result = supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
+
+        self.assertEqual(result["action"], "started")
+        self.assertEqual(writes, ["openclaw_not_ready", "healthy"])
+        delete.assert_called_once_with(binding)
+        start.assert_called_once_with(binding)
+        wait.assert_called_once_with(123.0)
+
+    def test_healthy_gateway_with_config_mismatch_restarts(self) -> None:
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+        fingerprint = self._fingerprint("new")
+        writes: list[str] = []
+
+        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+            writes.append(state)
+
+        with (
+            patch.object(
+                supervisor,
+                "read_runtime_state",
+                return_value={
+                    "state": "healthy",
+                    "config_fingerprint": self._fingerprint("old"),
+                },
+            ),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(
+                supervisor,
+                "probe_current_openclaw_gateway_health",
+                return_value=(True, "ok"),
+            ),
+            patch.object(
+                supervisor,
+                "_write_runtime_state",
+                side_effect=fake_write_runtime_state,
+            ),
+            patch.object(supervisor, "delete_telegram_webhook") as delete,
+            patch.object(
+                supervisor, "start_openclaw_gateway", return_value=123.0
+            ) as start,
+            patch.object(supervisor, "wait_for_openclaw_start"),
+        ):
+            result = supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
+
+        self.assertEqual(result["action"], "started")
+        self.assertEqual(writes, ["healthy"])
+        delete.assert_called_once_with(binding)
+        start.assert_called_once_with(binding)
+
+    def test_unrecoverable_manual_blocks_restart_without_clear_marker(
+        self,
+    ) -> None:
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+        fingerprint = self._fingerprint()
+        writes: list[str] = []
+
+        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+            writes.append(state)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV: os.path.join(
+                    tmpdir,
+                    "clear-unrecoverable-manual",
+                )
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "read_runtime_state",
+                    return_value={
+                        "state": "unrecoverable_manual",
+                        "manual_recovery_required": True,
+                    },
+                ),
+                patch.object(
+                    supervisor, "is_openclaw_gateway_active", return_value=True
+                ),
+                patch.object(
+                    supervisor,
+                    "_write_runtime_state",
+                    side_effect=fake_write_runtime_state,
+                ),
+                patch.object(supervisor, "delete_telegram_webhook") as delete,
+                patch.object(supervisor, "start_openclaw_gateway") as start,
+            ):
+                with self.assertRaises(supervisor.ManualRecoveryRequired):
+                    supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
+
+        self.assertEqual(writes, ["unrecoverable_manual"])
+        delete.assert_not_called()
+        start.assert_not_called()
+
+    def test_unrecoverable_manual_clear_marker_allows_recovery(self) -> None:
+        binding = {"telegram_bot_username": "Tinychattestbot"}
+        fingerprint = self._fingerprint()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker_path = os.path.join(tmpdir, "clear-unrecoverable-manual")
+            with open(marker_path, "w", encoding="utf-8") as fh:
+                fh.write("operator cleared\n")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV: marker_path
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "read_runtime_state",
+                    return_value={
+                        "state": "unrecoverable_manual",
+                        "manual_recovery_required": True,
+                    },
+                ),
+                patch.object(
+                    supervisor, "is_openclaw_gateway_active", return_value=False
+                ),
+                patch.object(supervisor, "_write_runtime_state"),
+                patch.object(supervisor, "delete_telegram_webhook") as delete,
+                patch.object(
+                    supervisor, "start_openclaw_gateway", return_value=123.0
+                ) as start,
+                patch.object(supervisor, "wait_for_openclaw_start") as wait,
+            ):
+                result = supervisor.ensure_openclaw_gateway_ready(
+                    binding,
+                    fingerprint,
+                )
+
+            self.assertFalse(os.path.exists(marker_path))
+
+        self.assertEqual(result["action"], "started")
+        delete.assert_called_once_with(binding)
+        start.assert_called_once_with(binding)
+        wait.assert_called_once_with(123.0)
+
+
 class SupervisorWatchdogContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self._last_watchdog_checkpoint_ts = supervisor._last_watchdog_checkpoint_ts
@@ -1965,6 +2198,13 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             supervisor._stop_holder["stop"] = True
             return True
 
+        config_fingerprint = {
+            "algorithm": "sha256",
+            "source": "openclaw_config",
+            "path": "/etc/openclaw/openclaw.json",
+            "value": "test",
+        }
+
         with (
             patch.object(supervisor, "post_json", return_value={}),
             patch.object(
@@ -1988,6 +2228,17 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                 "write_openclaw_config",
                 side_effect=fake_write_openclaw_config,
             ),
+            patch.object(
+                supervisor,
+                "_openclaw_config_fingerprint",
+                return_value=config_fingerprint,
+            ),
+            patch.object(
+                supervisor,
+                "probe_current_openclaw_gateway_health",
+                return_value=(True, "ok"),
+            ),
+            patch.object(supervisor, "_write_runtime_state"),
             patch.object(supervisor, "delete_telegram_webhook"),
             patch.object(supervisor, "start_openclaw_gateway", return_value=123.0),
             patch.object(supervisor, "wait_for_openclaw_start"),

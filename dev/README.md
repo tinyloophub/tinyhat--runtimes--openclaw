@@ -132,22 +132,24 @@ no code at runtime; that matches prod.)
    platform attaches a Telegram bot to the Computer.
 3. Supervisor writes `openclaw.json` under `$TINYHAT_RUNTIME_HOME`
    (default `/home/tinyhat/runtime/openclaw/openclaw.json`).
-4. Supervisor clears the platform's fallback webhook for that bot
-   (Telegram only allows one webhook OR one long-poller).
-5. Supervisor launches `openclaw gateway run …` as a subprocess,
-   with `OPENCLAW_CONFIG_PATH` set in the subprocess environment
-   so OpenClaw finds the `openclaw.json` written in step 3. (The
-   `gateway run` CLI does not accept a config-path argv; the env
-   variable is the supported entry point and is the same one the
-   prod systemd unit uses.) The subprocess's stdout + stderr
-   stream to `$TINYHAT_RUNTIME_HOME/openclaw-gateway.log` (NOT to
-   the container's stdout); the supervisor's own log lines —
-   `dev: starting OpenClaw gateway subprocess`, the readiness
-   probe, the heartbeat ticks, the rebind watchdog — are what flow
-   to `docker logs`.
-6. Supervisor waits for `[gateway] ready` + `[telegram] connected
-   to gateway` log lines (read from the gateway log file in step
-   5), then POSTs `state=active`.
+4. Supervisor reattaches if the gateway is already active, ready,
+   and running the same persisted config fingerprint. Otherwise it
+   clears the platform's fallback webhook for that bot (Telegram only
+   allows one webhook OR one long-poller) and starts/restarts
+   `openclaw gateway run …`.
+5. When starting, the supervisor sets `OPENCLAW_CONFIG_PATH` in the
+   subprocess environment so OpenClaw finds the `openclaw.json`
+   written in step 3. (The `gateway run` CLI does not accept a
+   config-path argv; the env variable is the supported entry point and
+   is the same one the prod systemd unit uses.) The subprocess's stdout
+   + stderr stream to `$TINYHAT_RUNTIME_HOME/openclaw-gateway.log`
+   (NOT to the container's stdout); the supervisor's own log lines —
+   `dev: starting OpenClaw gateway subprocess`, the readiness probe,
+   the heartbeat ticks, the rebind watchdog — are what flow to
+   `docker logs`.
+6. Supervisor waits for `[gateway] ready` + `[telegram] connected`
+   to gateway` log lines before writing local runtime health
+   `healthy` and POSTing lifecycle `state=active`.
 7. Supervisor heartbeats every 30s. A watchdog thread re-polls
    `/me/binding` and triggers rebind if the platform unassigns
    this Computer.
