@@ -506,6 +506,52 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                 self.assertTrue(state["openclaw"]["ready"])
                 self.assertEqual(state["config_fingerprint"], fingerprint)
 
+    def test_gateway_oom_baseline_preserves_reattach_fingerprint(self) -> None:
+        fingerprint = self._fingerprint()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path}
+            snapshot = {
+                "available": True,
+                "control_group": "/tinyhat.slice/workload",
+                "memory_current_bytes": 500,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 1, "oom_kill": 3},
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.time, "time", return_value=100),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=True,
+                ),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    config_fingerprint=fingerprint,
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                result = supervisor._record_gateway_oom_delta(snapshot)
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(result, "baseline")
+        self.assertEqual(state["state"], "healthy")
+        self.assertEqual(state["config_fingerprint"], fingerprint)
+        self.assertTrue(state["openclaw"]["ready"])
+        self.assertTrue(
+            supervisor._runtime_state_config_fingerprint_matches(
+                state,
+                fingerprint,
+            )
+        )
+
     def test_active_not_ready_records_degradation_before_restart(self) -> None:
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint()
@@ -1087,7 +1133,11 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "checkpoint_supervisor_progress",
                     return_value=True,
                 ),
-                patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=False,
+                ),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
                 supervisor._wait_for_gateway_recovery_window()
@@ -1156,15 +1206,90 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertTrue(state["manual_recovery_required"])
         self.assertEqual(state["gateway"]["action"], "blocked")
 
+    def test_gateway_recovery_wait_unavailable_samples_exhaust_to_manual(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "degraded_workload",
+                        "detail": "hold-down expired",
+                        "gateway_recovery": {
+                            "last_oom_kill": 10,
+                            "hold_down_cycles": 2,
+                            "hold_down_until_unix": 100,
+                            "failures": [
+                                {"at_unix": 90, "reason": "restart_failed"},
+                                {"at_unix": 95, "reason": "restart_failed"},
+                            ],
+                        },
+                    },
+                    fh,
+                )
+            unavailable = {
+                "available": False,
+                "reason": "gateway-cgroup-unavailable",
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", return_value=100),
+                patch.object(
+                    supervisor,
+                    "gateway_cgroup_memory_snapshot",
+                    return_value=unavailable,
+                ),
+                patch.object(
+                    supervisor,
+                    "checkpoint_supervisor_progress",
+                    return_value=True,
+                ),
+                patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+                patch.object(
+                    supervisor,
+                    "GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES",
+                    3,
+                ),
+                patch.object(supervisor.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(supervisor.ManualRecoveryRequired):
+                    supervisor._wait_for_gateway_recovery_window()
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(state["state"], "unrecoverable_manual")
+        self.assertTrue(state["manual_recovery_required"])
+        self.assertEqual(state["gateway"]["action"], "blocked")
+        self.assertEqual(state["last_error_category"], "recovery_window_timeout")
+        self.assertEqual(
+            state["gateway_recovery"]["last_error_category"],
+            "recovery_window_timeout",
+        )
+        self.assertEqual(sleep.call_count, 2)
+
     def test_stable_healthy_window_resets_gateway_recovery_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
+            fingerprint = {
+                "algorithm": "sha256",
+                "source": "openclaw_config",
+                "path": "/etc/openclaw/openclaw.json",
+                "value": "stable",
+            }
             with open(state_path, "w", encoding="utf-8") as fh:
                 json.dump(
                     {
                         "state": "healthy",
                         "detail": "gateway healthy",
                         "updated_at_unix": 100,
+                        "config_fingerprint": fingerprint,
+                        "openclaw": {"ready": True},
                         "gateway_recovery": {
                             "last_oom_kill": 5,
                             "hold_down_cycles": 1,
@@ -1200,6 +1325,8 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
 
         self.assertEqual(state["state"], "healthy")
         self.assertEqual(state["gateway"]["action"], "stable_reset")
+        self.assertEqual(state["config_fingerprint"], fingerprint)
+        self.assertTrue(state["openclaw"]["ready"])
         self.assertEqual(state["gateway_recovery"]["failures"], [])
         self.assertEqual(state["gateway_recovery"]["hold_down_cycles"], 0)
         self.assertEqual(state["gateway_recovery"]["last_oom_kill"], 5)

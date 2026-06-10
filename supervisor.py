@@ -210,6 +210,7 @@ GATEWAY_RECOVERY_HOLD_DOWN_SECONDS = 10 * 60
 GATEWAY_RECOVERY_MEMORY_THRESHOLD_RATIO = 0.70
 GATEWAY_RECOVERY_MEMORY_STABLE_SAMPLES = 3
 GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS = 10
+GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES = 60
 GATEWAY_RECOVERY_HEALTHY_RESET_SECONDS = 30 * 60
 GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES = 2
 GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS = 5
@@ -1721,8 +1722,20 @@ def _write_runtime_state(
     path = runtime_state_path()
     parent = os.path.dirname(path)
     _prepare_control_plane_state_dir(parent)
+    existing_state = read_runtime_state()
     if gateway_recovery is None:
-        gateway_recovery = _runtime_state_gateway_recovery(read_runtime_state())
+        gateway_recovery = _runtime_state_gateway_recovery(existing_state)
+    if config_fingerprint is None:
+        existing_fingerprint = existing_state.get("config_fingerprint")
+        if isinstance(existing_fingerprint, dict):
+            config_fingerprint = dict(existing_fingerprint)
+    if openclaw_ready is None:
+        existing_openclaw = existing_state.get("openclaw")
+        if isinstance(existing_openclaw, dict) and isinstance(
+            existing_openclaw.get("ready"),
+            bool,
+        ):
+            openclaw_ready = existing_openclaw["ready"]
     if gateway_cgroup is not None:
         gateway_recovery = _gateway_recovery_policy_with_cgroup_baseline(
             gateway_recovery,
@@ -1930,7 +1943,9 @@ def _gateway_memory_recovery_sample_ok(
 def _wait_for_gateway_recovery_window(
     *,
     config_fingerprint: dict[str, str] | None = None,
+    notify_platform: bool = False,
 ) -> None:
+    platform_hold_down_reported = False
     while True:
         state = read_runtime_state()
         if _runtime_state_is_unrecoverable_manual(state):
@@ -1943,15 +1958,31 @@ def _wait_for_gateway_recovery_window(
         if hold_down_until <= 0:
             return
         if hold_down_until > now:
+            detail = "gateway hold-down active; automatic restart delayed"
             _write_runtime_state(
                 "degraded_workload",
-                "gateway hold-down active; automatic restart delayed",
+                detail,
                 config_fingerprint=config_fingerprint,
                 gateway_active=is_openclaw_gateway_active(),
                 gateway_action="hold_down",
                 openclaw_ready=False,
                 gateway_recovery=policy,
             )
+            if notify_platform and not platform_hold_down_reported:
+                platform_hold_down_reported = True
+                try:
+                    post_json(
+                        "/hapi/v1/computers/me/state",
+                        {"state": "broken", "detail": detail},
+                    )
+                except urllib.error.HTTPError as http_exc:
+                    if http_exc.code != 400:
+                        log.warning(
+                            "hold-down /me/state broken POST failed: %s",
+                            http_exc,
+                        )
+                except Exception as exc:
+                    log.warning("hold-down /me/state broken POST failed: %s", exc)
             checkpoint_supervisor_progress(
                 "gateway-recovery-hold-down",
                 inspect_gateway=True,
@@ -1969,6 +2000,8 @@ def _wait_for_gateway_recovery_window(
         if baseline_oom_kill is None:
             baseline_oom_kill = int(policy.get("last_oom_kill") or 0)
         stable_samples = 0
+        samples_taken = 0
+        max_samples = max(1, int(GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES))
         while stable_samples < GATEWAY_RECOVERY_MEMORY_STABLE_SAMPLES:
             snapshot = (
                 first_snapshot
@@ -1976,6 +2009,7 @@ def _wait_for_gateway_recovery_window(
                 else gateway_cgroup_memory_snapshot()
             )
             first_snapshot = None
+            samples_taken += 1
             current_oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
             if current_oom_kill is not None and current_oom_kill > baseline_oom_kill:
                 mode = _record_gateway_recovery_failure(
@@ -2020,6 +2054,21 @@ def _wait_for_gateway_recovery_window(
                     gateway_cgroup=snapshot,
                 )
                 return
+            if samples_taken >= max_samples:
+                mode = _record_gateway_recovery_failure(
+                    "recovery_window_timeout",
+                    (
+                        "gateway recovery window was not satisfied before "
+                        "the sample budget expired"
+                    ),
+                    snapshot=snapshot,
+                    config_fingerprint=config_fingerprint,
+                )
+                if mode == "manual":
+                    raise ManualRecoveryRequired(
+                        "gateway recovery exhausted; manual recovery required"
+                    )
+                break
             checkpoint_supervisor_progress(
                 "gateway-recovery-memory-wait",
                 inspect_gateway=True,
@@ -3492,7 +3541,10 @@ def ensure_openclaw_gateway_ready(
             )
 
     if not manual_recovery_cleared:
-        _wait_for_gateway_recovery_window(config_fingerprint=config_fingerprint)
+        _wait_for_gateway_recovery_window(
+            config_fingerprint=config_fingerprint,
+            notify_platform=True,
+        )
     try:
         delete_telegram_webhook(binding)
         started_at = start_openclaw_gateway(binding)
