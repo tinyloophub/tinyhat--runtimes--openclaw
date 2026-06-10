@@ -93,6 +93,8 @@ _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
     "/var/lib/tinyhat-control/clear-unrecoverable-manual"
 )
 RUNTIME_STATE_SCHEMA = "runtime_state_v1"
+RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH = 127
+RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS = 60
 RUNTIME_HEALTH_VALUES = frozenset(
     {
         "healthy",
@@ -380,6 +382,7 @@ log = logging.getLogger("tinyhat-supervisor")
 
 _base_url_cache = {"value": None, "ts": 0.0}
 _audience_cache = {"value": None, "ts": 0.0}
+_runtime_state_platform_post_cache: dict[str, Any] = {"signature": None, "ts": 0.0}
 _last_watchdog_checkpoint_ts = 0.0
 
 
@@ -1775,11 +1778,44 @@ def _runtime_health_value(state: str) -> str:
     return "degraded_workload"
 
 
+def _reset_runtime_state_platform_post_cache() -> None:
+    _runtime_state_platform_post_cache.clear()
+    _runtime_state_platform_post_cache.update({"signature": None, "ts": 0.0})
+
+
+def _runtime_state_platform_post_signature(payload: dict[str, Any]) -> str:
+    stable_payload = dict(payload)
+    stable_payload.pop("observed_at", None)
+    stable_payload.pop("updated_at_unix", None)
+    raw = json.dumps(
+        stable_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
     """Best-effort platform mirror for the local runtime_state_v1 payload."""
-    if not (os.environ.get("TINYHAT_PLATFORM_BASE_URL") or "").strip():
-        return False
     try:
+        env_base_url = (os.environ.get("TINYHAT_PLATFORM_BASE_URL") or "").strip()
+        if not env_base_url and not _gce_metadata_available():
+            return False
+        if not get_backend_base_url():
+            return False
+        now = time.time()
+        signature = _runtime_state_platform_post_signature(payload)
+        previous_signature = _runtime_state_platform_post_cache.get("signature")
+        previous_ts = float(_runtime_state_platform_post_cache.get("ts") or 0.0)
+        if (
+            signature == previous_signature
+            and now - previous_ts < RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
+        ):
+            log.debug("runtime_state platform POST skipped: unchanged payload")
+            return False
+        _runtime_state_platform_post_cache["signature"] = signature
+        _runtime_state_platform_post_cache["ts"] = now
         post_json("/hapi/v1/computers/me/runtime-state", payload)
     except Exception as exc:
         log.warning("runtime_state platform POST failed: %s", exc)
@@ -1914,7 +1950,7 @@ def _runtime_state_last_error(
         return None
     safe_category = _sanitize_runtime_state_text(
         category or runtime_health,
-        limit=128,
+        limit=RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
     )
     return {
         "category": safe_category or runtime_health,
@@ -1970,7 +2006,10 @@ def _write_runtime_state(
     runtime_health = _runtime_health_value(state)
     safe_detail = _sanitize_runtime_state_text(detail)
     safe_last_error_category = (
-        _sanitize_runtime_state_text(last_error_category, limit=128)
+        _sanitize_runtime_state_text(
+            last_error_category,
+            limit=RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
+        )
         if last_error_category
         else None
     )
