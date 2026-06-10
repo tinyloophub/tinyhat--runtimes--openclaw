@@ -559,6 +559,48 @@ class RuntimeStateV1Tests(unittest.TestCase):
             read_metadata_path.assert_called_once_with("instance/id", timeout=2)
             read_runtime_git_sha.assert_called_once()
 
+    def test_runtime_state_retries_identity_misses_until_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_COMPUTER_ID_ENV: "",
+                supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "",
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_value",
+                    side_effect=["", "cmp_retry_123"],
+                ) as read_metadata_value,
+                patch.object(
+                    supervisor,
+                    "_read_metadata_path",
+                    side_effect=["", "gce-instance-123"],
+                ) as read_metadata_path,
+                patch.object(
+                    supervisor,
+                    "_runtime_ref",
+                    side_effect=[None, "0.11.0@abcdef123456"],
+                ) as runtime_ref,
+            ):
+                supervisor._write_runtime_state("healthy", "first")
+                first_payload = supervisor.read_runtime_state()
+                supervisor._write_runtime_state("degraded_workload", "second")
+                second_payload = supervisor.read_runtime_state()
+
+            self.assertIsNone(first_payload["computer_id"])
+            self.assertIsNone(first_payload["instance_id"])
+            self.assertIsNone(first_payload["runtime_ref"])
+            self.assertEqual(second_payload["computer_id"], "cmp_retry_123")
+            self.assertEqual(second_payload["instance_id"], "gce-instance-123")
+            self.assertEqual(second_payload["runtime_ref"], "0.11.0@abcdef123456")
+            self.assertEqual(read_metadata_value.call_count, 2)
+            self.assertEqual(read_metadata_path.call_count, 2)
+            self.assertEqual(runtime_ref.call_count, 2)
+
     def test_runtime_state_write_uses_tempfile_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")

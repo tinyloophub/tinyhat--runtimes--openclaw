@@ -1822,7 +1822,7 @@ def _runtime_ref() -> str | None:
     return version or None
 
 
-_runtime_state_identity_cache: dict[str, str | None] = {}
+_runtime_state_identity_cache: dict[str, str] = {}
 
 
 def _reset_runtime_state_identity_cache() -> None:
@@ -1830,15 +1830,20 @@ def _reset_runtime_state_identity_cache() -> None:
 
 
 def _runtime_state_identity() -> dict[str, str | None]:
-    if not _runtime_state_identity_cache:
-        _runtime_state_identity_cache.update(
-            {
-                "computer_id": _runtime_computer_id(),
-                "instance_id": _gce_instance_id(),
-                "runtime_ref": _runtime_ref(),
-            }
-        )
-    return dict(_runtime_state_identity_cache)
+    identity: dict[str, str | None] = {}
+    for key, resolver in (
+        ("computer_id", _runtime_computer_id),
+        ("instance_id", _gce_instance_id),
+        ("runtime_ref", _runtime_ref),
+    ):
+        value = _runtime_state_identity_cache.get(key)
+        if not value:
+            resolved = resolver()
+            if resolved:
+                _runtime_state_identity_cache[key] = resolved
+                value = resolved
+        identity[key] = value or None
+    return identity
 
 
 def _runtime_supervisor_status(runtime_health: str) -> str:
