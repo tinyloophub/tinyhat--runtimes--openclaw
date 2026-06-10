@@ -446,6 +446,12 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
 
 
 class RuntimeStateV1Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+
+    def tearDown(self) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+
     def _env(self, state_path: str) -> dict[str, str]:
         return {
             supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
@@ -516,6 +522,42 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertIsNone(payload["last_error"])
             self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(os.path.dirname(state_path)).st_mode & 0o777, 0o700)
+
+    def test_runtime_state_caches_stable_identity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_path",
+                    return_value="gce-instance-123",
+                ) as read_metadata_path,
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ) as read_runtime_git_sha,
+            ):
+                supervisor._write_runtime_state("healthy", "first")
+                supervisor._write_runtime_state("degraded_workload", "second")
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["computer_id"], "cmp_test_123")
+            self.assertEqual(payload["instance_id"], "gce-instance-123")
+            self.assertEqual(payload["runtime_ref"], "0.11.0@abcdef123456")
+            read_metadata_path.assert_called_once_with("instance/id", timeout=2)
+            read_runtime_git_sha.assert_called_once()
 
     def test_runtime_state_write_uses_tempfile_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -615,6 +657,7 @@ class RuntimeStateV1Tests(unittest.TestCase):
     def test_runtime_state_redacts_sensitive_diagnostics(self) -> None:
         detail = (
             "restart failed Authorization: Bearer bearer-secret-123 "
+            "Authorization: Basic dXNlcjpwYXNz "
             "api_key=sk-test-secret token=runtime-token "
             "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 "
             "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ "
@@ -637,6 +680,7 @@ class RuntimeStateV1Tests(unittest.TestCase):
 
         raw = json.dumps(payload, sort_keys=True)
         self.assertNotIn("bearer-secret-123", raw)
+        self.assertNotIn("dXNlcjpwYXNz", raw)
         self.assertNotIn("sk-test-secret", raw)
         self.assertNotIn("sk-or-v1-abcdef0123456789", raw)
         self.assertNotIn("runtime-token", raw)
@@ -1671,6 +1715,46 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                 supervisor.PLATFORM_REQUEST_TIMEOUT_SECONDS,
             ],
         )
+
+    def test_me_state_post_sanitizes_detail_before_platform_send(self) -> None:
+        observed_bodies = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def _urlopen(req, timeout):
+            observed_bodies.append(json.loads(req.data.decode("utf-8")))
+            return _Resp()
+
+        detail = (
+            "gateway failed Authorization: Basic dXNlcjpwYXNz "
+            "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789"
+        )
+        with (
+            patch.object(supervisor, "get_backend_base_url", return_value="https://p"),
+            patch.object(supervisor, "fetch_identity_token", return_value="tok"),
+            patch.object(supervisor.urllib.request, "urlopen", side_effect=_urlopen),
+        ):
+            supervisor.post_json(
+                "/hapi/v1/computers/me/state",
+                {"state": "broken", "detail": detail},
+            )
+            supervisor.post_json("/hapi/v1/other", {"detail": detail})
+
+        state_body = observed_bodies[0]
+        passthrough_body = observed_bodies[1]
+        state_raw = json.dumps(state_body, sort_keys=True)
+        self.assertEqual(state_body["state"], "broken")
+        self.assertNotIn("dXNlcjpwYXNz", state_raw)
+        self.assertNotIn("sk-or-v1-abcdef0123456789", state_raw)
+        self.assertIn("dXNlcjpwYXNz", json.dumps(passthrough_body))
 
     def test_gce_identity_timeout_is_bounded(self) -> None:
         observed_timeouts = []

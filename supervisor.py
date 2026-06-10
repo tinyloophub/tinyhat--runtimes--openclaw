@@ -520,9 +520,10 @@ def fetch_identity_token() -> str:
 def post_json(path: str, body: dict) -> dict:
     token = fetch_identity_token()
     base = get_backend_base_url()
+    safe_body = _sanitize_platform_state_body(path, body)
     req = urllib.request.Request(
         base.rstrip("/") + path,
-        data=json.dumps(body).encode("utf-8"),
+        data=json.dumps(safe_body).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -1722,7 +1723,9 @@ _RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
     r"access[_-]?token|refresh[_-]?token|token|password|secret|cookie|"
     r"authorization)[A-Za-z0-9_-]*)(\s*[:=]\s*)([^\s,;]+)"
 )
-_RUNTIME_STATE_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_RUNTIME_STATE_AUTH_SCHEME_RE = re.compile(
+    r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"
+)
 _RUNTIME_STATE_SIGNED_QUERY_RE = re.compile(
     r"(?i)([?&][^=\s&]*(?:token|signature|credential|key|secret|password)"
     r"[^=\s&]*=)[^&\s]+"
@@ -1738,7 +1741,10 @@ _RUNTIME_STATE_LOCAL_PATH_RE = re.compile(
 
 def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
     text = str(value or "")
-    text = _RUNTIME_STATE_BEARER_RE.sub("Bearer [redacted]", text)
+    text = _RUNTIME_STATE_AUTH_SCHEME_RE.sub(
+        lambda match: f"{match.group(1)} [redacted]",
+        text,
+    )
     text = _RUNTIME_STATE_TELEGRAM_TOKEN_RE.sub("[redacted-telegram-token]", text)
     text = _RUNTIME_STATE_SIGNED_QUERY_RE.sub(r"\1[redacted]", text)
     text = _RUNTIME_STATE_SECRET_ASSIGNMENT_RE.sub(
@@ -1747,6 +1753,15 @@ def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
     )
     text = _RUNTIME_STATE_LOCAL_PATH_RE.sub("[local-path]", text)
     return text[:limit]
+
+
+def _sanitize_platform_state_body(path: str, body: dict) -> dict:
+    if path != "/hapi/v1/computers/me/state":
+        return body
+    safe_body = dict(body)
+    if "detail" in safe_body:
+        safe_body["detail"] = _sanitize_runtime_state_text(safe_body["detail"])
+    return safe_body
 
 
 def _runtime_state_observed_at(now: int) -> str:
@@ -1805,6 +1820,25 @@ def _runtime_ref() -> str | None:
     if sha:
         return sha
     return version or None
+
+
+_runtime_state_identity_cache: dict[str, str | None] = {}
+
+
+def _reset_runtime_state_identity_cache() -> None:
+    _runtime_state_identity_cache.clear()
+
+
+def _runtime_state_identity() -> dict[str, str | None]:
+    if not _runtime_state_identity_cache:
+        _runtime_state_identity_cache.update(
+            {
+                "computer_id": _runtime_computer_id(),
+                "instance_id": _gce_instance_id(),
+                "runtime_ref": _runtime_ref(),
+            }
+        )
+    return dict(_runtime_state_identity_cache)
 
 
 def _runtime_supervisor_status(runtime_health: str) -> str:
@@ -1957,12 +1991,13 @@ def _write_runtime_state(
         gateway_payload["active"] = bool(gateway_active)
     if gateway_action:
         gateway_payload["action"] = gateway_action
+    identity = _runtime_state_identity()
     payload: dict[str, Any] = {
         "schema": RUNTIME_STATE_SCHEMA,
         "schema_version": 1,
-        "computer_id": _runtime_computer_id(),
-        "instance_id": _gce_instance_id(),
-        "runtime_ref": _runtime_ref(),
+        "computer_id": identity["computer_id"],
+        "instance_id": identity["instance_id"],
+        "runtime_ref": identity["runtime_ref"],
         "observed_at": _runtime_state_observed_at(now),
         "runtime_health": runtime_health,
         "runtime_state": runtime_health,
