@@ -1775,6 +1775,23 @@ def _runtime_health_value(state: str) -> str:
     return "degraded_workload"
 
 
+def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
+    """Best-effort platform mirror for the local runtime_state_v1 payload."""
+    if not (os.environ.get("TINYHAT_PLATFORM_BASE_URL") or "").strip():
+        return False
+    try:
+        post_json("/hapi/v1/computers/me/runtime-state", payload)
+    except Exception as exc:
+        log.warning("runtime_state platform POST failed: %s", exc)
+        return False
+    log.info(
+        "runtime_state platform POST succeeded: health=%s observed_at=%s",
+        payload.get("runtime_health"),
+        payload.get("observed_at"),
+    )
+    return True
+
+
 def _runtime_computer_id() -> str | None:
     for env_name in (TINYHAT_COMPUTER_ID_ENV, "DEV_AUTO_COMPUTER_ID"):
         value = (os.environ.get(env_name) or "").strip()
@@ -2033,6 +2050,7 @@ def _write_runtime_state(
     if gateway_recovery:
         payload["gateway_recovery"] = gateway_recovery
     _atomic_write_json(path, payload, mode=0o600)
+    _post_runtime_state_to_platform(payload)
 
 
 def _gateway_recovery_failure_entry(

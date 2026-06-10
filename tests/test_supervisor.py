@@ -601,6 +601,85 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(read_metadata_path.call_count, 2)
             self.assertEqual(runtime_ref.call_count, 2)
 
+    def test_runtime_state_posts_payload_to_platform_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                return {"ok": True}
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.time, "time", return_value=1_760_000_000),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(
+                posted[0][0],
+                "/hapi/v1/computers/me/runtime-state",
+            )
+            self.assertEqual(posted[0][1], payload)
+            self.assertEqual(posted[0][1]["runtime_health"], "healthy")
+
+    def test_runtime_state_platform_post_failure_keeps_local_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", side_effect=RuntimeError("boom")),
+            ):
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "platform unavailable",
+                    gateway_active=False,
+                    openclaw_ready=False,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["runtime_health"], "degraded_workload")
+            self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
+
+    def test_runtime_state_skips_platform_post_without_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+
+            with (
+                patch.dict(os.environ, self._env(state_path), clear=False),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor._write_runtime_state("healthy", "ok")
+
+            post_json.assert_not_called()
+
     def test_runtime_state_write_uses_tempfile_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
