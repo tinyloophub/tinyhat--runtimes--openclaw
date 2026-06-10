@@ -1718,15 +1718,18 @@ def _gateway_recovery_now() -> int:
 
 
 _RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|"
-    r"password|secret|cookie|authorization)\b(\s*[:=]\s*)([^\s,;]+)"
+    r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_-]*(?:api[_-]?key|"
+    r"access[_-]?token|refresh[_-]?token|token|password|secret|cookie|"
+    r"authorization)[A-Za-z0-9_-]*)(\s*[:=]\s*)([^\s,;]+)"
 )
 _RUNTIME_STATE_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _RUNTIME_STATE_SIGNED_QUERY_RE = re.compile(
     r"(?i)([?&][^=\s&]*(?:token|signature|credential|key|secret|password)"
     r"[^=\s&]*=)[^&\s]+"
 )
-_RUNTIME_STATE_TELEGRAM_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+_RUNTIME_STATE_TELEGRAM_TOKEN_RE = re.compile(
+    r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}\b"
+)
 _RUNTIME_STATE_LOCAL_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9:/])/(?:Users|home|root|etc|var|tmp|private|opt)/"
     r"[^\s,'\")]+"

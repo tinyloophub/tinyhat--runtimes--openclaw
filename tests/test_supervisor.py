@@ -616,9 +616,11 @@ class RuntimeStateV1Tests(unittest.TestCase):
         detail = (
             "restart failed Authorization: Bearer bearer-secret-123 "
             "api_key=sk-test-secret token=runtime-token "
+            "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 "
             "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ "
             "/etc/openclaw/openclaw.json "
-            "https://storage.googleapis.com/b?X-Goog-Signature=deadbeef"
+            "https://storage.googleapis.com/b?X-Goog-Signature=deadbeef "
+            "https://api.telegram.org/bot1234567890:AAEqhJkLmNoPqRsTuVwXyZ12345678/deleteWebhook"
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
@@ -636,8 +638,11 @@ class RuntimeStateV1Tests(unittest.TestCase):
         raw = json.dumps(payload, sort_keys=True)
         self.assertNotIn("bearer-secret-123", raw)
         self.assertNotIn("sk-test-secret", raw)
+        self.assertNotIn("sk-or-v1-abcdef0123456789", raw)
         self.assertNotIn("runtime-token", raw)
         self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ", raw)
+        self.assertNotIn("AAEqhJkLmNoPqRsTuVwXyZ12345678", raw)
+        self.assertNotIn("api.telegram.org/bot", raw)
         self.assertNotIn("/etc/openclaw/openclaw.json", raw)
         self.assertNotIn("deadbeef", raw)
         self.assertIn("[redacted]", raw)
