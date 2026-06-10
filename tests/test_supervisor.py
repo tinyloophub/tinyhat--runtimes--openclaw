@@ -17,6 +17,27 @@ from unittest.mock import call, patch
 
 import supervisor
 
+_AMBIENT_ENV: dict[str, str | None] = {}
+_AMBIENT_ENV_KEYS = (
+    "TINYHAT_PLATFORM_BASE_URL",
+    supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV,
+)
+
+
+def setUpModule() -> None:
+    for key in _AMBIENT_ENV_KEYS:
+        _AMBIENT_ENV[key] = os.environ.get(key)
+    os.environ.pop("TINYHAT_PLATFORM_BASE_URL", None)
+    os.environ[supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV] = "0"
+
+
+def tearDownModule() -> None:
+    for key, value in _AMBIENT_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 def _runtime_repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -448,15 +469,21 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
 class RuntimeStateV1Tests(unittest.TestCase):
     def setUp(self) -> None:
         supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        supervisor._base_url_cache.update({"value": None, "ts": 0.0})
 
     def tearDown(self) -> None:
         supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        supervisor._base_url_cache.update({"value": None, "ts": 0.0})
 
     def _env(self, state_path: str) -> dict[str, str]:
         return {
             supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
             supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
             supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "9876543210",
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_PLATFORM_BASE_URL": "",
         }
 
     def test_runtime_state_v1_payload_shape_permissions_and_read_back(self) -> None:
@@ -530,9 +557,11 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
                 supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
                 supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+                "TINYHAT_DEV_RUNTIME": "",
             }
             with (
                 patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "get_backend_base_url", return_value=""),
                 patch.object(
                     supervisor,
                     "_read_metadata_path",
@@ -567,9 +596,11 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 supervisor.TINYHAT_COMPUTER_ID_ENV: "",
                 supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "",
                 supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+                "TINYHAT_DEV_RUNTIME": "",
             }
             with (
                 patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "get_backend_base_url", return_value=""),
                 patch.object(
                     supervisor,
                     "_read_metadata_value",
@@ -600,6 +631,181 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(read_metadata_value.call_count, 2)
             self.assertEqual(read_metadata_path.call_count, 2)
             self.assertEqual(runtime_ref.call_count, 2)
+
+    def test_runtime_state_posts_payload_to_platform_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                return {"ok": True}
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.time, "time", return_value=1_760_000_000),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(
+                posted[0][0],
+                "/hapi/v1/computers/me/runtime-state",
+            )
+            self.assertEqual(posted[0][1], payload)
+            self.assertEqual(posted[0][1]["runtime_health"], "healthy")
+
+    def test_runtime_state_posts_payload_with_metadata_only_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+                "TINYHAT_DEV_RUNTIME": "",
+                "TINYHAT_PLATFORM_BASE_URL": "",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                return {"ok": True}
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_value",
+                    return_value="https://metadata-platform.test",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state("healthy", "ok")
+
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(posted[0][0], "/hapi/v1/computers/me/runtime-state")
+
+    def test_runtime_state_platform_post_failure_keeps_local_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", side_effect=RuntimeError("boom")),
+            ):
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "platform unavailable",
+                    gateway_active=False,
+                    openclaw_ready=False,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["runtime_health"], "degraded_workload")
+            self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
+
+    def test_runtime_state_skips_repeated_unchanged_platform_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                return {"ok": True}
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor.time,
+                    "time",
+                    side_effect=[1000, 1000, 1005, 1005, 1070, 1070],
+                ),
+                patch.object(
+                    supervisor,
+                    "get_backend_base_url",
+                    return_value="https://platform.test",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state("degraded_workload", "holding")
+                supervisor._write_runtime_state("degraded_workload", "holding")
+                supervisor._write_runtime_state("degraded_workload", "holding")
+
+            self.assertEqual(len(posted), 2)
+
+    def test_runtime_state_posts_changed_payload_inside_platform_throttle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                return {"ok": True}
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor.time,
+                    "time",
+                    side_effect=[1000, 1000, 1005, 1005],
+                ),
+                patch.object(
+                    supervisor,
+                    "get_backend_base_url",
+                    return_value="https://platform.test",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state("degraded_workload", "holding")
+                supervisor._write_runtime_state("openclaw_not_ready", "still booting")
+
+            self.assertEqual(len(posted), 2)
+            self.assertEqual(posted[0][1]["runtime_health"], "degraded_workload")
+            self.assertEqual(posted[1][1]["runtime_health"], "openclaw_not_ready")
+
+    def test_runtime_state_skips_platform_post_without_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+
+            with (
+                patch.dict(os.environ, self._env(state_path), clear=False),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor._write_runtime_state("healthy", "ok")
+
+            post_json.assert_not_called()
 
     def test_runtime_state_write_uses_tempfile_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -674,6 +880,26 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 },
             )
 
+    def test_runtime_state_caps_last_error_category_for_platform_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with patch.dict(os.environ, self._env(state_path), clear=False):
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "gateway recovery failed",
+                    last_error_category="x" * 200,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(
+                len(payload["last_error_category"]),
+                supervisor.RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
+            )
+            self.assertEqual(
+                len(payload["last_error"]["category"]),
+                supervisor.RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
+            )
+
     def test_runtime_state_reads_gce_instance_metadata_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
@@ -681,9 +907,11 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
                 supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
                 supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+                "TINYHAT_DEV_RUNTIME": "",
             }
             with (
                 patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "get_backend_base_url", return_value=""),
                 patch.object(
                     supervisor,
                     "_read_metadata_path",
