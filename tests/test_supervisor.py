@@ -445,6 +445,310 @@ class OpenClawGatewayHealthTests(unittest.TestCase):
             supervisor._dev_gateway.update(previous_gateway)
 
 
+class RuntimeStateV1Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+
+    def tearDown(self) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+
+    def _env(self, state_path: str) -> dict[str, str]:
+        return {
+            supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+            supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
+            supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "9876543210",
+        }
+
+    def test_runtime_state_v1_payload_shape_permissions_and_read_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(
+                tmpdir,
+                "tinyhat-control",
+                "runtime-state.json",
+            )
+            gateway_recovery = {
+                "failures": [
+                    {"at_unix": 1_759_999_900, "reason": "restart_failed"},
+                    {"at_unix": 1_750_000_000, "reason": "old_failure"},
+                ],
+            }
+
+            with (
+                patch.dict(os.environ, self._env(state_path), clear=False),
+                patch.object(supervisor.time, "time", return_value=1_760_000_000),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                    gateway_recovery=gateway_recovery,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["schema"], supervisor.RUNTIME_STATE_SCHEMA)
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertEqual(payload["runtime_state"], "healthy")
+            self.assertEqual(payload["state"], "healthy")
+            self.assertEqual(payload["computer_id"], "cmp_test_123")
+            self.assertEqual(payload["instance_id"], "9876543210")
+            self.assertEqual(payload["runtime_ref"], "0.11.0@abcdef123456")
+            self.assertEqual(
+                payload["observed_at"],
+                supervisor._runtime_state_observed_at(1_760_000_000),
+            )
+            self.assertEqual(
+                payload["supervisor"],
+                {"version": "0.11.0", "status": "healthy"},
+            )
+            self.assertEqual(payload["gateway"]["unit"], supervisor.GATEWAY_SYSTEMD_UNIT)
+            self.assertEqual(payload["gateway"]["status"], "healthy")
+            self.assertEqual(payload["gateway"]["restart_count_window"], 1)
+            self.assertTrue(payload["gateway"]["active"])
+            self.assertEqual(payload["gateway"]["action"], "started")
+            self.assertTrue(payload["openclaw"]["ready"])
+            self.assertFalse(payload["manual_recovery_required"])
+            self.assertIsNone(payload["last_error"])
+            self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.dirname(state_path)).st_mode & 0o777, 0o700)
+
+    def test_runtime_state_caches_stable_identity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_path",
+                    return_value="gce-instance-123",
+                ) as read_metadata_path,
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ) as read_runtime_git_sha,
+            ):
+                supervisor._write_runtime_state("healthy", "first")
+                supervisor._write_runtime_state("degraded_workload", "second")
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["computer_id"], "cmp_test_123")
+            self.assertEqual(payload["instance_id"], "gce-instance-123")
+            self.assertEqual(payload["runtime_ref"], "0.11.0@abcdef123456")
+            read_metadata_path.assert_called_once_with("instance/id", timeout=2)
+            read_runtime_git_sha.assert_called_once()
+
+    def test_runtime_state_retries_identity_misses_until_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_COMPUTER_ID_ENV: "",
+                supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "",
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_value",
+                    side_effect=["", "cmp_retry_123"],
+                ) as read_metadata_value,
+                patch.object(
+                    supervisor,
+                    "_read_metadata_path",
+                    side_effect=["", "gce-instance-123"],
+                ) as read_metadata_path,
+                patch.object(
+                    supervisor,
+                    "_runtime_ref",
+                    side_effect=[None, "0.11.0@abcdef123456"],
+                ) as runtime_ref,
+            ):
+                supervisor._write_runtime_state("healthy", "first")
+                first_payload = supervisor.read_runtime_state()
+                supervisor._write_runtime_state("degraded_workload", "second")
+                second_payload = supervisor.read_runtime_state()
+
+            self.assertIsNone(first_payload["computer_id"])
+            self.assertIsNone(first_payload["instance_id"])
+            self.assertIsNone(first_payload["runtime_ref"])
+            self.assertEqual(second_payload["computer_id"], "cmp_retry_123")
+            self.assertEqual(second_payload["instance_id"], "gce-instance-123")
+            self.assertEqual(second_payload["runtime_ref"], "0.11.0@abcdef123456")
+            self.assertEqual(read_metadata_value.call_count, 2)
+            self.assertEqual(read_metadata_path.call_count, 2)
+            self.assertEqual(runtime_ref.call_count, 2)
+
+    def test_runtime_state_write_uses_tempfile_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            original_replace = os.replace
+            with (
+                patch.dict(os.environ, self._env(state_path), clear=False),
+                patch.object(
+                    supervisor.os,
+                    "replace",
+                    side_effect=original_replace,
+                ) as replace,
+            ):
+                supervisor._write_runtime_state("healthy", "ok")
+
+            replace.assert_called_once()
+            tmp_path, final_path = replace.call_args.args
+            self.assertEqual(final_path, state_path)
+            self.assertTrue(os.path.basename(tmp_path).startswith(".tmp-"))
+
+    def test_runtime_state_read_ignores_parse_failure_and_preserves_future_fields(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with patch.dict(
+                os.environ,
+                {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                clear=False,
+            ):
+                with open(state_path, "w", encoding="utf-8") as fh:
+                    fh.write("{not-json")
+                self.assertEqual(supervisor.read_runtime_state(), {})
+
+                future_payload = {
+                    "schema": "runtime_state_v2",
+                    "runtime_health": "healthy",
+                    "future_field": {"kept": True},
+                }
+                with open(state_path, "w", encoding="utf-8") as fh:
+                    json.dump(future_payload, fh)
+
+                self.assertEqual(supervisor.read_runtime_state(), future_payload)
+                self.assertEqual(
+                    supervisor._runtime_state_name(future_payload),
+                    "healthy",
+                )
+
+    def test_runtime_state_manual_health_sets_flag_and_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with patch.dict(os.environ, self._env(state_path), clear=False):
+                supervisor._write_runtime_state(
+                    "unrecoverable_manual",
+                    "gateway recovery exhausted",
+                    gateway_active=False,
+                    gateway_action="blocked",
+                    openclaw_ready=False,
+                    last_error_category="recovery_window_timeout",
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["runtime_health"], "unrecoverable_manual")
+            self.assertTrue(payload["manual_recovery_required"])
+            self.assertEqual(payload["gateway"]["status"], "unrecoverable_manual")
+            self.assertEqual(payload["gateway"]["action"], "blocked")
+            self.assertEqual(
+                payload["last_error"],
+                {
+                    "category": "recovery_window_timeout",
+                    "detail": "gateway recovery exhausted",
+                },
+            )
+
+    def test_runtime_state_reads_gce_instance_metadata_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path,
+                supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_123",
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "1",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_metadata_path",
+                    return_value="gce-instance-123",
+                ) as read_metadata_path,
+            ):
+                supervisor._write_runtime_state("healthy", "ok")
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(payload["instance_id"], "gce-instance-123")
+            read_metadata_path.assert_called_once_with("instance/id", timeout=2)
+
+    def test_runtime_state_redacts_sensitive_diagnostics(self) -> None:
+        detail = (
+            "restart failed Authorization: Bearer bearer-secret-123 "
+            "Authorization: Basic dXNlcjpwYXNz "
+            "api_key=sk-test-secret token=runtime-token "
+            "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 "
+            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+            "/etc/openclaw/openclaw.json "
+            "https://storage.googleapis.com/b?X-Goog-Signature=deadbeef "
+            "https://api.telegram.org/bot1234567890:AAEqhJkLmNoPqRsTuVwXyZ12345678/deleteWebhook"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with patch.dict(os.environ, self._env(state_path), clear=False):
+                supervisor._write_runtime_state(
+                    "openclaw_not_ready",
+                    detail,
+                    gateway_active=True,
+                    gateway_action="restart",
+                    openclaw_ready=False,
+                    last_error_category="health_check_failed",
+                )
+                payload = supervisor.read_runtime_state()
+
+        raw = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("bearer-secret-123", raw)
+        self.assertNotIn("dXNlcjpwYXNz", raw)
+        self.assertNotIn("sk-test-secret", raw)
+        self.assertNotIn("sk-or-v1-abcdef0123456789", raw)
+        self.assertNotIn("runtime-token", raw)
+        self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ", raw)
+        self.assertNotIn("AAEqhJkLmNoPqRsTuVwXyZ12345678", raw)
+        self.assertNotIn("api.telegram.org/bot", raw)
+        self.assertNotIn("/etc/openclaw/openclaw.json", raw)
+        self.assertNotIn("deadbeef", raw)
+        self.assertIn("[redacted]", raw)
+        self.assertIn("[local-path]", raw)
+        self.assertEqual(payload["last_error"]["category"], "health_check_failed")
+        self.assertEqual(payload["runtime_health"], "openclaw_not_ready")
+
+    def test_control_plane_state_dir_chowns_root_when_running_as_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            control_dir = os.path.join(tmpdir, "tinyhat-control")
+            with (
+                patch.object(supervisor.os, "geteuid", return_value=0),
+                patch.object(supervisor.os, "chown") as chown,
+            ):
+                supervisor._prepare_control_plane_state_dir(control_dir)
+
+            chown.assert_called_once_with(control_dir, 0, 0)
+            self.assertEqual(os.stat(control_dir).st_mode & 0o777, 0o700)
+
+
 class OpenClawGatewayReattachTests(unittest.TestCase):
     def _fingerprint(self, value: str = "abc123") -> dict[str, str]:
         return {
@@ -1453,6 +1757,46 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                 supervisor.PLATFORM_REQUEST_TIMEOUT_SECONDS,
             ],
         )
+
+    def test_me_state_post_sanitizes_detail_before_platform_send(self) -> None:
+        observed_bodies = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def _urlopen(req, timeout):
+            observed_bodies.append(json.loads(req.data.decode("utf-8")))
+            return _Resp()
+
+        detail = (
+            "gateway failed Authorization: Basic dXNlcjpwYXNz "
+            "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789"
+        )
+        with (
+            patch.object(supervisor, "get_backend_base_url", return_value="https://p"),
+            patch.object(supervisor, "fetch_identity_token", return_value="tok"),
+            patch.object(supervisor.urllib.request, "urlopen", side_effect=_urlopen),
+        ):
+            supervisor.post_json(
+                "/hapi/v1/computers/me/state",
+                {"state": "broken", "detail": detail},
+            )
+            supervisor.post_json("/hapi/v1/other", {"detail": detail})
+
+        state_body = observed_bodies[0]
+        passthrough_body = observed_bodies[1]
+        state_raw = json.dumps(state_body, sort_keys=True)
+        self.assertEqual(state_body["state"], "broken")
+        self.assertNotIn("dXNlcjpwYXNz", state_raw)
+        self.assertNotIn("sk-or-v1-abcdef0123456789", state_raw)
+        self.assertIn("dXNlcjpwYXNz", json.dumps(passthrough_body))
 
     def test_gce_identity_timeout_is_bounded(self) -> None:
         observed_timeouts = []
