@@ -1249,7 +1249,11 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "checkpoint_supervisor_progress",
                     return_value=True,
                 ),
-                patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=False,
+                ),
                 patch.object(
                     supervisor,
                     "GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES",
@@ -1272,6 +1276,88 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
             "recovery_window_timeout",
         )
         self.assertEqual(sleep.call_count, 2)
+
+    def test_gateway_recovery_wait_timeout_cycles_escalate_with_real_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "degraded_workload",
+                        "detail": "first hold-down expired",
+                        "gateway_recovery": {
+                            "last_oom_kill": 10,
+                            "hold_down_cycles": 1,
+                            "hold_down_until_unix": 100,
+                            "failures": [],
+                        },
+                    },
+                    fh,
+                )
+            unavailable = {
+                "available": False,
+                "reason": "gateway-cgroup-unavailable",
+            }
+            clock = {"now": 100}
+
+            def _time() -> float:
+                return float(clock["now"])
+
+            def _sleep(seconds: float) -> None:
+                clock["now"] += seconds
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", side_effect=_time),
+                patch.object(
+                    supervisor,
+                    "gateway_cgroup_memory_snapshot",
+                    return_value=unavailable,
+                ),
+                patch.object(
+                    supervisor,
+                    "checkpoint_supervisor_progress",
+                    return_value=True,
+                ),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=False,
+                ),
+                patch.object(supervisor.time, "sleep", side_effect=_sleep) as sleep,
+            ):
+                with self.assertRaises(supervisor.ManualRecoveryRequired):
+                    supervisor._wait_for_gateway_recovery_window()
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        expected_sampling_sleeps = (
+            supervisor.GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES - 1
+        ) * 2
+        expected_hold_down_sleeps = (
+            supervisor.GATEWAY_RECOVERY_HOLD_DOWN_SECONDS
+            // supervisor.GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS
+        )
+        self.assertEqual(
+            sleep.call_count,
+            expected_sampling_sleeps + expected_hold_down_sleeps,
+        )
+        self.assertEqual(state["state"], "unrecoverable_manual")
+        self.assertTrue(state["manual_recovery_required"])
+        self.assertEqual(state["gateway"]["action"], "blocked")
+        self.assertEqual(state["last_error_category"], "recovery_window_timeout")
+        self.assertEqual(state["gateway_recovery"]["hold_down_cycles"], 2)
+        self.assertEqual(
+            state["gateway_recovery"]["last_error_category"],
+            "recovery_window_timeout",
+        )
 
     def test_stable_healthy_window_resets_gateway_recovery_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

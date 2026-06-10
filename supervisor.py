@@ -1886,6 +1886,76 @@ def _record_gateway_recovery_failure(
     return "tracking"
 
 
+def _record_gateway_recovery_window_timeout(
+    *,
+    snapshot: dict[str, Any] | None = None,
+    config_fingerprint: dict[str, str] | None = None,
+    now: int | None = None,
+) -> str:
+    now = _gateway_recovery_now() if now is None else now
+    current_state = read_runtime_state()
+    policy = _runtime_state_gateway_recovery(current_state)
+    policy = _gateway_recovery_policy_with_cgroup_baseline(policy, snapshot)
+    failures = [
+        item
+        for item in policy.get("failures", [])
+        if now - int(item["at_unix"]) <= GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS
+    ]
+    failures.append(
+        _gateway_recovery_failure_entry(
+            "recovery_window_timeout",
+            snapshot,
+            now,
+        )
+    )
+    policy["failures"] = failures
+    policy["last_error_category"] = "recovery_window_timeout"
+    policy["last_failure_at_unix"] = now
+
+    cycles = int(policy.get("hold_down_cycles") or 0)
+    if cycles >= GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES:
+        policy["manual_recovery_required"] = True
+        policy.pop("hold_down_started_at_unix", None)
+        policy.pop("hold_down_until_unix", None)
+        policy.pop("hold_down_reason", None)
+        _write_runtime_state(
+            "unrecoverable_manual",
+            (
+                "gateway recovery exhausted after "
+                f"{GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES} hold-down cycles"
+            ),
+            config_fingerprint=config_fingerprint,
+            gateway_active=is_openclaw_gateway_active(),
+            gateway_action="blocked",
+            openclaw_ready=False,
+            gateway_recovery=policy,
+            gateway_cgroup=snapshot,
+            last_error_category="recovery_window_timeout",
+        )
+        return "manual"
+
+    cycles += 1
+    policy["hold_down_cycles"] = cycles
+    policy["hold_down_started_at_unix"] = now
+    policy["hold_down_until_unix"] = now + GATEWAY_RECOVERY_HOLD_DOWN_SECONDS
+    policy["hold_down_reason"] = "recovery_window_timeout"
+    _write_runtime_state(
+        "degraded_workload",
+        (
+            "gateway hold-down active after recovery window timeout "
+            f"(cycle {cycles}/{GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES})"
+        ),
+        config_fingerprint=config_fingerprint,
+        gateway_active=is_openclaw_gateway_active(),
+        gateway_action="hold_down",
+        openclaw_ready=False,
+        gateway_recovery=policy,
+        gateway_cgroup=snapshot,
+        last_error_category="recovery_window_timeout",
+    )
+    return "hold_down"
+
+
 def _record_gateway_oom_delta(
     snapshot: dict[str, Any],
     *,
@@ -2055,12 +2125,7 @@ def _wait_for_gateway_recovery_window(
                 )
                 return
             if samples_taken >= max_samples:
-                mode = _record_gateway_recovery_failure(
-                    "recovery_window_timeout",
-                    (
-                        "gateway recovery window was not satisfied before "
-                        "the sample budget expired"
-                    ),
+                mode = _record_gateway_recovery_window_timeout(
                     snapshot=snapshot,
                     config_fingerprint=config_fingerprint,
                 )
@@ -2068,6 +2133,7 @@ def _wait_for_gateway_recovery_window(
                     raise ManualRecoveryRequired(
                         "gateway recovery exhausted; manual recovery required"
                     )
+                platform_hold_down_reported = False
                 break
             checkpoint_supervisor_progress(
                 "gateway-recovery-memory-wait",
