@@ -92,6 +92,16 @@ _DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH = (
 _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
     "/var/lib/tinyhat-control/clear-unrecoverable-manual"
 )
+RUNTIME_STATE_SCHEMA = "runtime_state_v1"
+RUNTIME_HEALTH_VALUES = frozenset(
+    {
+        "healthy",
+        "degraded_workload",
+        "openclaw_not_ready",
+        "unsupported_openclaw_version",
+        "unrecoverable_manual",
+    }
+)
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
 # OpenRouter's catalog can report very large per-model completion ceilings
@@ -188,6 +198,9 @@ TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV = (
 TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH_ENV = (
     "TINYHAT_RUNTIME_STATE_CLEAR_MANUAL_PATH"
 )
+TINYHAT_COMPUTER_ID_ENV = "TINYHAT_COMPUTER_ID"
+TINYHAT_GCE_INSTANCE_ID_ENV = "TINYHAT_GCE_INSTANCE_ID"
+TINYHAT_GCE_METADATA_AVAILABLE_ENV = "TINYHAT_GCE_METADATA_AVAILABLE"
 TINYHAT_OPENCLAW_RUNTIME_USER_ENV = "TINYHAT_OPENCLAW_RUNTIME_USER"
 TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV = "TINYHAT_OPENCLAW_RUNTIME_GROUP"
 
@@ -198,6 +211,7 @@ TINYHAT_OPENCLAW_RUNTIME_GROUP_ENV = "TINYHAT_OPENCLAW_RUNTIME_GROUP"
 # the metadata server is unreachable or the key is missing.
 METADATA_BASE_URL_KEY = "tinyhat-platform-base-url"
 METADATA_AUDIENCE_KEY = "tinyhat-backend-audience"
+METADATA_COMPUTER_ID_KEY = "tinyhat-computer-id"
 METADATA_TTL_SECONDS = 30
 
 BINDING_POLL_BASE_SECONDS = 3
@@ -369,14 +383,33 @@ _audience_cache = {"value": None, "ts": 0.0}
 _last_watchdog_checkpoint_ts = 0.0
 
 
-def _read_metadata_value(key: str, timeout: int = 5) -> str:
+def _read_metadata_path(path: str, timeout: int = 5) -> str:
     url = (
         "http://metadata.google.internal/computeMetadata/v1/"
-        f"instance/attributes/{key}"
+        + path.lstrip("/")
     )
     req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8").strip()
+
+
+def _read_metadata_value(key: str, timeout: int = 5) -> str:
+    return _read_metadata_path(f"instance/attributes/{key}", timeout=timeout)
+
+
+def _gce_metadata_available() -> bool:
+    override = (
+        os.environ.get(TINYHAT_GCE_METADATA_AVAILABLE_ENV) or ""
+    ).strip().lower()
+    if override in {"1", "true", "yes"}:
+        return True
+    if override in {"0", "false", "no"}:
+        return False
+    try:
+        with open("/sys/class/dmi/id/product_name", encoding="utf-8") as fh:
+            return "google compute engine" in fh.read().strip().lower()
+    except OSError:
+        return False
 
 
 def get_backend_base_url() -> str:
@@ -1581,6 +1614,11 @@ def _prepare_control_plane_state_dir(path: str) -> None:
         os.chmod(path, 0o700)
     except OSError as exc:
         log.warning("failed to chmod control-plane state dir %s: %s", path, exc)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            os.chown(path, 0, 0)
+        except OSError as exc:
+            log.warning("failed to chown control-plane state dir %s: %s", path, exc)
 
 
 def read_runtime_state() -> dict[str, Any]:
@@ -1597,7 +1635,7 @@ def read_runtime_state() -> dict[str, Any]:
 
 
 def _runtime_state_name(state: dict[str, Any]) -> str:
-    for key in ("state", "runtime_state", "health", "primary"):
+    for key in ("state", "runtime_health", "runtime_state", "health", "primary"):
         value = state.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -1679,6 +1717,152 @@ def _gateway_recovery_now() -> int:
     return int(time.time())
 
 
+_RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|"
+    r"password|secret|cookie|authorization)\b(\s*[:=]\s*)([^\s,;]+)"
+)
+_RUNTIME_STATE_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_RUNTIME_STATE_SIGNED_QUERY_RE = re.compile(
+    r"(?i)([?&][^=\s&]*(?:token|signature|credential|key|secret|password)"
+    r"[^=\s&]*=)[^&\s]+"
+)
+_RUNTIME_STATE_TELEGRAM_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+_RUNTIME_STATE_LOCAL_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?:Users|home|root|etc|var|tmp|private|opt)/"
+    r"[^\s,'\")]+"
+)
+
+
+def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
+    text = str(value or "")
+    text = _RUNTIME_STATE_BEARER_RE.sub("Bearer [redacted]", text)
+    text = _RUNTIME_STATE_TELEGRAM_TOKEN_RE.sub("[redacted-telegram-token]", text)
+    text = _RUNTIME_STATE_SIGNED_QUERY_RE.sub(r"\1[redacted]", text)
+    text = _RUNTIME_STATE_SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        text,
+    )
+    text = _RUNTIME_STATE_LOCAL_PATH_RE.sub("[local-path]", text)
+    return text[:limit]
+
+
+def _runtime_state_observed_at(now: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+
+
+def _runtime_health_value(state: str) -> str:
+    normalized = str(state or "").strip()
+    if normalized in RUNTIME_HEALTH_VALUES:
+        return normalized
+    return "degraded_workload"
+
+
+def _runtime_computer_id() -> str | None:
+    for env_name in (TINYHAT_COMPUTER_ID_ENV, "DEV_AUTO_COMPUTER_ID"):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    if _dev_mode():
+        return None
+    if not _gce_metadata_available():
+        return None
+    try:
+        return _read_metadata_value(METADATA_COMPUTER_ID_KEY, timeout=2) or None
+    except Exception as exc:
+        log.debug("runtime state computer id metadata unavailable: %s", exc)
+        return None
+
+
+def _gce_instance_id() -> str | None:
+    value = (os.environ.get(TINYHAT_GCE_INSTANCE_ID_ENV) or "").strip()
+    if value:
+        return value
+    if _dev_mode():
+        return None
+    if not _gce_metadata_available():
+        return None
+    try:
+        return _read_metadata_path("instance/id", timeout=2) or None
+    except Exception as exc:
+        log.debug("runtime state GCE instance id metadata unavailable: %s", exc)
+        return None
+
+
+def _runtime_ref() -> str | None:
+    try:
+        version = _read_runtime_repo_version()
+    except Exception:
+        version = ""
+    try:
+        sha = _read_runtime_git_sha()
+    except Exception:
+        sha = ""
+    if version and sha:
+        return f"{version}@{sha[:12]}"
+    if sha:
+        return sha
+    return version or None
+
+
+def _runtime_supervisor_status(runtime_health: str) -> str:
+    if runtime_health in RUNTIME_HEALTH_VALUES:
+        return runtime_health
+    return "degraded_workload"
+
+
+def _gateway_status(
+    runtime_health: str,
+    *,
+    gateway_active: bool | None,
+    openclaw_ready: bool | None,
+) -> str:
+    if runtime_health == "unrecoverable_manual":
+        return "unrecoverable_manual"
+    if runtime_health == "openclaw_not_ready":
+        return "openclaw_not_ready"
+    if gateway_active is False:
+        return "inactive"
+    if openclaw_ready is False:
+        return "not_ready"
+    return runtime_health
+
+
+def _gateway_restart_count_window(
+    gateway_recovery: dict[str, Any],
+    *,
+    now: int,
+) -> int:
+    count = 0
+    for item in gateway_recovery.get("failures") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            at_unix = int(item.get("at_unix"))
+        except (TypeError, ValueError):
+            continue
+        if now - at_unix <= GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS:
+            count += 1
+    return count
+
+
+def _runtime_state_last_error(
+    runtime_health: str,
+    detail: str,
+    *,
+    category: str | None,
+) -> dict[str, str] | None:
+    if runtime_health == "healthy" and not category:
+        return None
+    safe_category = _sanitize_runtime_state_text(
+        category or runtime_health,
+        limit=128,
+    )
+    return {
+        "category": safe_category or runtime_health,
+        "detail": _sanitize_runtime_state_text(detail),
+    }
+
+
 def _gateway_cgroup_event(snapshot: dict[str, Any] | None, key: str) -> int | None:
     if not isinstance(snapshot, dict):
         return None
@@ -1723,6 +1907,14 @@ def _write_runtime_state(
     parent = os.path.dirname(path)
     _prepare_control_plane_state_dir(parent)
     existing_state = read_runtime_state()
+    now = int(time.time())
+    runtime_health = _runtime_health_value(state)
+    safe_detail = _sanitize_runtime_state_text(detail)
+    safe_last_error_category = (
+        _sanitize_runtime_state_text(last_error_category, limit=128)
+        if last_error_category
+        else None
+    )
     if gateway_recovery is None:
         gateway_recovery = _runtime_state_gateway_recovery(existing_state)
     if config_fingerprint is None:
@@ -1741,30 +1933,60 @@ def _write_runtime_state(
             gateway_recovery,
             gateway_cgroup,
         )
-    payload: dict[str, Any] = {
-        "schema": "tinyhat_runtime_state_v1",
-        "schema_version": 1,
-        "state": state,
-        "detail": detail,
-        "updated_at_unix": int(time.time()),
-        "manual_recovery_required": state == "unrecoverable_manual",
-        "manual_recovery_marker_path": runtime_state_manual_marker_path(),
-        "manual_recovery_clear_marker_path": runtime_state_clear_manual_path(),
-        "gateway": {
-            "unit": GATEWAY_SYSTEMD_UNIT,
-        },
-        "openclaw": {},
+    runtime_version = ""
+    try:
+        runtime_version = _read_runtime_repo_version()
+    except Exception:
+        runtime_version = ""
+    gateway_payload: dict[str, Any] = {
+        "unit": GATEWAY_SYSTEMD_UNIT,
+        "status": _gateway_status(
+            runtime_health,
+            gateway_active=gateway_active,
+            openclaw_ready=openclaw_ready,
+        ),
+        "restart_count_window": _gateway_restart_count_window(
+            gateway_recovery,
+            now=now,
+        ),
     }
     if gateway_active is not None:
-        payload["gateway"]["active"] = bool(gateway_active)
+        gateway_payload["active"] = bool(gateway_active)
     if gateway_action:
-        payload["gateway"]["action"] = gateway_action
+        gateway_payload["action"] = gateway_action
+    payload: dict[str, Any] = {
+        "schema": RUNTIME_STATE_SCHEMA,
+        "schema_version": 1,
+        "computer_id": _runtime_computer_id(),
+        "instance_id": _gce_instance_id(),
+        "runtime_ref": _runtime_ref(),
+        "observed_at": _runtime_state_observed_at(now),
+        "runtime_health": runtime_health,
+        "runtime_state": runtime_health,
+        "state": runtime_health,
+        "detail": safe_detail,
+        "updated_at_unix": now,
+        "supervisor": {
+            "version": runtime_version or None,
+            "status": _runtime_supervisor_status(runtime_health),
+        },
+        "manual_recovery_required": runtime_health == "unrecoverable_manual",
+        "manual_recovery_marker_path": runtime_state_manual_marker_path(),
+        "manual_recovery_clear_marker_path": runtime_state_clear_manual_path(),
+        "gateway": gateway_payload,
+        "openclaw": {},
+        "last_error": _runtime_state_last_error(
+            runtime_health,
+            safe_detail,
+            category=safe_last_error_category,
+        ),
+    }
     if openclaw_ready is not None:
         payload["openclaw"]["ready"] = bool(openclaw_ready)
     if config_fingerprint:
         payload["config_fingerprint"] = dict(config_fingerprint)
-    if last_error_category:
-        payload["last_error_category"] = last_error_category
+    if safe_last_error_category:
+        payload["last_error_category"] = safe_last_error_category
     if gateway_recovery:
         payload["gateway_recovery"] = gateway_recovery
     _atomic_write_json(path, payload, mode=0o600)
