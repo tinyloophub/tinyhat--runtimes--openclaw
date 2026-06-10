@@ -161,6 +161,17 @@ The supervisor writes local runtime health to
 mode, mirroring the production control-plane path
 `/var/lib/tinyhat-control/runtime-state.json`.
 
+The same file also holds the gateway recovery policy state. In
+production the supervisor samples the gateway cgroup v2 files
+`memory.current`, `memory.max`, and `memory.events.local` from the
+gateway service cgroup, falling back to the workload slice when the
+service is inactive. A local `oom_kill` delta or restart failure is
+counted inside the ten-minute failure window. Three failures enter a
+ten-minute hold-down, and recovery waits for three stable memory
+samples spaced ten seconds apart before another restart. A thirty-minute
+healthy window resets counters; after two failed hold-down cycles, the
+runtime enters `unrecoverable_manual`.
+
 An operator can intentionally hold recovery by creating
 `$TINYHAT_RUNTIME_HOME/tinyhat-control/unrecoverable-manual`
 (`TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH` overrides the path). On the

@@ -9,6 +9,7 @@ communication between the Computer and the Tinyhat platform:
   provider credentials this Computer should run);
 - writing the **framework config** (OpenClaw) for the binding;
 - starting and monitoring the framework **gateway** under systemd;
+- bounded gateway recovery from restart storms and cgroup v2 OOM signals;
 - **heartbeat** while active, plus rebind / unassign detection;
 - runtime config apply for Computer-scoped secrets;
 - installing the public Tinyhat OpenClaw plugin from the repo/ref
@@ -79,6 +80,31 @@ The framework (OpenClaw) is installed from npm and is **not** vendored
 here — only a package/version pin is recorded. A separate
 framework-reference repository would only be introduced if a
 framework needed a lifecycle that npm cannot express.
+
+## Gateway recovery
+
+The supervisor is the only authority for intentional gateway hold-down.
+It reads the gateway service cgroup, falling back to the workload slice
+when the service is inactive, and records non-secret recovery evidence in
+`/var/lib/tinyhat-control/runtime-state.json`.
+
+Recovery policy:
+
+- `memory.events.local` `oom_kill` deltas are the primary local OOM signal;
+- `oom` is recorded only as supporting evidence;
+- three gateway OOM/restart failures inside ten minutes enter hold-down;
+- hold-down starts at ten minutes;
+- recovery waits for three samples, spaced ten seconds apart, where
+  `memory.current <= 70% memory.max` and no new `oom_kill` delta appears;
+- a thirty-minute stable healthy window resets counters;
+- after two failed hold-down cycles without a stable window, the runtime
+  enters `unrecoverable_manual`.
+
+When `unrecoverable_manual` is set, automatic gateway restart attempts stop.
+The operator clear path is typed and file-based:
+`/var/lib/tinyhat-control/clear-unrecoverable-manual` clears the marker after
+manual repair. This repo does not add arbitrary shell, arbitrary `systemctl`,
+or broad repair commands.
 
 ## Tinyhat plugin support
 
