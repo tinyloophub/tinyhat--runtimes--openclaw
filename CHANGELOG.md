@@ -7,18 +7,33 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+No unreleased changes.
+
+## 0.11.15
+
+### Added
+
+- Add systemd watchdog/notify readiness and bounded forward-progress
+  checkpoints for the Tinyhat supervisor, so the platform can distinguish
+  startup, healthy gateway, degraded, and recovery states.
+- Add cgroup v2 memory/OOM recovery policy for the OpenClaw gateway: `oom_kill`
+  deltas and restart failures enter supervisor-owned hold-down, recovery waits
+  for bounded memory stability, stable healthy windows reset counters, and
+  repeated failed hold-down cycles escalate to `unrecoverable_manual`.
+- Persist root-owned local `runtime_state_v1` health state and mirror the same
+  payload to the Tinyhat platform endpoint best-effort for admin visibility.
+
 ### Fixed
 
 - Reattach the supervisor to an already healthy OpenClaw gateway when the
   persisted runtime state and current config fingerprint match, so supervisor
   restarts do not disrupt Telegram long polling.
-- Persist root-owned local runtime health state for gateway startup/reattach,
-  including `openclaw_not_ready` before bounded recovery and operator
-  marker/clear-marker handling for `unrecoverable_manual` state.
-- Add cgroup v2 memory/OOM recovery policy for the OpenClaw gateway: `oom_kill`
-  deltas and restart failures enter supervisor-owned hold-down, recovery waits
-  for bounded memory stability, stable healthy windows reset counters, and
-  repeated failed hold-down cycles escalate to `unrecoverable_manual`.
+- Keep gateway not-ready states from reporting as healthy, including
+  `openclaw_not_ready` before bounded recovery and operator marker/clear-marker
+  handling for `unrecoverable_manual` state.
+- Harden platform runtime-state mirroring with metadata-aware base URL
+  resolution, unchanged-payload POST throttling, and bounded platform error
+  labels.
 
 ## 0.11.14
 
