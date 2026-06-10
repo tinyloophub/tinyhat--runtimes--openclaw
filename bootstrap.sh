@@ -35,8 +35,10 @@ RUNTIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SUPERVISOR_PATH="${RUNTIME_DIR}/supervisor.py"
 SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"
 GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"
+WORKLOAD_SLICE_UNIT_NAME="tinyhat-openclaw-workload.slice"
 SUPERVISOR_UNIT="/etc/systemd/system/${SUPERVISOR_UNIT_NAME}"
 GATEWAY_UNIT="/etc/systemd/system/${GATEWAY_UNIT_NAME}"
+WORKLOAD_SLICE_UNIT="/etc/systemd/system/${WORKLOAD_SLICE_UNIT_NAME}"
 RUNTIME_ENV_FILE="/etc/tinyhat/runtime.env"
 
 OPENCLAW_CONFIG_PATH="/etc/openclaw/openclaw.json"
@@ -204,6 +206,23 @@ chown_runtime_paths
 } > "${RUNTIME_ENV_FILE}"
 chmod 0644 "${RUNTIME_ENV_FILE}"
 
+# The workload slice is explicit so the supervisor can still sample
+# bounded cgroup memory state while the gateway service itself is
+# stopped for hold-down.
+cat > "${WORKLOAD_SLICE_UNIT}" <<UNIT
+[Unit]
+Description=Tinyhat OpenClaw workload slice
+
+[Slice]
+MemoryAccounting=true
+MemoryHigh=2400M
+MemoryMax=3072M
+CPUAccounting=true
+CPUQuota=175%
+TasksAccounting=true
+TasksMax=512
+UNIT
+
 # The OpenClaw gateway: a separate systemd unit so it has
 # first-class lifecycle, logs, and crash-restart semantics. Started
 # and stopped only by the supervisor; restarted by systemd if
@@ -227,7 +246,7 @@ Environment=OPENCLAW_STATE_DIR=${OPENCLAW_STATE_DIR}
 Environment=HOME=${OPENCLAW_STATE_DIR}
 WorkingDirectory=${OPENCLAW_STATE_DIR}
 ExecStart=/usr/bin/env openclaw gateway run --force --allow-unconfigured --port ${OPENCLAW_GATEWAY_PORT} --bind loopback --auth none --tailscale off --verbose
-Slice=tinyhat-openclaw-workload.slice
+Slice=${WORKLOAD_SLICE_UNIT_NAME}
 MemoryAccounting=true
 MemoryHigh=2400M
 MemoryMax=3072M
@@ -292,6 +311,7 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+systemctl start "${WORKLOAD_SLICE_UNIT_NAME}"
 systemctl enable --now "${SUPERVISOR_UNIT_NAME}"
 
 echo "[tinyhat-runtime] bootstrap complete"

@@ -151,6 +151,7 @@ TINYHAT_PLUGIN_REPO_REF_ENV = "TINYHAT_PLATFORM_PLUGIN_REPO_REF"
 TINYHAT_PLUGIN_REPO_URL_DEFAULT = "https://github.com/tinyhat-ai/tinyhat.git"
 TINYHAT_PLUGIN_REPO_REF_DEFAULT = "main"
 GATEWAY_SYSTEMD_UNIT = "tinyhat-openclaw-gateway.service"
+GATEWAY_WORKLOAD_SLICE_UNIT = "tinyhat-openclaw-workload.slice"
 # The systemd unit that runs THIS supervisor in production. Used by the
 # runtime self-update path (the ``update_component`` command): after the
 # runtime repo is checked out to a new ref, the still-running old
@@ -203,6 +204,14 @@ BINDING_POLL_BASE_SECONDS = 3
 BINDING_POLL_IDLE_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
+GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS = 10 * 60
+GATEWAY_RECOVERY_FAILURE_THRESHOLD = 3
+GATEWAY_RECOVERY_HOLD_DOWN_SECONDS = 10 * 60
+GATEWAY_RECOVERY_MEMORY_THRESHOLD_RATIO = 0.70
+GATEWAY_RECOVERY_MEMORY_STABLE_SAMPLES = 3
+GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS = 10
+GATEWAY_RECOVERY_HEALTHY_RESET_SECONDS = 30 * 60
+GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES = 2
 GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS = 5
 PLATFORM_REQUEST_TIMEOUT_SECONDS = 10
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5
@@ -607,22 +616,9 @@ def _read_int_file(path: str) -> int | str | None:
         return None
 
 
-def gateway_cgroup_memory_snapshot() -> dict[str, Any]:
-    """Best-effort gateway cgroup memory read for watchdog checkpoints."""
-    if _dev_mode():
-        return {"available": False, "reason": "dev-mode"}
-    result = _run_systemctl(
-        "show",
-        GATEWAY_SYSTEMD_UNIT,
-        "--property=ControlGroup",
-        "--value",
-        check=False,
-    )
-    if result.returncode != 0:
-        return {"available": False, "reason": "systemctl-show-failed"}
-    control_group = (result.stdout or "").strip()
+def _cgroup_path_for_control_group(control_group: str) -> str | None:
     if not control_group:
-        return {"available": False, "reason": "no-control-group"}
+        return None
     cgroup_root = (
         os.environ.get("TINYHAT_CGROUP_ROOT") or "/sys/fs/cgroup"
     ).rstrip("/")
@@ -631,9 +627,40 @@ def gateway_cgroup_memory_snapshot() -> dict[str, Any]:
     )
     root_prefix = os.path.normpath(cgroup_root) + os.sep
     if not (cgroup_path + os.sep).startswith(root_prefix):
+        return None
+    return cgroup_path
+
+
+def _systemd_control_group(unit: str) -> str:
+    result = _run_systemctl(
+        "show",
+        unit,
+        "--property=ControlGroup",
+        "--value",
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def gateway_cgroup_memory_snapshot() -> dict[str, Any]:
+    """Best-effort gateway cgroup memory read for watchdog checkpoints."""
+    if _dev_mode():
+        return {"available": False, "reason": "dev-mode"}
+    control_group = _systemd_control_group(GATEWAY_SYSTEMD_UNIT)
+    unit = GATEWAY_SYSTEMD_UNIT
+    if not control_group:
+        control_group = _systemd_control_group(GATEWAY_WORKLOAD_SLICE_UNIT)
+        unit = GATEWAY_WORKLOAD_SLICE_UNIT
+    if not control_group:
+        return {"available": False, "reason": "no-control-group"}
+    cgroup_path = _cgroup_path_for_control_group(control_group)
+    if cgroup_path is None:
         return {"available": False, "reason": "invalid-control-group-path"}
     snapshot: dict[str, Any] = {
         "available": True,
+        "unit": unit,
         "control_group": control_group,
         "memory_current_bytes": _read_int_file(
             os.path.join(cgroup_path, "memory.current")
@@ -1616,6 +1643,69 @@ def _consume_runtime_manual_clear_marker() -> bool:
     return True
 
 
+def _runtime_state_gateway_recovery(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.get("gateway_recovery")
+    policy: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    failures = []
+    for item in policy.get("failures") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            at_unix = int(item.get("at_unix"))
+        except (TypeError, ValueError):
+            continue
+        reason = str(item.get("reason") or "unknown").strip() or "unknown"
+        compact = {"at_unix": at_unix, "reason": reason}
+        for key in (
+            "oom_kill",
+            "oom",
+            "memory_current_bytes",
+            "memory_max_bytes",
+            "control_group",
+        ):
+            if key in item:
+                compact[key] = item[key]
+        failures.append(compact)
+    policy["failures"] = failures
+    try:
+        policy["hold_down_cycles"] = int(policy.get("hold_down_cycles") or 0)
+    except (TypeError, ValueError):
+        policy["hold_down_cycles"] = 0
+    return policy
+
+
+def _gateway_recovery_now() -> int:
+    return int(time.time())
+
+
+def _gateway_cgroup_event(snapshot: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    events = snapshot.get("memory_events")
+    if not isinstance(events, dict):
+        return None
+    value = events.get(key)
+    return value if isinstance(value, int) else None
+
+
+def _gateway_recovery_policy_with_cgroup_baseline(
+    policy: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict) or snapshot.get("available") is not True:
+        return policy
+    oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
+    oom = _gateway_cgroup_event(snapshot, "oom")
+    if oom_kill is not None:
+        policy["last_oom_kill"] = oom_kill
+    if oom is not None:
+        policy["last_oom"] = oom
+    policy["last_cgroup_sample_at_unix"] = _gateway_recovery_now()
+    if snapshot.get("control_group"):
+        policy["control_group"] = snapshot["control_group"]
+    return policy
+
+
 def _write_runtime_state(
     state: str,
     detail: str,
@@ -1624,10 +1714,20 @@ def _write_runtime_state(
     gateway_active: bool | None = None,
     gateway_action: str | None = None,
     openclaw_ready: bool | None = None,
+    gateway_recovery: dict[str, Any] | None = None,
+    gateway_cgroup: dict[str, Any] | None = None,
+    last_error_category: str | None = None,
 ) -> None:
     path = runtime_state_path()
     parent = os.path.dirname(path)
     _prepare_control_plane_state_dir(parent)
+    if gateway_recovery is None:
+        gateway_recovery = _runtime_state_gateway_recovery(read_runtime_state())
+    if gateway_cgroup is not None:
+        gateway_recovery = _gateway_recovery_policy_with_cgroup_baseline(
+            gateway_recovery,
+            gateway_cgroup,
+        )
     payload: dict[str, Any] = {
         "schema": "tinyhat_runtime_state_v1",
         "schema_version": 1,
@@ -1650,7 +1750,318 @@ def _write_runtime_state(
         payload["openclaw"]["ready"] = bool(openclaw_ready)
     if config_fingerprint:
         payload["config_fingerprint"] = dict(config_fingerprint)
+    if last_error_category:
+        payload["last_error_category"] = last_error_category
+    if gateway_recovery:
+        payload["gateway_recovery"] = gateway_recovery
     _atomic_write_json(path, payload, mode=0o600)
+
+
+def _gateway_recovery_failure_entry(
+    reason: str,
+    snapshot: dict[str, Any] | None,
+    now: int,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"at_unix": now, "reason": reason}
+    if isinstance(snapshot, dict):
+        for source, target in (
+            ("memory_current_bytes", "memory_current_bytes"),
+            ("memory_max_bytes", "memory_max_bytes"),
+            ("control_group", "control_group"),
+        ):
+            if source in snapshot:
+                entry[target] = snapshot[source]
+        oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
+        oom = _gateway_cgroup_event(snapshot, "oom")
+        if oom_kill is not None:
+            entry["oom_kill"] = oom_kill
+        if oom is not None:
+            entry["oom"] = oom
+    return entry
+
+
+def _record_gateway_recovery_failure(
+    reason: str,
+    detail: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    config_fingerprint: dict[str, str] | None = None,
+    now: int | None = None,
+) -> str:
+    now = _gateway_recovery_now() if now is None else now
+    current_state = read_runtime_state()
+    policy = _runtime_state_gateway_recovery(current_state)
+    policy = _gateway_recovery_policy_with_cgroup_baseline(policy, snapshot)
+    failures = [
+        item
+        for item in policy.get("failures", [])
+        if now - int(item["at_unix"]) <= GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS
+    ]
+    failures.append(_gateway_recovery_failure_entry(reason, snapshot, now))
+    policy["failures"] = failures
+    policy["last_error_category"] = reason
+    policy["last_failure_at_unix"] = now
+
+    hold_down_until = int(policy.get("hold_down_until_unix") or 0)
+    if hold_down_until > now:
+        _write_runtime_state(
+            "degraded_workload",
+            detail,
+            config_fingerprint=config_fingerprint,
+            gateway_active=is_openclaw_gateway_active(),
+            gateway_action="hold_down",
+            openclaw_ready=False,
+            gateway_recovery=policy,
+            gateway_cgroup=snapshot,
+            last_error_category=reason,
+        )
+        return "hold_down"
+
+    if len(failures) >= GATEWAY_RECOVERY_FAILURE_THRESHOLD:
+        cycles = int(policy.get("hold_down_cycles") or 0)
+        if cycles >= GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES:
+            policy["manual_recovery_required"] = True
+            policy.pop("hold_down_started_at_unix", None)
+            policy.pop("hold_down_until_unix", None)
+            _write_runtime_state(
+                "unrecoverable_manual",
+                (
+                    "gateway recovery exhausted after "
+                    f"{GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES} hold-down cycles"
+                ),
+                config_fingerprint=config_fingerprint,
+                gateway_active=is_openclaw_gateway_active(),
+                gateway_action="blocked",
+                openclaw_ready=False,
+                gateway_recovery=policy,
+                gateway_cgroup=snapshot,
+                last_error_category=reason,
+            )
+            return "manual"
+        cycles += 1
+        policy["hold_down_cycles"] = cycles
+        policy["hold_down_started_at_unix"] = now
+        policy["hold_down_until_unix"] = now + GATEWAY_RECOVERY_HOLD_DOWN_SECONDS
+        policy["hold_down_reason"] = reason
+        _write_runtime_state(
+            "degraded_workload",
+            (
+                "gateway hold-down active after repeated failures "
+                f"(cycle {cycles}/{GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES})"
+            ),
+            config_fingerprint=config_fingerprint,
+            gateway_active=is_openclaw_gateway_active(),
+            gateway_action="hold_down",
+            openclaw_ready=False,
+            gateway_recovery=policy,
+            gateway_cgroup=snapshot,
+            last_error_category=reason,
+        )
+        return "hold_down"
+
+    _write_runtime_state(
+        "degraded_workload",
+        detail,
+        config_fingerprint=config_fingerprint,
+        gateway_active=is_openclaw_gateway_active(),
+        gateway_action="failure_recorded",
+        openclaw_ready=False,
+        gateway_recovery=policy,
+        gateway_cgroup=snapshot,
+        last_error_category=reason,
+    )
+    return "tracking"
+
+
+def _record_gateway_oom_delta(
+    snapshot: dict[str, Any],
+    *,
+    config_fingerprint: dict[str, str] | None = None,
+) -> str:
+    if not isinstance(snapshot, dict) or snapshot.get("available") is not True:
+        return "unavailable"
+    current_oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
+    if current_oom_kill is None:
+        return "unavailable"
+    state = read_runtime_state()
+    policy = _runtime_state_gateway_recovery(state)
+    previous_oom_kill = policy.get("last_oom_kill")
+    if not isinstance(previous_oom_kill, int) or current_oom_kill < previous_oom_kill:
+        policy = _gateway_recovery_policy_with_cgroup_baseline(policy, snapshot)
+        _write_runtime_state(
+            _runtime_state_name(state) or "degraded_workload",
+            str(state.get("detail") or "gateway cgroup baseline recorded"),
+            config_fingerprint=config_fingerprint,
+            gateway_active=is_openclaw_gateway_active(),
+            gateway_recovery=policy,
+            gateway_cgroup=snapshot,
+        )
+        return "baseline"
+    if current_oom_kill == previous_oom_kill:
+        return "unchanged"
+    delta = current_oom_kill - previous_oom_kill
+    return _record_gateway_recovery_failure(
+        "oom_kill",
+        f"gateway cgroup oom_kill advanced by {delta}",
+        snapshot=snapshot,
+        config_fingerprint=config_fingerprint,
+    )
+
+
+def _gateway_memory_recovery_sample_ok(
+    snapshot: dict[str, Any],
+    *,
+    baseline_oom_kill: int,
+) -> bool:
+    if not isinstance(snapshot, dict) or snapshot.get("available") is not True:
+        return False
+    memory_current = snapshot.get("memory_current_bytes")
+    memory_max = snapshot.get("memory_max_bytes")
+    if not isinstance(memory_current, int) or not isinstance(memory_max, int):
+        return False
+    if memory_max <= 0:
+        return False
+    current_oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
+    if current_oom_kill is None or current_oom_kill > baseline_oom_kill:
+        return False
+    return memory_current <= int(memory_max * GATEWAY_RECOVERY_MEMORY_THRESHOLD_RATIO)
+
+
+def _wait_for_gateway_recovery_window(
+    *,
+    config_fingerprint: dict[str, str] | None = None,
+) -> None:
+    while True:
+        state = read_runtime_state()
+        if _runtime_state_is_unrecoverable_manual(state):
+            raise ManualRecoveryRequired(
+                "manual recovery required; automatic gateway recovery blocked"
+            )
+        policy = _runtime_state_gateway_recovery(state)
+        hold_down_until = int(policy.get("hold_down_until_unix") or 0)
+        now = _gateway_recovery_now()
+        if hold_down_until <= 0:
+            return
+        if hold_down_until > now:
+            _write_runtime_state(
+                "degraded_workload",
+                "gateway hold-down active; automatic restart delayed",
+                config_fingerprint=config_fingerprint,
+                gateway_active=is_openclaw_gateway_active(),
+                gateway_action="hold_down",
+                openclaw_ready=False,
+                gateway_recovery=policy,
+            )
+            checkpoint_supervisor_progress(
+                "gateway-recovery-hold-down",
+                inspect_gateway=True,
+            )
+            time.sleep(
+                min(
+                    GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS,
+                    max(1, hold_down_until - now),
+                )
+            )
+            continue
+
+        first_snapshot = gateway_cgroup_memory_snapshot()
+        baseline_oom_kill = _gateway_cgroup_event(first_snapshot, "oom_kill")
+        if baseline_oom_kill is None:
+            baseline_oom_kill = int(policy.get("last_oom_kill") or 0)
+        stable_samples = 0
+        while stable_samples < GATEWAY_RECOVERY_MEMORY_STABLE_SAMPLES:
+            snapshot = (
+                first_snapshot
+                if first_snapshot is not None
+                else gateway_cgroup_memory_snapshot()
+            )
+            first_snapshot = None
+            current_oom_kill = _gateway_cgroup_event(snapshot, "oom_kill")
+            if current_oom_kill is not None and current_oom_kill > baseline_oom_kill:
+                mode = _record_gateway_recovery_failure(
+                    "oom_kill",
+                    "gateway cgroup oom_kill advanced during recovery wait",
+                    snapshot=snapshot,
+                    config_fingerprint=config_fingerprint,
+                )
+                if mode == "manual":
+                    raise ManualRecoveryRequired(
+                        "gateway recovery exhausted; manual recovery required"
+                    )
+                break
+            if _gateway_memory_recovery_sample_ok(
+                snapshot,
+                baseline_oom_kill=baseline_oom_kill,
+            ):
+                stable_samples += 1
+            else:
+                stable_samples = 0
+            if stable_samples >= GATEWAY_RECOVERY_MEMORY_STABLE_SAMPLES:
+                state = read_runtime_state()
+                policy = _runtime_state_gateway_recovery(state)
+                policy.pop("hold_down_started_at_unix", None)
+                policy.pop("hold_down_until_unix", None)
+                policy.pop("hold_down_reason", None)
+                policy = _gateway_recovery_policy_with_cgroup_baseline(
+                    policy,
+                    snapshot,
+                )
+                policy["last_recovery_window_satisfied_at_unix"] = (
+                    _gateway_recovery_now()
+                )
+                _write_runtime_state(
+                    "degraded_workload",
+                    "gateway recovery window satisfied; restart may resume",
+                    config_fingerprint=config_fingerprint,
+                    gateway_active=is_openclaw_gateway_active(),
+                    gateway_action="recovery_window_satisfied",
+                    openclaw_ready=False,
+                    gateway_recovery=policy,
+                    gateway_cgroup=snapshot,
+                )
+                return
+            checkpoint_supervisor_progress(
+                "gateway-recovery-memory-wait",
+                inspect_gateway=True,
+            )
+            time.sleep(GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS)
+
+
+def _reset_gateway_recovery_after_stable_healthy(
+    snapshot: dict[str, Any] | None = None,
+) -> bool:
+    state = read_runtime_state()
+    if _runtime_state_name(state) != "healthy":
+        return False
+    policy = _runtime_state_gateway_recovery(state)
+    if not policy.get("failures") and int(policy.get("hold_down_cycles") or 0) == 0:
+        return False
+    try:
+        updated_at = int(state.get("updated_at_unix") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0
+    now = _gateway_recovery_now()
+    if now - updated_at < GATEWAY_RECOVERY_HEALTHY_RESET_SECONDS:
+        return False
+    reset_policy: dict[str, Any] = {
+        "failures": [],
+        "hold_down_cycles": 0,
+        "last_stable_reset_at_unix": now,
+    }
+    reset_policy = _gateway_recovery_policy_with_cgroup_baseline(
+        reset_policy,
+        snapshot,
+    )
+    _write_runtime_state(
+        "healthy",
+        "stable healthy window reset gateway recovery policy",
+        gateway_active=True,
+        gateway_action="stable_reset",
+        openclaw_ready=True,
+        gateway_recovery=reset_policy,
+        gateway_cgroup=snapshot,
+    )
+    return True
 
 
 def _openclaw_config_fingerprint() -> dict[str, str]:
@@ -3006,6 +3417,7 @@ def ensure_openclaw_gateway_ready(
 ) -> dict[str, Any]:
     """Reattach to a healthy matching gateway or restart it boundedly."""
     previous_state = read_runtime_state()
+    manual_recovery_cleared = False
     if (
         _runtime_state_is_unrecoverable_manual(previous_state)
         or _runtime_manual_recovery_requested()
@@ -3021,6 +3433,7 @@ def ensure_openclaw_gateway_ready(
                 openclaw_ready=False,
             )
             raise ManualRecoveryRequired(detail)
+        manual_recovery_cleared = True
 
     if is_openclaw_gateway_active():
         ok, detail = probe_current_openclaw_gateway_health()
@@ -3054,6 +3467,16 @@ def ensure_openclaw_gateway_ready(
                 "restart: %s",
                 detail,
             )
+            mode = _record_gateway_recovery_failure(
+                "health_check_failed",
+                detail,
+                snapshot=gateway_cgroup_memory_snapshot(),
+                config_fingerprint=config_fingerprint,
+            )
+            if mode == "manual":
+                raise ManualRecoveryRequired(
+                    "gateway recovery exhausted; manual recovery required"
+                )
             _write_runtime_state(
                 "openclaw_not_ready",
                 detail,
@@ -3068,9 +3491,26 @@ def ensure_openclaw_gateway_ready(
                 "restarting to apply current binding"
             )
 
-    delete_telegram_webhook(binding)
-    started_at = start_openclaw_gateway(binding)
-    wait_for_openclaw_start(started_at)
+    if not manual_recovery_cleared:
+        _wait_for_gateway_recovery_window(config_fingerprint=config_fingerprint)
+    try:
+        delete_telegram_webhook(binding)
+        started_at = start_openclaw_gateway(binding)
+        wait_for_openclaw_start(started_at)
+    except ManualRecoveryRequired:
+        raise
+    except Exception as exc:
+        mode = _record_gateway_recovery_failure(
+            "restart_failed",
+            f"gateway restart failed: {exc}",
+            snapshot=gateway_cgroup_memory_snapshot(),
+            config_fingerprint=config_fingerprint,
+        )
+        if mode == "manual":
+            raise ManualRecoveryRequired(
+                "gateway recovery exhausted; manual recovery required"
+            ) from exc
+        raise
     _write_runtime_state(
         "healthy",
         "openclaw gateway started",
@@ -5327,6 +5767,21 @@ def _run_one_binding_cycle() -> int:
             gateway_alive = is_openclaw_gateway_active()
             local_manifest = local_watchdog_manifest_snapshot()
             gateway_cgroup = gateway_cgroup_memory_snapshot()
+            oom_delta_status = _record_gateway_oom_delta(gateway_cgroup)
+            if oom_delta_status in {"hold_down", "manual"}:
+                log.warning(
+                    "gateway cgroup OOM policy requested %s; stopping "
+                    "gateway and restarting the binding cycle",
+                    oom_delta_status,
+                )
+                _stop_holder["rebind"] = oom_delta_status == "hold_down"
+                _stop_holder["stop"] = True
+                notify_watchdog_checkpoint(
+                    "phase-d-gateway-recovery-" + oom_delta_status
+                )
+                return
+            if gateway_alive:
+                _reset_gateway_recovery_after_stable_healthy(gateway_cgroup)
             component_versions = collect_component_versions()
             metrics = {
                 "gateway_alive": gateway_alive,
@@ -5505,6 +5960,11 @@ def _run_one_binding_cycle() -> int:
     except Exception as exc:
         log.exception("OpenClaw gateway unhealthy: %s", exc)
         _stop_holder["stop"] = True
+        mode = _record_gateway_recovery_failure(
+            "restart_storm",
+            f"openclaw gateway unhealthy: {exc}",
+            snapshot=gateway_cgroup_memory_snapshot(),
+        )
         try:
             post_json(
                 "/hapi/v1/computers/me/state",
@@ -5512,6 +5972,9 @@ def _run_one_binding_cycle() -> int:
             )
         except Exception:
             pass
+        if mode == "hold_down":
+            _stop_holder["rebind"] = True
+            return 0
         return 1
     finally:
         stop_openclaw_gateway()

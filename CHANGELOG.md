@@ -15,6 +15,10 @@ runtime's published `VERSION` on each new Computer row.
 - Persist root-owned local runtime health state for gateway startup/reattach,
   including `openclaw_not_ready` before bounded recovery and operator
   marker/clear-marker handling for `unrecoverable_manual` state.
+- Add cgroup v2 memory/OOM recovery policy for the OpenClaw gateway: `oom_kill`
+  deltas and restart failures enter supervisor-owned hold-down, recovery waits
+  for bounded memory stability, stable healthy windows reset counters, and
+  repeated failed hold-down cycles escalate to `unrecoverable_manual`.
 
 ## 0.11.14
 

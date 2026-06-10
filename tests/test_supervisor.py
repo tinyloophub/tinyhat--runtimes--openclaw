@@ -543,7 +543,10 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
             result = supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
 
         self.assertEqual(result["action"], "started")
-        self.assertEqual(writes, ["openclaw_not_ready", "healthy"])
+        self.assertEqual(
+            writes,
+            ["degraded_workload", "openclaw_not_ready", "healthy"],
+        )
         delete.assert_called_once_with(binding)
         start.assert_called_once_with(binding)
         wait.assert_called_once_with(123.0)
@@ -928,6 +931,278 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
 
         self.assertEqual(snapshot["available"], False)
         self.assertEqual(snapshot["reason"], "invalid-control-group-path")
+
+    def test_gateway_cgroup_memory_snapshot_falls_back_to_workload_slice(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cgroup = "tinyhat.slice/tinyhat-openclaw-workload.slice"
+            cgroup_dir = os.path.join(tmpdir, cgroup)
+            os.makedirs(cgroup_dir, exist_ok=True)
+            with open(
+                os.path.join(cgroup_dir, "memory.current"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("700\n")
+            with open(
+                os.path.join(cgroup_dir, "memory.max"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("1000\n")
+            with open(
+                os.path.join(cgroup_dir, "memory.events.local"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("oom 2\noom_kill 1\n")
+
+            def fake_systemctl(*args, **_kwargs):
+                unit = args[1]
+                if unit == supervisor.GATEWAY_SYSTEMD_UNIT:
+                    return SimpleNamespace(returncode=0, stdout="\n")
+                self.assertEqual(unit, supervisor.GATEWAY_WORKLOAD_SLICE_UNIT)
+                return SimpleNamespace(returncode=0, stdout="/" + cgroup)
+
+            with (
+                patch.object(supervisor, "_dev_mode", return_value=False),
+                patch.object(
+                    supervisor,
+                    "_run_systemctl",
+                    side_effect=fake_systemctl,
+                ),
+                patch.dict(os.environ, {"TINYHAT_CGROUP_ROOT": tmpdir}, clear=False),
+            ):
+                snapshot = supervisor.gateway_cgroup_memory_snapshot()
+
+        self.assertEqual(snapshot["available"], True)
+        self.assertEqual(snapshot["unit"], supervisor.GATEWAY_WORKLOAD_SLICE_UNIT)
+        self.assertEqual(snapshot["memory_current_bytes"], 700)
+        self.assertEqual(snapshot["memory_max_bytes"], 1000)
+        self.assertEqual(snapshot["memory_events"]["oom_kill"], 1)
+
+    def test_gateway_oom_delta_enters_hold_down_after_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "healthy",
+                        "detail": "previously healthy",
+                        "gateway_recovery": {
+                            "last_oom_kill": 4,
+                            "hold_down_cycles": 0,
+                            "failures": [
+                                {"at_unix": 100, "reason": "restart_failed"},
+                                {"at_unix": 200, "reason": "restart_failed"},
+                            ],
+                        },
+                    },
+                    fh,
+                )
+            snapshot = {
+                "available": True,
+                "control_group": "/tinyhat.slice/workload",
+                "memory_current_bytes": 600,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 2, "oom_kill": 5},
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", return_value=250),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=False,
+                ),
+            ):
+                result = supervisor._record_gateway_oom_delta(snapshot)
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(result, "hold_down")
+        self.assertEqual(state["state"], "degraded_workload")
+        self.assertEqual(state["gateway"]["action"], "hold_down")
+        self.assertEqual(state["last_error_category"], "oom_kill")
+        policy = state["gateway_recovery"]
+        self.assertEqual(policy["hold_down_cycles"], 1)
+        self.assertEqual(policy["hold_down_until_unix"], 850)
+        self.assertEqual(policy["last_oom_kill"], 5)
+        self.assertEqual(len(policy["failures"]), 3)
+
+    def test_gateway_recovery_wait_requires_memory_and_oom_stability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "degraded_workload",
+                        "detail": "hold-down",
+                        "gateway_recovery": {
+                            "last_oom_kill": 7,
+                            "hold_down_cycles": 1,
+                            "hold_down_until_unix": 100,
+                            "failures": [
+                                {"at_unix": 90, "reason": "oom_kill"},
+                            ],
+                        },
+                    },
+                    fh,
+                )
+            high = {
+                "available": True,
+                "control_group": "/tinyhat.slice/workload",
+                "memory_current_bytes": 701,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 2, "oom_kill": 7},
+            }
+            stable = {
+                "available": True,
+                "control_group": "/tinyhat.slice/workload",
+                "memory_current_bytes": 700,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 2, "oom_kill": 7},
+            }
+            snapshots = [high, stable, stable, stable]
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", return_value=100),
+                patch.object(
+                    supervisor,
+                    "gateway_cgroup_memory_snapshot",
+                    side_effect=snapshots,
+                ),
+                patch.object(
+                    supervisor,
+                    "checkpoint_supervisor_progress",
+                    return_value=True,
+                ),
+                patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+                patch.object(supervisor.time, "sleep") as sleep,
+            ):
+                supervisor._wait_for_gateway_recovery_window()
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(
+            state["gateway"]["action"],
+            "recovery_window_satisfied",
+        )
+        self.assertNotIn(
+            "hold_down_until_unix",
+            state["gateway_recovery"],
+        )
+        self.assertEqual(state["gateway_recovery"]["last_oom_kill"], 7)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_gateway_recovery_after_two_hold_down_cycles_goes_manual(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "degraded_workload",
+                        "detail": "previous hold-downs failed",
+                        "gateway_recovery": {
+                            "last_oom_kill": 10,
+                            "hold_down_cycles": 2,
+                            "failures": [
+                                {"at_unix": 100, "reason": "restart_failed"},
+                                {"at_unix": 200, "reason": "restart_failed"},
+                            ],
+                        },
+                    },
+                    fh,
+                )
+            snapshot = {
+                "available": True,
+                "memory_current_bytes": 800,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 3, "oom_kill": 11},
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", return_value=250),
+                patch.object(
+                    supervisor,
+                    "is_openclaw_gateway_active",
+                    return_value=False,
+                ),
+            ):
+                result = supervisor._record_gateway_oom_delta(snapshot)
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(result, "manual")
+        self.assertEqual(state["state"], "unrecoverable_manual")
+        self.assertTrue(state["manual_recovery_required"])
+        self.assertEqual(state["gateway"]["action"], "blocked")
+
+    def test_stable_healthy_window_resets_gateway_recovery_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "state": "healthy",
+                        "detail": "gateway healthy",
+                        "updated_at_unix": 100,
+                        "gateway_recovery": {
+                            "last_oom_kill": 5,
+                            "hold_down_cycles": 1,
+                            "failures": [
+                                {"at_unix": 50, "reason": "oom_kill"},
+                            ],
+                        },
+                    },
+                    fh,
+                )
+            snapshot = {
+                "available": True,
+                "memory_current_bytes": 500,
+                "memory_max_bytes": 1000,
+                "memory_events": {"oom": 1, "oom_kill": 5},
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: state_path},
+                    clear=False,
+                ),
+                patch.object(supervisor.time, "time", return_value=2000),
+            ):
+                self.assertTrue(
+                    supervisor._reset_gateway_recovery_after_stable_healthy(
+                        snapshot
+                    )
+                )
+
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+        self.assertEqual(state["state"], "healthy")
+        self.assertEqual(state["gateway"]["action"], "stable_reset")
+        self.assertEqual(state["gateway_recovery"]["failures"], [])
+        self.assertEqual(state["gateway_recovery"]["hold_down_cycles"], 0)
+        self.assertEqual(state["gateway_recovery"]["last_oom_kill"], 5)
 
     def test_platform_http_timeouts_are_bounded(self) -> None:
         observed_timeouts = []
@@ -3978,6 +4253,10 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             'TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"',
             script,
         )
+        self.assertIn(
+            'WORKLOAD_SLICE_UNIT_NAME="tinyhat-openclaw-workload.slice"',
+            script,
+        )
         self.assertIn('groupadd --system "${TINYHAT_RUNTIME_GROUP}"', script)
         self.assertIn('--gid "${TINYHAT_RUNTIME_GROUP}"', script)
         self.assertIn('--home-dir "${OPENCLAW_STATE_DIR}"', script)
@@ -3987,6 +4266,21 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         # Bootstrap chowns once before install and again after plugin install,
         # because npm/OpenClaw plugin commands can create root-owned state.
         self.assertGreaterEqual(script.count("chown_runtime_paths"), 3)
+        self.assertIn('systemctl start "${WORKLOAD_SLICE_UNIT_NAME}"', script)
+
+    def test_workload_slice_is_bounded_for_hold_down_sampling(self) -> None:
+        unit = _bootstrap_unit_block("WORKLOAD_SLICE_UNIT")
+
+        for directive in (
+            "MemoryAccounting=true",
+            "MemoryHigh=2400M",
+            "MemoryMax=3072M",
+            "CPUAccounting=true",
+            "CPUQuota=175%",
+            "TasksAccounting=true",
+            "TasksMax=512",
+        ):
+            self.assertIn(directive, unit)
 
     def test_gateway_unit_is_bounded_unprivileged_workload(self) -> None:
         unit = _bootstrap_unit_block("GATEWAY_UNIT")
@@ -3999,7 +4293,7 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             "User=${TINYHAT_RUNTIME_USER}",
             "Group=${TINYHAT_RUNTIME_GROUP}",
             "UMask=0077",
-            "Slice=tinyhat-openclaw-workload.slice",
+            "Slice=${WORKLOAD_SLICE_UNIT_NAME}",
             "MemoryAccounting=true",
             "MemoryHigh=2400M",
             "MemoryMax=3072M",
