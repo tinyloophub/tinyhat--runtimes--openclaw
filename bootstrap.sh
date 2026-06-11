@@ -227,10 +227,24 @@ UNIT
 # first-class lifecycle, logs, and crash-restart semantics. Started
 # and stopped only by the supervisor; restarted by systemd if
 # OpenClaw crashes.
+#
+# Deliberately NOT PartOf= the supervisor (#685). Under systemd a
+# PartOf child is restarted whenever the parent restarts — INCLUDING
+# the supervisor's own Restart=on-failure / watchdog respawns — which
+# bounced this gateway on every supervisor restart and defeated the
+# reattach-continuity goal (a healthy gateway must survive a supervisor
+# restart so the respawned supervisor can reattach without disrupting
+# OpenClaw). Live GCE proof confirmed the gateway PID changed on each
+# supervisor watchdog/crash restart with PartOf present. Teardown is
+# instead owned by the supervisor itself: main() ends with
+# `finally: stop_openclaw_gateway()`, so a clean stop of the supervisor
+# (SIGTERM) still stops the gateway, while a crash/watchdog respawn
+# leaves the running gateway untouched for the new supervisor to
+# reattach. This matches the "supervisor is the lifecycle authority"
+# fallback documented in the v0.11.0 scope (§4.1).
 cat > "${GATEWAY_UNIT}" <<UNIT
 [Unit]
 Description=Tinyhat OpenClaw gateway
-PartOf=${SUPERVISOR_UNIT_NAME}
 After=network-online.target ${SUPERVISOR_UNIT_NAME}
 Wants=network-online.target
 StartLimitIntervalSec=10min

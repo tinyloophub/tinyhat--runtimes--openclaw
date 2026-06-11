@@ -5070,8 +5070,12 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
     def test_gateway_unit_is_bounded_unprivileged_workload(self) -> None:
         unit = _bootstrap_unit_block("GATEWAY_UNIT")
 
+        # #685: deliberately NOT PartOf= the supervisor — that bounced
+        # the gateway on every supervisor watchdog/crash restart and
+        # broke reattach continuity. Teardown is owned by the
+        # supervisor's finally: stop_openclaw_gateway().
+        self.assertNotIn("PartOf=", unit)
         for directive in (
-            "PartOf=${SUPERVISOR_UNIT_NAME}",
             "After=network-online.target ${SUPERVISOR_UNIT_NAME}",
             "StartLimitIntervalSec=10min",
             "StartLimitBurst=3",
@@ -7071,3 +7075,132 @@ class PluginLoadDetectionTests(unittest.TestCase):
                 later["runtime_health"], "unsupported_openclaw_version"
             )
             self.assertEqual(later["plugin"]["load_check"], "not_loaded")
+
+
+class CleanShutdownGatewayTeardownTests(unittest.TestCase):
+    """#685 (PR #81 review): with PartOf= gone the supervisor must stop an
+    active gateway on a CLEAN exit — even when stopped before Phase D —
+    but must NOT stop it on a crash/exception (continuity)."""
+
+    def setUp(self) -> None:
+        self._old_stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update({"stop": False, "rebind": False})
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_clean_stop_before_phase_d_stops_active_gateway(self) -> None:
+        # Codex repro: a SIGTERM lands while the respawned supervisor is
+        # still in Phase A/B, so _run_one_binding_cycle returns 0 before
+        # its Phase C/D finally — with a gateway from the prior
+        # crash-continuity instance still running.
+        def fake_cycle() -> int:
+            supervisor._stop_holder["stop"] = True
+            return 0
+
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", side_effect=fake_cycle),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_called_once()
+
+    def test_clean_stop_with_no_active_gateway_does_not_call_stop(self) -> None:
+        def fake_cycle() -> int:
+            supervisor._stop_holder["stop"] = True
+            return 0
+
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", side_effect=fake_cycle),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_not_called()
+
+    def test_error_exit_does_not_trigger_clean_shutdown_teardown(self) -> None:
+        # A non-zero cycle exit (broken/crash path) returns early; the
+        # top-level clean-shutdown guard must NOT fire — error paths own
+        # their own gateway handling and a crash must leave the gateway
+        # for reattach.
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", return_value=1),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 1)
+        stop_gw.assert_not_called()
+
+    def test_guard_is_noop_when_stop_flag_not_set(self) -> None:
+        # Defensive: the guard keys off the clean-stop flag, never the
+        # gateway state alone, so it cannot bounce a gateway mid-run.
+        supervisor._stop_holder["stop"] = False
+        with (
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            supervisor._stop_gateway_on_clean_shutdown()
+        stop_gw.assert_not_called()
+
+    def test_phase_a_ready_retry_returns_promptly_on_clean_stop(self) -> None:
+        # Codex re-review repro: SIGTERM lands while Phase A is retrying an
+        # unreachable platform. The retry loop must observe the stop flag
+        # and return 0 BEFORE another long sleep/retry, so main() reaches
+        # the clean-shutdown guard within TimeoutStopSec.
+        import urllib.error
+
+        post_calls = {"n": 0}
+
+        def failing_ready_post(path, payload):
+            post_calls["n"] += 1
+            # The signal handler would set this mid-POST; simulate that.
+            supervisor._stop_holder["stop"] = True
+            raise urllib.error.HTTPError(path, 503, "platform down", {}, None)
+
+        sleeps: list[float] = []
+
+        with (
+            patch.object(supervisor, "post_json", side_effect=failing_ready_post),
+            patch.object(supervisor, "checkpoint_supervisor_progress", return_value=True),
+            patch.object(supervisor.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+        ):
+            result = supervisor._run_one_binding_cycle()
+
+        self.assertEqual(result, 0)
+        # Exactly one POST attempt — it must not keep retrying after stop.
+        self.assertEqual(post_calls["n"], 1)
+        # The interruptible sleep bailed immediately once stop was set, so
+        # no full multi-second wait happened.
+        self.assertLessEqual(sum(sleeps), 0.5)
+
+    def test_phase_a_clean_stop_lets_main_stop_the_gateway(self) -> None:
+        # End to end: a clean stop during a failing Phase A ready-post ->
+        # cycle returns 0 -> main()'s guard stops the active gateway.
+        import urllib.error
+
+        def failing_ready_post(path, payload):
+            supervisor._stop_holder["stop"] = True
+            raise urllib.error.HTTPError(path, 503, "platform down", {}, None)
+
+        with (
+            patch.object(supervisor, "post_json", side_effect=failing_ready_post),
+            patch.object(supervisor, "checkpoint_supervisor_progress", return_value=True),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor.time, "sleep", return_value=None),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_called_once()
+
+    def test_interruptible_sleep_bails_when_stop_set(self) -> None:
+        slept: list[float] = []
+        supervisor._stop_holder["stop"] = True
+        with patch.object(supervisor.time, "sleep", side_effect=lambda s: slept.append(s)):
+            supervisor._interruptible_sleep(30)
+        self.assertEqual(slept, [])  # never sleeps once stop is already set

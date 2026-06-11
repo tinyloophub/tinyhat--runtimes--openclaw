@@ -6224,6 +6224,34 @@ def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 
 
+def _stop_gateway_on_clean_shutdown() -> None:
+    """Stop any active gateway when the supervisor exits CLEANLY (#685).
+
+    The gateway unit is no longer ``PartOf=`` the supervisor (that bounced
+    a healthy gateway on every supervisor crash/watchdog restart). With
+    ``PartOf=`` gone, systemd no longer stops the gateway when the
+    supervisor unit stops, so the supervisor must own teardown itself.
+    ``_run_one_binding_cycle`` already stops the gateway in its Phase C/D
+    ``finally``, but a clean SIGTERM/SIGINT that arrives while the
+    respawned supervisor is still in Phase A/B (a gateway from a prior
+    crash-continuity instance still running) returns BEFORE that ``finally``
+    exists — orphaning the gateway. This top-level guard closes that gap.
+
+    Deliberately NOT a blanket ``try/finally`` around ``main()``: that would
+    also fire when ``main()`` exits via an unhandled exception (a supervisor
+    crash), re-introducing the gateway bounce on crash/watchdog restart that
+    this PR removes. It only runs on the explicit clean-stop code path, and
+    a hard kill (SIGKILL/watchdog) never reaches it — the gateway survives
+    for the respawned supervisor to reattach, which is the whole point.
+    """
+    if not _stop_holder["stop"]:
+        return
+    if not is_openclaw_gateway_active():
+        return
+    log.info("clean shutdown: stopping active OpenClaw gateway")
+    stop_openclaw_gateway()
+
+
 def main() -> int:
     log.info("supervisor starting")
 
@@ -6245,6 +6273,7 @@ def main() -> int:
             return exit_code
         if _stop_holder["stop"] and not _stop_holder["rebind"]:
             log.info("supervisor exiting cleanly")
+            _stop_gateway_on_clean_shutdown()
             return 0
         # Rebind path: clear the per-cycle flags and loop.
         _stop_holder["stop"] = False
@@ -6253,7 +6282,26 @@ def main() -> int:
             "rebind: platform unassigned this Computer; awaiting a fresh "
             "/me/binding"
         )
+    _stop_gateway_on_clean_shutdown()
     return 0
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to ``seconds``, returning early on a clean-stop request.
+
+    The Phase A/B retry/poll waits must stay responsive to SIGTERM (#685):
+    a plain ``time.sleep(30)`` could outlast systemd's ``TimeoutStopSec``
+    so the supervisor never reaches ``main()``'s clean-shutdown guard and
+    an already-running gateway (from a prior crash-continuity instance) is
+    SIGKILLed orphaned. Sleeping in small slices and bailing when
+    ``_stop_holder["stop"]`` is set keeps clean shutdown prompt.
+    """
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not _stop_holder["stop"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.5, remaining))
 
 
 def _run_one_binding_cycle() -> int:
@@ -6264,6 +6312,11 @@ def _run_one_binding_cycle() -> int:
     # allow-list, so a stuck supervisor would 409-loop forever
     # otherwise.
     #
+    # The retry loop observes ``_stop_holder["stop"]`` (set by SIGTERM/
+    # SIGINT) so a clean shutdown while the platform is unreachable
+    # returns promptly to ``main()`` — letting the clean-shutdown guard
+    # stop the gateway before systemd's TimeoutStopSec escalates (#685).
+    #
     # On supervisor restart the row may already be past
     # ``provisioning`` (admin retry, manual reset). The platform
     # refuses ``provisioning -> ready`` anything, but it also
@@ -6273,6 +6326,10 @@ def _run_one_binding_cycle() -> int:
     # /me/binding decide what's next; that way a restart in
     # ready/assigned/active/broken does not infinite-loop.
     for attempt in range(1, 1000):
+        # Clean shutdown requested while retrying an unreachable platform:
+        # return so main()'s clean-shutdown guard can stop the gateway.
+        if _stop_holder["stop"]:
+            return 0
         try:
             post_json(
                 "/hapi/v1/computers/me/state",
@@ -6296,7 +6353,7 @@ def _run_one_binding_cycle() -> int:
                 http_exc,
             )
             checkpoint_supervisor_progress("phase-a-ready-post-failed")
-            time.sleep(min(2 * attempt, 30))
+            _interruptible_sleep(min(2 * attempt, 30))
         except Exception as exc:
             log.warning(
                 "initial /me/state ready POST failed (attempt %d): %s",
@@ -6304,7 +6361,9 @@ def _run_one_binding_cycle() -> int:
                 exc,
             )
             checkpoint_supervisor_progress("phase-a-ready-post-failed")
-            time.sleep(min(2 * attempt, 30))
+            _interruptible_sleep(min(2 * attempt, 30))
+    if _stop_holder["stop"]:
+        return 0
 
     # Phase B: poll for binding
     poll = BINDING_POLL_BASE_SECONDS
@@ -6321,7 +6380,7 @@ def _run_one_binding_cycle() -> int:
         except Exception as exc:
             log.warning("/me/binding GET failed: %s", exc)
             checkpoint_supervisor_progress("phase-b-binding-get-failed")
-            time.sleep(poll)
+            _interruptible_sleep(poll)
             continue
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
@@ -6367,7 +6426,7 @@ def _run_one_binding_cycle() -> int:
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS
         checkpoint_supervisor_progress("phase-b-binding-empty")
-        time.sleep(poll)
+        _interruptible_sleep(poll)
     if _stop_holder["stop"]:
         return 0
 
