@@ -3505,6 +3505,67 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
         self.assertEqual(payload, runtime_state_posts[0])
 
+    def test_refused_ready_transition_still_posts_runtime_state_when_unbound(
+        self,
+    ) -> None:
+        import urllib.error
+
+        supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        runtime_state_posts: list[dict] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            if path == "/hapi/v1/computers/me/state":
+                raise urllib.error.HTTPError(
+                    path,
+                    400,
+                    "already ready",
+                    {},
+                    None,
+                )
+            if path == "/hapi/v1/computers/me/runtime-state":
+                runtime_state_posts.append(dict(body))
+                return {}
+            self.fail(f"unexpected POST path: {path}")
+
+        def stop_after_first_sleep(_seconds: float) -> None:
+            supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    return_value={"assigned": False},
+                ),
+                patch.object(supervisor, "_wipe_on_owner_release"),
+                patch.object(supervisor, "checkpoint_supervisor_progress"),
+                patch.object(
+                    supervisor.time,
+                    "sleep",
+                    side_effect=stop_after_first_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+                payload = supervisor.read_runtime_state()
+
+        self.assertEqual(len(runtime_state_posts), 1)
+        self.assertEqual(runtime_state_posts[0]["runtime_health"], "healthy")
+        self.assertEqual(runtime_state_posts[0]["gateway"]["status"], "inactive")
+        self.assertEqual(
+            runtime_state_posts[0]["gateway"]["action"],
+            "awaiting_binding",
+        )
+        self.assertEqual(payload, runtime_state_posts[0])
+
     def test_codex_plugin_failure_does_not_disable_openai_subscription_provider(
         self,
     ) -> None:

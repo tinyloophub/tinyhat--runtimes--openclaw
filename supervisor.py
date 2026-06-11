@@ -6498,7 +6498,6 @@ def _run_one_binding_cycle() -> int:
                 {"state": "ready", "detail": "bootstrap complete"},
             )
             log.info("reported state=ready (attempt %d)", attempt)
-            report_ready_runtime_state()
             checkpoint_supervisor_progress("phase-a-ready-post")
             break
         except urllib.error.HTTPError as http_exc:
@@ -6574,6 +6573,7 @@ def _run_one_binding_cycle() -> int:
         # touch the filesystem or re-bump the generation.
         if not cold_start_wipe_attempted:
             cold_start_wipe_attempted = True
+            report_ready_runtime_state()
             try:
                 log.info(
                     "phase B cold-start: running owner-release path "
