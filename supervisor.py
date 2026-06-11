@@ -2226,6 +2226,19 @@ def _runtime_state_last_error(
     }
 
 
+def report_ready_runtime_state() -> None:
+    """Mirror the ready-but-unbound control-plane state to the platform."""
+    try:
+        _write_runtime_state(
+            "healthy",
+            "control plane ready; awaiting binding",
+            gateway_active=False,
+            gateway_action="awaiting_binding",
+        )
+    except Exception as exc:  # noqa: BLE001 - startup state must keep moving
+        log.warning("runtime_state ready mirror failed: %s", exc)
+
+
 def _runtime_state_log_entry(text: Any, *, unit: str | None = None) -> dict[str, str] | None:
     safe_text = _sanitize_runtime_state_text(
         text,
@@ -6582,6 +6595,7 @@ def _run_one_binding_cycle() -> int:
         # touch the filesystem or re-bump the generation.
         if not cold_start_wipe_attempted:
             cold_start_wipe_attempted = True
+            report_ready_runtime_state()
             try:
                 log.info(
                     "phase B cold-start: running owner-release path "
