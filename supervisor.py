@@ -990,6 +990,155 @@ def _read_installed_plugin_marker() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+# ── Plugin load detection (#77) ─────────────────────────────────────
+#
+# "Installed" is not "loaded": OpenClaw skips an enabled extension it
+# cannot read or import WITHOUT failing the gateway, and
+# `openclaw plugins inspect` reports registration, not loadability. The
+# plugin ships a load beacon since v0.5.0 (tinyhat-ai/tinyhat#125): when
+# its extension module evaluates successfully it writes
+# ``tinyhat-plugin-loaded.json`` (plugin, version, loaded_at, pid, node)
+# into the OpenClaw state dir. The supervisor reads that beacon to tell
+# the platform when an enabled plugin never actually loaded — the silent
+# capability loss behind the v0.11.13 ownership regression (#78).
+
+TINYHAT_PLUGIN_BEACON_FILENAME = "tinyhat-plugin-loaded.json"
+# First plugin version that writes the beacon. Older plugins cannot be
+# distinguished from a load failure, so they report "unknown" instead of
+# degrading runtime health.
+TINYHAT_PLUGIN_BEACON_MIN_VERSION = (0, 5, 0)
+# How long an enabled, beacon-capable plugin may stay beacon-less after
+# the gateway is active before the runtime reports it as not loaded.
+# Generous against slow extension startup; tiny against the hours/days a
+# real silent loss would otherwise persist.
+PLUGIN_LOAD_GRACE_SECONDS = 180
+_PLUGIN_BEACON_MAX_BYTES = 8192
+
+
+def tinyhat_plugin_beacon_path() -> str:
+    """Where the plugin's load beacon lands (gateway-written)."""
+    return os.path.join(openclaw_state_dir(), TINYHAT_PLUGIN_BEACON_FILENAME)
+
+
+def _parse_plugin_version(value: Any) -> tuple[int, ...] | None:
+    """Parse ``0.5.0``-style versions; ``None`` for anything else."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts: list[int] = []
+    for segment in text.split("."):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        if not digits:
+            return None
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def _read_plugin_load_beacon() -> dict | None:
+    """Read the beacon file; ``None`` when missing/oversized/invalid."""
+    path = tinyhat_plugin_beacon_path()
+    try:
+        if os.path.getsize(path) > _PLUGIN_BEACON_MAX_BYTES:
+            return None
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _plugin_load_check(
+    existing_state: dict[str, Any],
+    *,
+    gateway_active: bool | None,
+    now: int,
+) -> dict[str, Any] | None:
+    """Classify whether the enabled Tinyhat plugin actually loaded.
+
+    Returns ``None`` when no plugin is installed (nothing to check).
+    Otherwise a payload block::
+
+        {"installed_version", "load_check", "reason"?,
+         "beacon_loaded_at"?, "missing_since_unix"?}
+
+    ``load_check`` values:
+
+    - ``loaded`` — a beacon for the installed plugin version exists;
+    - ``not_loaded`` — beacon-capable plugin, gateway active, and no
+      matching beacon for longer than the grace window (degrades
+      runtime health to ``unsupported_openclaw_version``);
+    - ``pending`` — same, but still inside the grace window;
+    - ``unknown`` — the check cannot conclude (pre-beacon plugin
+      version, gateway not active) and must never degrade health.
+
+    Known limitation (documented, accepted): the beacon is matched by
+    plugin version, not gateway start time, so a plugin that loaded
+    once and silently broke mid-life without a version change is not
+    detected until the next plugin update or reprovision. The incident
+    class this targets (#78) breaks at boot/install time.
+    """
+    marker = _read_installed_plugin_marker()
+    installed_version = str(marker.get("version") or "").strip()
+    if not installed_version:
+        return None
+    check: dict[str, Any] = {"installed_version": installed_version}
+    # Positive evidence first: a beacon matching the installed version is
+    # definitive proof of load, whatever the version metadata says (a
+    # pre-release build of a beacon-capable plugin can still carry an
+    # older version string).
+    beacon = _read_plugin_load_beacon()
+    if (
+        isinstance(beacon, dict)
+        and str(beacon.get("version") or "").strip() == installed_version
+    ):
+        check["load_check"] = "loaded"
+        loaded_at = str(beacon.get("loaded_at") or "").strip()
+        if loaded_at:
+            check["beacon_loaded_at"] = loaded_at
+        return check
+    # Absence is only meaningful for plugin versions that are known to
+    # write the beacon; older plugins cannot be distinguished from a
+    # load failure and must never degrade health.
+    parsed = _parse_plugin_version(installed_version)
+    if parsed is None or parsed < TINYHAT_PLUGIN_BEACON_MIN_VERSION:
+        check["load_check"] = "unknown"
+        check["reason"] = "plugin_predates_load_beacon"
+        return check
+    check["reason"] = (
+        "beacon_version_mismatch" if isinstance(beacon, dict) else "beacon_missing"
+    )
+    if gateway_active is not True:
+        # The plugin cannot have loaded into a gateway that is not
+        # running; report unknown rather than start the clock.
+        check["load_check"] = "unknown"
+        return check
+    # The missing-beacon clock is scoped to the installed version: a
+    # plugin install/update must get its own grace window instead of
+    # inheriting a stale verdict from the previous version. The reason
+    # may flip between beacon_missing and beacon_version_mismatch for
+    # the same unloaded install; both mean "this version has not
+    # loaded", so they share one clock.
+    prior = existing_state.get("plugin")
+    prior_version = (
+        str(prior.get("installed_version") or "").strip()
+        if isinstance(prior, dict)
+        else ""
+    )
+    missing_since = (
+        prior.get("missing_since_unix")
+        if isinstance(prior, dict) and prior_version == installed_version
+        else None
+    )
+    if not isinstance(missing_since, int):
+        missing_since = now
+    check["missing_since_unix"] = missing_since
+    if now - missing_since >= PLUGIN_LOAD_GRACE_SECONDS:
+        check["load_check"] = "not_loaded"
+    else:
+        check["load_check"] = "pending"
+    return check
+
+
 def _openclaw_plugin_from_inspect_payload(plugin_id: str, payload: Any) -> dict | None:
     if not isinstance(payload, dict):
         return None
@@ -2102,6 +2251,34 @@ def _write_runtime_state(
             gateway_recovery,
             gateway_cgroup,
         )
+    # Plugin load detection (#77): an enabled plugin that never loaded
+    # must not let the runtime report healthy. Only ever demotes
+    # `healthy` — every other state already carries a stronger signal.
+    effective_gateway_active = gateway_active
+    if effective_gateway_active is None:
+        existing_gateway = existing_state.get("gateway")
+        if isinstance(existing_gateway, dict) and isinstance(
+            existing_gateway.get("active"),
+            bool,
+        ):
+            effective_gateway_active = existing_gateway["active"]
+    plugin_check = _plugin_load_check(
+        existing_state,
+        gateway_active=effective_gateway_active,
+        now=now,
+    )
+    if (
+        runtime_health == "healthy"
+        and isinstance(plugin_check, dict)
+        and plugin_check.get("load_check") == "not_loaded"
+    ):
+        runtime_health = "unsupported_openclaw_version"
+        safe_detail = _sanitize_runtime_state_text(
+            f"{detail}; tinyhat plugin enabled but not loaded "
+            "(no fresh load beacon)"
+        )
+        if not safe_last_error_category:
+            safe_last_error_category = "plugin_not_loaded"
     runtime_version = ""
     try:
         runtime_version = _read_runtime_repo_version()
@@ -2153,6 +2330,8 @@ def _write_runtime_state(
     }
     if openclaw_ready is not None:
         payload["openclaw"]["ready"] = bool(openclaw_ready)
+    if plugin_check:
+        payload["plugin"] = plugin_check
     if config_fingerprint:
         payload["config_fingerprint"] = dict(config_fingerprint)
     if safe_last_error_category:
