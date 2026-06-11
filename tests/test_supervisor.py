@@ -6997,3 +6997,21 @@ class PluginLoadDetectionTests(unittest.TestCase):
         )
         self.assertIsNone(supervisor._parse_plugin_version(""))
         self.assertIsNone(supervisor._parse_plugin_version("main"))
+
+    def test_matching_beacon_wins_even_for_pre_beacon_version_metadata(
+        self,
+    ) -> None:
+        """A build of a beacon-capable plugin can still carry older version
+        metadata (e.g. main before the release cut) — positive evidence
+        must classify as loaded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.4.5")
+            self._write_beacon(tmpdir, "0.4.5")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                supervisor._write_runtime_state(
+                    "healthy", "ok", gateway_active=True
+                )
+                payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertEqual(payload["plugin"]["load_check"], "loaded")

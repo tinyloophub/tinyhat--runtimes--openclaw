@@ -1082,11 +1082,10 @@ def _plugin_load_check(
     if not installed_version:
         return None
     check: dict[str, Any] = {"installed_version": installed_version}
-    parsed = _parse_plugin_version(installed_version)
-    if parsed is None or parsed < TINYHAT_PLUGIN_BEACON_MIN_VERSION:
-        check["load_check"] = "unknown"
-        check["reason"] = "plugin_predates_load_beacon"
-        return check
+    # Positive evidence first: a beacon matching the installed version is
+    # definitive proof of load, whatever the version metadata says (a
+    # pre-release build of a beacon-capable plugin can still carry an
+    # older version string).
     beacon = _read_plugin_load_beacon()
     if (
         isinstance(beacon, dict)
@@ -1096,6 +1095,14 @@ def _plugin_load_check(
         loaded_at = str(beacon.get("loaded_at") or "").strip()
         if loaded_at:
             check["beacon_loaded_at"] = loaded_at
+        return check
+    # Absence is only meaningful for plugin versions that are known to
+    # write the beacon; older plugins cannot be distinguished from a
+    # load failure and must never degrade health.
+    parsed = _parse_plugin_version(installed_version)
+    if parsed is None or parsed < TINYHAT_PLUGIN_BEACON_MIN_VERSION:
+        check["load_check"] = "unknown"
+        check["reason"] = "plugin_predates_load_beacon"
         return check
     check["reason"] = (
         "beacon_version_mismatch" if isinstance(beacon, dict) else "beacon_missing"
