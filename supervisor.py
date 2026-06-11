@@ -73,6 +73,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from typing import Any
 
 # Path conventions on the VM. Pinned here so the gateway systemd
@@ -86,6 +87,7 @@ _DEFAULT_OPENCLAW_WORKSPACE_DIR = "/var/lib/tinyhat-openclaw/workspace"
 _DEFAULT_TINYHAT_SECRETS_PATH = "/etc/openclaw/tinyhat-secrets.json"
 _DEFAULT_RUNTIME_ENV_FILE = "/etc/tinyhat/runtime.env"
 _DEFAULT_RUNTIME_STATE_PATH = "/var/lib/tinyhat-control/runtime-state.json"
+_DEFAULT_RUNTIME_BOOTSTRAP_LOG_PATH = "/var/log/tinyhat-bootstrap.log"
 _DEFAULT_RUNTIME_STATE_MANUAL_MARKER_PATH = (
     "/var/lib/tinyhat-control/unrecoverable-manual"
 )
@@ -95,6 +97,9 @@ _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
 RUNTIME_STATE_SCHEMA = "runtime_state_v1"
 RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH = 127
 RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS = 60
+RUNTIME_STATE_LOG_SOURCE_MAX_LINES = 15
+RUNTIME_STATE_LOG_LINE_MAX_CHARS = 1024
+RUNTIME_STATE_LOG_COMMAND_TIMEOUT_SECONDS = 2
 RUNTIME_HEALTH_VALUES = frozenset(
     {
         "healthy",
@@ -194,6 +199,7 @@ _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH = (
 TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
 TINYHAT_RUNTIME_STATE_PATH_ENV = "TINYHAT_RUNTIME_STATE_PATH"
+TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH_ENV = "TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH"
 TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV = (
     "TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH"
 )
@@ -316,6 +322,13 @@ def runtime_state_path() -> str:
             _runtime_home(), "tinyhat-control", "runtime-state.json"
         )
     return _DEFAULT_RUNTIME_STATE_PATH
+
+
+def runtime_bootstrap_log_path() -> str:
+    return (
+        os.environ.get(TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH_ENV)
+        or _DEFAULT_RUNTIME_BOOTSTRAP_LOG_PATH
+    ).strip()
 
 
 def runtime_state_manual_marker_path() -> str:
@@ -1942,16 +1955,39 @@ def _gateway_recovery_now() -> int:
 
 
 _RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_-]*(?:api[_-]?key|"
+    r"(?i)(?<![A-Za-z0-9])([\"']?[A-Za-z0-9_-]*(?:api[_-]?key|"
     r"access[_-]?token|refresh[_-]?token|token|password|secret|cookie|"
-    r"authorization)[A-Za-z0-9_-]*)(\s*[:=]\s*)([^\s,;]+)"
+    r"authorization)[A-Za-z0-9_-]*[\"']?)(\s*[:=]\s*[\"']?)([^\s,;\"'}]+)"
 )
 _RUNTIME_STATE_AUTH_SCHEME_RE = re.compile(
     r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"
 )
+_RUNTIME_STATE_URL_USERINFO_RE = re.compile(
+    r"(?i)(\bhttps?://)[^/\s:@]+:[^/\s@]+@"
+)
 _RUNTIME_STATE_SIGNED_QUERY_RE = re.compile(
     r"(?i)([?&][^=\s&]*(?:token|signature|credential|key|secret|password)"
     r"[^=\s&]*=)[^&\s]+"
+)
+_RUNTIME_STATE_SIGNED_URL_RE = re.compile(
+    r"(?i)\bhttps?://[^\s'\"<>)]*\?[^\s'\"<>)]*"
+    r"(?:token|signature|credential|key|secret|password)=[^\s'\"<>)]*"
+)
+_RUNTIME_STATE_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+)
+_RUNTIME_STATE_LLM_PROVIDER_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])sk-(?:ant-api\d+-|ant-|or-v1-|proj-|live-)?"
+    r"[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
+_RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE = re.compile(r"\bya29\.[A-Za-z0-9_-]{20,}\b")
+_RUNTIME_STATE_GOOGLE_API_KEY_RE = re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b")
+_RUNTIME_STATE_GITHUB_TOKEN_RE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
+)
+_RUNTIME_STATE_AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_RUNTIME_STATE_SLACK_TOKEN_RE = re.compile(
+    r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{10,})\b"
 )
 _RUNTIME_STATE_TELEGRAM_TOKEN_RE = re.compile(
     r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}\b"
@@ -1964,10 +2000,22 @@ _RUNTIME_STATE_LOCAL_PATH_RE = re.compile(
 
 def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
     text = str(value or "")
+    text = _RUNTIME_STATE_SIGNED_URL_RE.sub("[redacted-signed-url]", text)
+    text = _RUNTIME_STATE_URL_USERINFO_RE.sub(r"\1[redacted-userinfo]@", text)
     text = _RUNTIME_STATE_AUTH_SCHEME_RE.sub(
         lambda match: f"{match.group(1)} [redacted]",
         text,
     )
+    text = _RUNTIME_STATE_JWT_RE.sub("[redacted-identity-token]", text)
+    text = _RUNTIME_STATE_LLM_PROVIDER_KEY_RE.sub("[redacted-api-key]", text)
+    text = _RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE.sub(
+        "[redacted-google-token]",
+        text,
+    )
+    text = _RUNTIME_STATE_GOOGLE_API_KEY_RE.sub("[redacted-api-key]", text)
+    text = _RUNTIME_STATE_GITHUB_TOKEN_RE.sub("[redacted-github-token]", text)
+    text = _RUNTIME_STATE_AWS_ACCESS_KEY_RE.sub("[redacted-aws-key]", text)
+    text = _RUNTIME_STATE_SLACK_TOKEN_RE.sub("[redacted-slack-token]", text)
     text = _RUNTIME_STATE_TELEGRAM_TOKEN_RE.sub("[redacted-telegram-token]", text)
     text = _RUNTIME_STATE_SIGNED_QUERY_RE.sub(r"\1[redacted]", text)
     text = _RUNTIME_STATE_SECRET_ASSIGNMENT_RE.sub(
@@ -2178,6 +2226,100 @@ def _runtime_state_last_error(
     }
 
 
+def _runtime_state_log_entry(text: Any, *, unit: str | None = None) -> dict[str, str] | None:
+    safe_text = _sanitize_runtime_state_text(
+        text,
+        limit=RUNTIME_STATE_LOG_LINE_MAX_CHARS,
+    ).strip()
+    if not safe_text:
+        return None
+    entry = {"text": safe_text}
+    if unit:
+        entry["unit"] = unit
+    return entry
+
+
+def _tail_runtime_log_file(path: str, *, limit: int) -> list[str]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return [line.rstrip("\r\n") for line in deque(fh, maxlen=limit)]
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001 - diagnostics must stay best-effort
+        log.debug("runtime log tail unavailable for %s: %s", path, exc)
+        return []
+
+
+def _journal_runtime_log_lines(unit: str, *, limit: int) -> list[str]:
+    if _dev_mode() or not unit:
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "-u",
+                unit,
+                "-n",
+                str(limit),
+                "--no-pager",
+                "--output=short-iso",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=RUNTIME_STATE_LOG_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("runtime journal tail unavailable for %s: %s", unit, exc)
+        return []
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            log.debug("runtime journal tail failed for %s: %s", unit, detail[:200])
+        return []
+    return [line for line in (result.stdout or "").splitlines() if line.strip()][
+        -limit:
+    ]
+
+
+def _runtime_state_log_entries(
+    lines: list[str],
+    *,
+    unit: str | None = None,
+) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for line in lines[-RUNTIME_STATE_LOG_SOURCE_MAX_LINES:]:
+        entry = _runtime_state_log_entry(line, unit=unit)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _runtime_state_recent_log_excerpts() -> dict[str, list[dict[str, str]]]:
+    """Collect a small, redacted diagnostic tail for runtime-state mirroring."""
+    bootstrap_lines = _tail_runtime_log_file(
+        runtime_bootstrap_log_path(),
+        limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+    )
+    return {
+        "bootstrap": _runtime_state_log_entries(bootstrap_lines),
+        "supervisor": _runtime_state_log_entries(
+            _journal_runtime_log_lines(
+                SUPERVISOR_SYSTEMD_UNIT,
+                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+            ),
+            unit=SUPERVISOR_SYSTEMD_UNIT,
+        ),
+        "gateway": _runtime_state_log_entries(
+            _journal_runtime_log_lines(
+                GATEWAY_SYSTEMD_UNIT,
+                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+            ),
+            unit=GATEWAY_SYSTEMD_UNIT,
+        ),
+    }
+
+
 def _gateway_cgroup_event(snapshot: dict[str, Any] | None, key: str) -> int | None:
     if not isinstance(snapshot, dict):
         return None
@@ -2301,6 +2443,7 @@ def _write_runtime_state(
     if gateway_action:
         gateway_payload["action"] = gateway_action
     identity = _runtime_state_identity()
+    recent_logs = _runtime_state_recent_log_excerpts()
     payload: dict[str, Any] = {
         "schema": RUNTIME_STATE_SCHEMA,
         "schema_version": 1,
@@ -2328,6 +2471,12 @@ def _write_runtime_state(
             category=safe_last_error_category,
         ),
     }
+    if recent_logs["bootstrap"]:
+        payload["bootstrap"] = {"log_excerpt_lines": recent_logs["bootstrap"]}
+    if recent_logs["supervisor"]:
+        payload["supervisor"]["journal"] = recent_logs["supervisor"]
+    if recent_logs["gateway"]:
+        payload["gateway"]["journal"] = recent_logs["gateway"]
     if openclaw_ready is not None:
         payload["openclaw"]["ready"] = bool(openclaw_ready)
     if plugin_check:
