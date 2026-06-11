@@ -1400,7 +1400,7 @@ def ensure_tinyhat_plugin_installed(
     repo_url = (repo_url or configured_url).strip()
     repo_ref = (repo_ref or configured_ref).strip()
     plugin_dir = tinyhat_plugin_checkout_dir()
-    os.makedirs(os.path.dirname(plugin_dir), mode=0o700, exist_ok=True)
+    _prepare_runtime_owned_dir(os.path.dirname(plugin_dir))
     if os.path.isdir(os.path.join(plugin_dir, ".git")):
         remote = subprocess.run(
             ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],
@@ -1481,6 +1481,10 @@ def ensure_tinyhat_plugin_installed(
         and os.path.exists(installed_manifest)
         and _is_tinyhat_plugin_registered()
     ):
+        # Repair path: machines installed before the ownership sync (or
+        # whose supervisor restarted mid-install) may hold these trees
+        # root-owned, which the isolated gateway cannot read.
+        _sync_tinyhat_plugin_runtime_ownership()
         log.info(
             "Tinyhat plugin already installed (ref=%s sha=%s version=%s)",
             repo_ref,
@@ -1504,6 +1508,10 @@ def ensure_tinyhat_plugin_installed(
     with open(marker, "w", encoding="utf-8") as fh:
         json.dump(marker_payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
+    # The privileged install leaves the checkout and OpenClaw's extension
+    # copy root-owned; hand them to the workload user so the isolated
+    # gateway can actually load the plugin.
+    _sync_tinyhat_plugin_runtime_ownership()
     log.info(
         "installed Tinyhat plugin (repo=%s ref=%s sha=%s version=%s)",
         repo_url,
@@ -1576,6 +1584,43 @@ def _prepare_runtime_owned_dir(path: str, *, mode: int = 0o700) -> None:
     except OSError as exc:
         log.warning("failed to chmod runtime-owned dir %s: %s", path, exc)
     _chown_runtime_owned_path(path)
+
+
+def _chown_runtime_owned_tree(path: str) -> None:
+    """Recursively hand a supervisor-written tree to the workload user.
+
+    The supervisor runs privileged, but since the workload-isolation
+    split the gateway runs as the unprivileged runtime user. Any tree
+    the gateway must READ — the Tinyhat plugin checkout and OpenClaw's
+    installed extensions — has to be readable by that user, or OpenClaw
+    silently skips loading the plugin: the install succeeds, the config
+    entry stays enabled, and every Tinyhat tool/skill is missing from
+    the agent. No-op when no runtime user is configured (dev mode and
+    pre-isolation images keep current behaviour).
+    """
+    if _runtime_ownership_ids() is None:
+        return
+    if not os.path.lexists(path):
+        return
+    _chown_runtime_owned_path(path)
+    for root, dirs, files in os.walk(path):
+        for name in dirs:
+            _chown_runtime_owned_path(os.path.join(root, name))
+        for name in files:
+            _chown_runtime_owned_path(os.path.join(root, name))
+
+
+def _sync_tinyhat_plugin_runtime_ownership() -> None:
+    """Make the plugin checkout + installed extensions gateway-readable.
+
+    Called from both ``ensure_tinyhat_plugin_installed`` success paths
+    (fresh install AND already-installed early return) so a supervisor
+    restart repairs ownership on machines provisioned while the install
+    left these trees root-owned.
+    """
+    plugin_dir = tinyhat_plugin_checkout_dir()
+    _chown_runtime_owned_tree(os.path.dirname(plugin_dir))
+    _chown_runtime_owned_tree(os.path.join(openclaw_state_dir(), "extensions"))
 
 
 def _atomic_write_json(

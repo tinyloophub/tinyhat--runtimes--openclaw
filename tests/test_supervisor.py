@@ -6538,3 +6538,167 @@ class RepostSendsCachedAppliedVersionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
+    """The isolated gateway must be able to READ the installed plugin.
+
+    The supervisor installs the plugin privileged; since the workload
+    isolation split the gateway runs as the unprivileged runtime user.
+    Without an ownership sync the checkout + OpenClaw's extension copy
+    stay root-owned and OpenClaw silently loads zero tinyhat tools.
+    """
+
+    def _run_install(self, tmpdir: str, *, chowned: list[tuple[str, int, int]]):
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "refs/tags/v0.5.0"
+        plugin_sha = "abc123def4567890"
+        plugin_dir = os.path.join(tmpdir, "platform-plugins", "tinyhat")
+        env = {
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_RUNTIME_HOME": tmpdir,
+            "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+            "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+            "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+        }
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["git", "clone", repo_url, plugin_dir]:
+                os.makedirs(os.path.join(plugin_dir, ".git"))
+                with open(
+                    os.path.join(plugin_dir, "openclaw.plugin.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    json.dump({"id": "tinyhat"}, fh)
+                with open(
+                    os.path.join(plugin_dir, "package.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    json.dump({"version": "0.5.0"}, fh)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                return SimpleNamespace(
+                    returncode=0, stdout=f"{plugin_sha}\n", stderr=""
+                )
+            if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                # OpenClaw copies the extension into the state dir; the
+                # CLI runs privileged, so in production these files end
+                # up root-owned.
+                ext_dir = os.path.join(tmpdir, "extensions", "tinyhat")
+                os.makedirs(ext_dir, exist_ok=True)
+                with open(
+                    os.path.join(ext_dir, "openclaw.plugin.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    json.dump({"id": "tinyhat"}, fh)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_chown(path, uid, gid):
+            chowned.append((path, uid, gid))
+
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+            ),
+            patch.object(supervisor.os, "chown", side_effect=fake_chown),
+        ):
+            self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+        return plugin_dir
+
+    def test_install_hands_plugin_trees_to_runtime_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chowned: list[tuple[str, int, int]] = []
+            plugin_dir = self._run_install(tmpdir, chowned=chowned)
+
+            chowned_paths = {path for path, _uid, _gid in chowned}
+            # The checkout tree (via its parent dir) is gateway-readable…
+            self.assertIn(os.path.dirname(plugin_dir), chowned_paths)
+            self.assertIn(
+                os.path.join(plugin_dir, "openclaw.plugin.json"), chowned_paths
+            )
+            # …and so is OpenClaw's installed extension copy.
+            self.assertIn(
+                os.path.join(tmpdir, "extensions", "tinyhat", "openclaw.plugin.json"),
+                chowned_paths,
+            )
+            self.assertTrue(
+                all((uid, gid) == (4242, 4243) for _p, uid, gid in chowned)
+            )
+
+    def test_already_installed_path_repairs_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # First pass installs and records the marker.
+            chowned_install: list[tuple[str, int, int]] = []
+            plugin_dir = self._run_install(tmpdir, chowned=chowned_install)
+
+            # Second pass takes the already-installed early return; it
+            # must still repair ownership (supervisor restart on a
+            # machine provisioned before the sync existed).
+            chowned_repair: list[tuple[str, int, int]] = []
+
+            def fake_chown(path, uid, gid):
+                chowned_repair.append((path, uid, gid))
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": "https://example.com/tinyhat.git",
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": "refs/tags/v0.5.0",
+            }
+
+            def fake_run(cmd, **kwargs):
+                if cmd[:3] == ["git", "-C", plugin_dir] and "set-url" in cmd:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:3] == ["git", "-C", plugin_dir] and "fetch" in cmd:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", "refs/tags/v0.5.0"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0, stdout="abc123def4567890\n", stderr=""
+                    )
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+                ),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(
+                    supervisor, "_is_tinyhat_plugin_registered", return_value=True
+                ),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
+            repaired = {path for path, _uid, _gid in chowned_repair}
+            self.assertIn(
+                os.path.join(tmpdir, "extensions", "tinyhat", "openclaw.plugin.json"),
+                repaired,
+            )
+
+    def test_no_runtime_user_keeps_current_behaviour(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chowned: list[tuple[str, int, int]] = []
+
+            def fake_chown(path, uid, gid):  # pragma: no cover - must not run
+                chowned.append((path, uid, gid))
+
+            with (
+                patch.object(
+                    supervisor, "_runtime_ownership_ids", return_value=None
+                ),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+            ):
+                supervisor._chown_runtime_owned_tree(tmpdir)
+            self.assertEqual(chowned, [])
