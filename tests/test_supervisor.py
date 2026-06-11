@@ -6761,3 +6761,239 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
             self.assertNotIn(outside_dir, lchowned)
             self.assertNotIn(os.path.join(outside_dir, "inner"), lchowned)
             self.assertNotIn(os.path.join(dir_link, "inner"), lchowned)
+
+
+class PluginLoadDetectionTests(unittest.TestCase):
+    """#77: an enabled plugin that never loaded must not report healthy.
+
+    The detection consumes the load beacon the plugin writes since
+    v0.5.0; older plugins and non-running gateways classify as
+    "unknown" and never degrade health.
+    """
+
+    def _env(self, tmpdir: str) -> dict[str, str]:
+        return {
+            "TINYHAT_DEV_RUNTIME": "1",
+            "TINYHAT_RUNTIME_HOME": tmpdir,
+            supervisor.TINYHAT_RUNTIME_STATE_PATH_ENV: os.path.join(
+                tmpdir, "runtime-state.json"
+            ),
+            supervisor.TINYHAT_COMPUTER_ID_ENV: "cmp_test_77",
+            supervisor.TINYHAT_GCE_INSTANCE_ID_ENV: "instance-77",
+            supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "",
+        }
+
+    def _write_marker(self, tmpdir: str, version: str) -> None:
+        with open(
+            os.path.join(tmpdir, "tinyhat-plugin.version"), "w", encoding="utf-8"
+        ) as fh:
+            json.dump(
+                {
+                    "repo_url": "https://example.com/tinyhat.git",
+                    "repo_ref": f"refs/tags/v{version}",
+                    "resolved_commit_sha": "a" * 40,
+                    "version": version,
+                },
+                fh,
+            )
+
+    def _write_beacon(self, tmpdir: str, version: str) -> None:
+        with open(
+            os.path.join(tmpdir, supervisor.TINYHAT_PLUGIN_BEACON_FILENAME),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                {
+                    "plugin": "tinyhat",
+                    "version": version,
+                    "loaded_at": "2026-06-11T12:00:00Z",
+                    "pid": 4321,
+                    "node": "v22.0.0",
+                },
+                fh,
+            )
+
+    def _patches(self, tmpdir: str):
+        return (
+            patch.dict(os.environ, self._env(tmpdir), clear=False),
+            patch.object(supervisor, "get_backend_base_url", return_value=""),
+            patch.object(
+                supervisor, "_read_runtime_repo_version", return_value="0.11.0"
+            ),
+            patch.object(
+                supervisor, "_read_runtime_git_sha", return_value="b" * 40
+            ),
+        )
+
+    def test_fresh_beacon_keeps_healthy_and_reports_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            self._write_beacon(tmpdir, "0.5.0")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                supervisor._write_runtime_state(
+                    "healthy", "ok", gateway_active=True
+                )
+                payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertEqual(payload["plugin"]["load_check"], "loaded")
+            self.assertEqual(
+                payload["plugin"]["beacon_loaded_at"], "2026-06-11T12:00:00Z"
+            )
+            self.assertIsNone(payload["last_error"])
+
+    def test_missing_beacon_demotes_healthy_after_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            base = 1_750_000_000
+            with p1, p2, p3, p4:
+                with patch.object(supervisor.time, "time", return_value=base):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    pending = supervisor.read_runtime_state()
+                # Same boot, grace elapsed.
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base + supervisor.PLUGIN_LOAD_GRACE_SECONDS + 1,
+                ):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    demoted = supervisor.read_runtime_state()
+            self.assertEqual(pending["runtime_health"], "healthy")
+            self.assertEqual(pending["plugin"]["load_check"], "pending")
+            self.assertEqual(pending["plugin"]["missing_since_unix"], base)
+            self.assertEqual(
+                demoted["runtime_health"], "unsupported_openclaw_version"
+            )
+            self.assertEqual(demoted["plugin"]["load_check"], "not_loaded")
+            self.assertEqual(demoted["plugin"]["reason"], "beacon_missing")
+            self.assertEqual(demoted["plugin"]["missing_since_unix"], base)
+            self.assertEqual(
+                demoted["last_error"]["category"], "plugin_not_loaded"
+            )
+            self.assertIn("not loaded", demoted["detail"])
+
+    def test_beacon_version_mismatch_counts_as_not_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.6.0")
+            self._write_beacon(tmpdir, "0.5.0")  # stale: pre-update load
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            base = 1_750_000_000
+            with p1, p2, p3, p4:
+                with patch.object(supervisor.time, "time", return_value=base):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base + supervisor.PLUGIN_LOAD_GRACE_SECONDS + 1,
+                ):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    payload = supervisor.read_runtime_state()
+            self.assertEqual(
+                payload["runtime_health"], "unsupported_openclaw_version"
+            )
+            self.assertEqual(
+                payload["plugin"]["reason"], "beacon_version_mismatch"
+            )
+
+    def test_pre_beacon_plugin_reports_unknown_and_stays_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.4.5")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                supervisor._write_runtime_state(
+                    "healthy", "ok", gateway_active=True
+                )
+                payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertEqual(payload["plugin"]["load_check"], "unknown")
+            self.assertEqual(
+                payload["plugin"]["reason"], "plugin_predates_load_beacon"
+            )
+
+    def test_inactive_gateway_reports_unknown_without_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                supervisor._write_runtime_state(
+                    "healthy", "ok", gateway_active=False
+                )
+                payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertEqual(payload["plugin"]["load_check"], "unknown")
+            self.assertNotIn("missing_since_unix", payload["plugin"])
+
+    def test_non_healthy_states_are_never_demoted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            base = 1_750_000_000
+            with p1, p2, p3, p4:
+                with patch.object(supervisor.time, "time", return_value=base):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base + supervisor.PLUGIN_LOAD_GRACE_SECONDS + 1,
+                ):
+                    supervisor._write_runtime_state(
+                        "openclaw_not_ready", "starting", gateway_active=True
+                    )
+                    payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "openclaw_not_ready")
+            self.assertEqual(payload["plugin"]["load_check"], "not_loaded")
+            self.assertIsNotNone(payload["last_error"])
+            self.assertNotEqual(
+                payload["last_error"]["category"], "plugin_not_loaded"
+            )
+
+    def test_no_marker_attaches_no_plugin_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                supervisor._write_runtime_state(
+                    "healthy", "ok", gateway_active=True
+                )
+                payload = supervisor.read_runtime_state()
+            self.assertEqual(payload["runtime_health"], "healthy")
+            self.assertNotIn("plugin", payload)
+
+    def test_malformed_beacon_counts_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            with open(
+                os.path.join(
+                    tmpdir, supervisor.TINYHAT_PLUGIN_BEACON_FILENAME
+                ),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("{not json")
+            check = None
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            with p1, p2, p3, p4:
+                check = supervisor._plugin_load_check(
+                    {}, gateway_active=True, now=1_750_000_000
+                )
+            self.assertEqual(check["load_check"], "pending")
+            self.assertEqual(check["reason"], "beacon_missing")
+
+    def test_parse_plugin_version_edges(self) -> None:
+        self.assertEqual(supervisor._parse_plugin_version("0.5.0"), (0, 5, 0))
+        self.assertEqual(
+            supervisor._parse_plugin_version("1.2.3-rc1"), (1, 2, 31)
+        )
+        self.assertIsNone(supervisor._parse_plugin_version(""))
+        self.assertIsNone(supervisor._parse_plugin_version("main"))
