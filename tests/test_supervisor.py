@@ -922,7 +922,56 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 payload = supervisor.read_runtime_state()
 
             self.assertEqual(payload["runtime_health"], "degraded_workload")
+            self.assertTrue(payload["platform_unreachable"])
+            self.assertEqual(payload["platform"]["status"], "unreachable")
+            self.assertEqual(
+                payload["platform"]["last_error_category"],
+                "platform_unreachable",
+            )
+            self.assertEqual(
+                payload["runtime_events"][-1]["type"],
+                "platform_unreachable",
+            )
+            self.assertNotEqual(payload.get("last_error_category"), "platform_unreachable")
             self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
+
+    def test_runtime_state_preserves_bounded_sanitized_typed_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            with open(state_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "runtime_events": [
+                            {
+                                "type": f"old_event_{index}",
+                                "at": f"2026-06-11T00:00:0{index}Z",
+                                "detail": "previous",
+                            }
+                            for index in range(supervisor.RUNTIME_STATE_MAX_EVENTS)
+                        ],
+                    },
+                    fh,
+                )
+
+            with (
+                patch.dict(os.environ, self._env(state_path), clear=False),
+                patch.object(supervisor.time, "time", return_value=1_760_000_000),
+            ):
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "hold-down after Authorization: Bearer secret-token",
+                    event_type="gateway_restart_hold_down_entered",
+                )
+                payload = supervisor.read_runtime_state()
+
+        events = payload["runtime_events"]
+        self.assertEqual(len(events), supervisor.RUNTIME_STATE_MAX_EVENTS)
+        self.assertEqual(events[-1]["type"], "gateway_restart_hold_down_entered")
+        self.assertEqual(events[-1]["at"], "2025-10-09T08:53:20Z")
+        self.assertNotIn("old_event_0", {event["type"] for event in events})
+        raw = json.dumps(events, sort_keys=True)
+        self.assertNotIn("secret-token", raw)
+        self.assertIn("[redacted]", raw)
 
     def test_runtime_state_skips_repeated_unchanged_platform_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1270,6 +1319,10 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                 self.assertEqual(state["gateway"]["action"], "reattached")
                 self.assertTrue(state["openclaw"]["ready"])
                 self.assertEqual(state["config_fingerprint"], fingerprint)
+                self.assertEqual(
+                    state["runtime_events"][-1]["type"],
+                    "supervisor_watchdog_restart",
+                )
 
     def test_gateway_oom_baseline_preserves_reattach_fingerprint(self) -> None:
         fingerprint = self._fingerprint()
@@ -1321,9 +1374,11 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint()
         writes: list[str] = []
+        events: list[str | None] = []
 
-        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+        def fake_write_runtime_state(state: str, _detail: str, **kwargs) -> None:
             writes.append(state)
+            events.append(kwargs.get("event_type"))
 
         with (
             patch.object(
@@ -1358,6 +1413,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
             writes,
             ["degraded_workload", "openclaw_not_ready", "healthy"],
         )
+        self.assertEqual(events, [None, None, "gateway_restart"])
         delete.assert_called_once_with(binding)
         start.assert_called_once_with(binding)
         wait.assert_called_once_with(123.0)
@@ -1366,9 +1422,11 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint("new")
         writes: list[str] = []
+        events: list[str | None] = []
 
-        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+        def fake_write_runtime_state(state: str, _detail: str, **kwargs) -> None:
             writes.append(state)
+            events.append(kwargs.get("event_type"))
 
         with (
             patch.object(
@@ -1400,6 +1458,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "started")
         self.assertEqual(writes, ["healthy"])
+        self.assertEqual(events, ["gateway_restart"])
         delete.assert_called_once_with(binding)
         start.assert_called_once_with(binding)
 
@@ -1409,9 +1468,11 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint()
         writes: list[str] = []
+        events: list[str | None] = []
 
-        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+        def fake_write_runtime_state(state: str, _detail: str, **kwargs) -> None:
             writes.append(state)
+            events.append(kwargs.get("event_type"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
@@ -1445,6 +1506,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                     supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
 
         self.assertEqual(writes, ["unrecoverable_manual"])
+        self.assertEqual(events, ["manual_recovery_set"])
         delete.assert_not_called()
         start.assert_not_called()
 
@@ -1454,9 +1516,11 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
         binding = {"telegram_bot_username": "Tinychattestbot"}
         fingerprint = self._fingerprint()
         writes: list[str] = []
+        events: list[str | None] = []
 
-        def fake_write_runtime_state(state: str, _detail: str, **_kwargs) -> None:
+        def fake_write_runtime_state(state: str, _detail: str, **kwargs) -> None:
             writes.append(state)
+            events.append(kwargs.get("event_type"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manual_marker_path = os.path.join(tmpdir, "unrecoverable-manual")
@@ -1489,6 +1553,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                     supervisor.ensure_openclaw_gateway_ready(binding, fingerprint)
 
         self.assertEqual(writes, ["unrecoverable_manual"])
+        self.assertEqual(events, ["manual_recovery_set"])
         delete.assert_not_called()
         start.assert_not_called()
 
@@ -1522,7 +1587,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
                 patch.object(
                     supervisor, "is_openclaw_gateway_active", return_value=False
                 ),
-                patch.object(supervisor, "_write_runtime_state"),
+                patch.object(supervisor, "_write_runtime_state") as write_state,
                 patch.object(supervisor, "delete_telegram_webhook") as delete,
                 patch.object(
                     supervisor, "start_openclaw_gateway", return_value=123.0
@@ -1538,6 +1603,7 @@ class OpenClawGatewayReattachTests(unittest.TestCase):
             self.assertFalse(os.path.exists(manual_marker_path))
 
         self.assertEqual(result["action"], "started")
+        self.assertEqual(write_state.call_args.kwargs["event_type"], "manual_recovery_clear")
         delete.assert_called_once_with(binding)
         start.assert_called_once_with(binding)
         wait.assert_called_once_with(123.0)
@@ -1841,6 +1907,10 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertEqual(state["state"], "degraded_workload")
         self.assertEqual(state["gateway"]["action"], "hold_down")
         self.assertEqual(state["last_error_category"], "oom_kill")
+        self.assertEqual(
+            state["runtime_events"][-1]["type"],
+            "gateway_restart_hold_down_entered",
+        )
         policy = state["gateway_recovery"]
         self.assertEqual(policy["hold_down_cycles"], 1)
         self.assertEqual(policy["hold_down_until_unix"], 850)
@@ -1970,6 +2040,7 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertEqual(state["state"], "unrecoverable_manual")
         self.assertTrue(state["manual_recovery_required"])
         self.assertEqual(state["gateway"]["action"], "blocked")
+        self.assertEqual(state["runtime_events"][-1]["type"], "manual_recovery_set")
 
     def test_gateway_recovery_wait_unavailable_samples_exhaust_to_manual(
         self,
@@ -2036,6 +2107,7 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertTrue(state["manual_recovery_required"])
         self.assertEqual(state["gateway"]["action"], "blocked")
         self.assertEqual(state["last_error_category"], "recovery_window_timeout")
+        self.assertEqual(state["runtime_events"][-1]["type"], "manual_recovery_set")
         self.assertEqual(
             state["gateway_recovery"]["last_error_category"],
             "recovery_window_timeout",
@@ -2118,6 +2190,7 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
         self.assertTrue(state["manual_recovery_required"])
         self.assertEqual(state["gateway"]["action"], "blocked")
         self.assertEqual(state["last_error_category"], "recovery_window_timeout")
+        self.assertEqual(state["runtime_events"][-1]["type"], "manual_recovery_set")
         self.assertEqual(state["gateway_recovery"]["hold_down_cycles"], 2)
         self.assertEqual(
             state["gateway_recovery"]["last_error_category"],
