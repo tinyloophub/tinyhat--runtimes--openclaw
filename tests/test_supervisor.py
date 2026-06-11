@@ -676,6 +676,27 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(posted[0][1], payload)
             self.assertEqual(posted[0][1]["runtime_health"], "healthy")
 
+    def test_ready_runtime_state_mirror_is_best_effort(self) -> None:
+        with (
+            patch.object(
+                supervisor,
+                "_write_runtime_state",
+                side_effect=PermissionError("runtime state dir unavailable"),
+            ) as write_state,
+            self.assertLogs("tinyhat-supervisor", level="WARNING") as logs,
+        ):
+            supervisor.report_ready_runtime_state()
+
+        write_state.assert_called_once_with(
+            "healthy",
+            "control plane ready; awaiting binding",
+            gateway_active=False,
+            gateway_action="awaiting_binding",
+        )
+        self.assertTrue(
+            any("runtime_state ready mirror failed" in line for line in logs.output)
+        )
+
     def test_runtime_state_includes_bounded_redacted_log_excerpts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
@@ -3420,6 +3441,69 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
     def tearDown(self) -> None:
         supervisor._stop_holder.clear()
         supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_ready_phase_posts_runtime_state_before_binding(self) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        state_posts: list[dict] = []
+        runtime_state_posts: list[dict] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            if path == "/hapi/v1/computers/me/state":
+                state_posts.append(dict(body))
+                return {}
+            if path == "/hapi/v1/computers/me/runtime-state":
+                runtime_state_posts.append(dict(body))
+                return {}
+            self.fail(f"unexpected POST path: {path}")
+
+        def stop_after_first_sleep(_seconds: float) -> None:
+            supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    return_value={"assigned": False},
+                ),
+                patch.object(supervisor, "_wipe_on_owner_release"),
+                patch.object(supervisor, "checkpoint_supervisor_progress"),
+                patch.object(
+                    supervisor.time,
+                    "sleep",
+                    side_effect=stop_after_first_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+                payload = supervisor.read_runtime_state()
+
+        self.assertEqual(
+            state_posts,
+            [{"state": "ready", "detail": "bootstrap complete"}],
+        )
+        self.assertEqual(len(runtime_state_posts), 1)
+        self.assertEqual(runtime_state_posts[0]["schema"], "runtime_state_v1")
+        self.assertEqual(runtime_state_posts[0]["runtime_health"], "healthy")
+        self.assertEqual(
+            runtime_state_posts[0]["detail"],
+            "control plane ready; awaiting binding",
+        )
+        self.assertEqual(runtime_state_posts[0]["gateway"]["status"], "inactive")
+        self.assertEqual(
+            runtime_state_posts[0]["gateway"]["action"],
+            "awaiting_binding",
+        )
+        self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
+        self.assertEqual(payload, runtime_state_posts[0])
 
     def test_codex_plugin_failure_does_not_disable_openai_subscription_provider(
         self,

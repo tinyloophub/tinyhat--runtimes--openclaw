@@ -2226,6 +2226,19 @@ def _runtime_state_last_error(
     }
 
 
+def report_ready_runtime_state() -> None:
+    """Mirror the ready-but-unbound control-plane state to the platform."""
+    try:
+        _write_runtime_state(
+            "healthy",
+            "control plane ready; awaiting binding",
+            gateway_active=False,
+            gateway_action="awaiting_binding",
+        )
+    except Exception as exc:  # noqa: BLE001 - startup state must keep moving
+        log.warning("runtime_state ready mirror failed: %s", exc)
+
+
 def _runtime_state_log_entry(text: Any, *, unit: str | None = None) -> dict[str, str] | None:
     safe_text = _sanitize_runtime_state_text(
         text,
@@ -6485,6 +6498,7 @@ def _run_one_binding_cycle() -> int:
                 {"state": "ready", "detail": "bootstrap complete"},
             )
             log.info("reported state=ready (attempt %d)", attempt)
+            report_ready_runtime_state()
             checkpoint_supervisor_progress("phase-a-ready-post")
             break
         except urllib.error.HTTPError as http_exc:
