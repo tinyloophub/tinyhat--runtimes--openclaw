@@ -6286,6 +6286,24 @@ def main() -> int:
     return 0
 
 
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to ``seconds``, returning early on a clean-stop request.
+
+    The Phase A/B retry/poll waits must stay responsive to SIGTERM (#685):
+    a plain ``time.sleep(30)`` could outlast systemd's ``TimeoutStopSec``
+    so the supervisor never reaches ``main()``'s clean-shutdown guard and
+    an already-running gateway (from a prior crash-continuity instance) is
+    SIGKILLed orphaned. Sleeping in small slices and bailing when
+    ``_stop_holder["stop"]`` is set keeps clean shutdown prompt.
+    """
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not _stop_holder["stop"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.5, remaining))
+
+
 def _run_one_binding_cycle() -> int:
     # Phase A: report ready. Retry until it succeeds — if the
     # platform is transiently unreachable (ngrok blip, backend
@@ -6293,6 +6311,11 @@ def _run_one_binding_cycle() -> int:
     # state. ``provisioning`` is not in ``/me/binding``'s
     # allow-list, so a stuck supervisor would 409-loop forever
     # otherwise.
+    #
+    # The retry loop observes ``_stop_holder["stop"]`` (set by SIGTERM/
+    # SIGINT) so a clean shutdown while the platform is unreachable
+    # returns promptly to ``main()`` — letting the clean-shutdown guard
+    # stop the gateway before systemd's TimeoutStopSec escalates (#685).
     #
     # On supervisor restart the row may already be past
     # ``provisioning`` (admin retry, manual reset). The platform
@@ -6303,6 +6326,10 @@ def _run_one_binding_cycle() -> int:
     # /me/binding decide what's next; that way a restart in
     # ready/assigned/active/broken does not infinite-loop.
     for attempt in range(1, 1000):
+        # Clean shutdown requested while retrying an unreachable platform:
+        # return so main()'s clean-shutdown guard can stop the gateway.
+        if _stop_holder["stop"]:
+            return 0
         try:
             post_json(
                 "/hapi/v1/computers/me/state",
@@ -6326,7 +6353,7 @@ def _run_one_binding_cycle() -> int:
                 http_exc,
             )
             checkpoint_supervisor_progress("phase-a-ready-post-failed")
-            time.sleep(min(2 * attempt, 30))
+            _interruptible_sleep(min(2 * attempt, 30))
         except Exception as exc:
             log.warning(
                 "initial /me/state ready POST failed (attempt %d): %s",
@@ -6334,7 +6361,9 @@ def _run_one_binding_cycle() -> int:
                 exc,
             )
             checkpoint_supervisor_progress("phase-a-ready-post-failed")
-            time.sleep(min(2 * attempt, 30))
+            _interruptible_sleep(min(2 * attempt, 30))
+    if _stop_holder["stop"]:
+        return 0
 
     # Phase B: poll for binding
     poll = BINDING_POLL_BASE_SECONDS
@@ -6351,7 +6380,7 @@ def _run_one_binding_cycle() -> int:
         except Exception as exc:
             log.warning("/me/binding GET failed: %s", exc)
             checkpoint_supervisor_progress("phase-b-binding-get-failed")
-            time.sleep(poll)
+            _interruptible_sleep(poll)
             continue
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
@@ -6397,7 +6426,7 @@ def _run_one_binding_cycle() -> int:
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS
         checkpoint_supervisor_progress("phase-b-binding-empty")
-        time.sleep(poll)
+        _interruptible_sleep(poll)
     if _stop_holder["stop"]:
         return 0
 

@@ -7146,3 +7146,61 @@ class CleanShutdownGatewayTeardownTests(unittest.TestCase):
         ):
             supervisor._stop_gateway_on_clean_shutdown()
         stop_gw.assert_not_called()
+
+    def test_phase_a_ready_retry_returns_promptly_on_clean_stop(self) -> None:
+        # Codex re-review repro: SIGTERM lands while Phase A is retrying an
+        # unreachable platform. The retry loop must observe the stop flag
+        # and return 0 BEFORE another long sleep/retry, so main() reaches
+        # the clean-shutdown guard within TimeoutStopSec.
+        import urllib.error
+
+        post_calls = {"n": 0}
+
+        def failing_ready_post(path, payload):
+            post_calls["n"] += 1
+            # The signal handler would set this mid-POST; simulate that.
+            supervisor._stop_holder["stop"] = True
+            raise urllib.error.HTTPError(path, 503, "platform down", {}, None)
+
+        sleeps: list[float] = []
+
+        with (
+            patch.object(supervisor, "post_json", side_effect=failing_ready_post),
+            patch.object(supervisor, "checkpoint_supervisor_progress", return_value=True),
+            patch.object(supervisor.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+        ):
+            result = supervisor._run_one_binding_cycle()
+
+        self.assertEqual(result, 0)
+        # Exactly one POST attempt — it must not keep retrying after stop.
+        self.assertEqual(post_calls["n"], 1)
+        # The interruptible sleep bailed immediately once stop was set, so
+        # no full multi-second wait happened.
+        self.assertLessEqual(sum(sleeps), 0.5)
+
+    def test_phase_a_clean_stop_lets_main_stop_the_gateway(self) -> None:
+        # End to end: a clean stop during a failing Phase A ready-post ->
+        # cycle returns 0 -> main()'s guard stops the active gateway.
+        import urllib.error
+
+        def failing_ready_post(path, payload):
+            supervisor._stop_holder["stop"] = True
+            raise urllib.error.HTTPError(path, 503, "platform down", {}, None)
+
+        with (
+            patch.object(supervisor, "post_json", side_effect=failing_ready_post),
+            patch.object(supervisor, "checkpoint_supervisor_progress", return_value=True),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor.time, "sleep", return_value=None),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_called_once()
+
+    def test_interruptible_sleep_bails_when_stop_set(self) -> None:
+        slept: list[float] = []
+        supervisor._stop_holder["stop"] = True
+        with patch.object(supervisor.time, "sleep", side_effect=lambda s: slept.append(s)):
+            supervisor._interruptible_sleep(30)
+        self.assertEqual(slept, [])  # never sleeps once stop is already set
