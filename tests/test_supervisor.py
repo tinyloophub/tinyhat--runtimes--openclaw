@@ -7015,3 +7015,59 @@ class PluginLoadDetectionTests(unittest.TestCase):
                 payload = supervisor.read_runtime_state()
             self.assertEqual(payload["runtime_health"], "healthy")
             self.assertEqual(payload["plugin"]["load_check"], "loaded")
+
+    def test_plugin_update_resets_the_missing_beacon_clock(self) -> None:
+        """Review repro: a not_loaded verdict for one version must not
+        leak its clock into the next installed version — each install
+        gets its own grace window."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_marker(tmpdir, "0.5.0")
+            p1, p2, p3, p4 = self._patches(tmpdir)
+            base = 1_750_000_000
+            with p1, p2, p3, p4:
+                with patch.object(supervisor.time, "time", return_value=base):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base + supervisor.PLUGIN_LOAD_GRACE_SECONDS + 1,
+                ):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    demoted = supervisor.read_runtime_state()
+                # Plugin updated to 0.6.0; its beacon has not landed yet.
+                self._write_marker(tmpdir, "0.6.0")
+                fresh_now = base + supervisor.PLUGIN_LOAD_GRACE_SECONDS + 2
+                with patch.object(
+                    supervisor.time, "time", return_value=fresh_now
+                ):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    fresh = supervisor.read_runtime_state()
+                # And only after ITS OWN grace window does 0.6.0 demote.
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=fresh_now
+                    + supervisor.PLUGIN_LOAD_GRACE_SECONDS
+                    + 1,
+                ):
+                    supervisor._write_runtime_state(
+                        "healthy", "ok", gateway_active=True
+                    )
+                    later = supervisor.read_runtime_state()
+            self.assertEqual(
+                demoted["runtime_health"], "unsupported_openclaw_version"
+            )
+            self.assertEqual(fresh["runtime_health"], "healthy")
+            self.assertEqual(fresh["plugin"]["load_check"], "pending")
+            self.assertEqual(fresh["plugin"]["installed_version"], "0.6.0")
+            self.assertEqual(fresh["plugin"]["missing_since_unix"], fresh_now)
+            self.assertEqual(
+                later["runtime_health"], "unsupported_openclaw_version"
+            )
+            self.assertEqual(later["plugin"]["load_check"], "not_loaded")

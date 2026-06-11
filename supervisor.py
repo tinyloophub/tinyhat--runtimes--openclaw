@@ -1112,9 +1112,22 @@ def _plugin_load_check(
         # running; report unknown rather than start the clock.
         check["load_check"] = "unknown"
         return check
+    # The missing-beacon clock is scoped to the installed version: a
+    # plugin install/update must get its own grace window instead of
+    # inheriting a stale verdict from the previous version. The reason
+    # may flip between beacon_missing and beacon_version_mismatch for
+    # the same unloaded install; both mean "this version has not
+    # loaded", so they share one clock.
     prior = existing_state.get("plugin")
+    prior_version = (
+        str(prior.get("installed_version") or "").strip()
+        if isinstance(prior, dict)
+        else ""
+    )
     missing_since = (
-        prior.get("missing_since_unix") if isinstance(prior, dict) else None
+        prior.get("missing_since_unix")
+        if isinstance(prior, dict) and prior_version == installed_version
+        else None
     )
     if not isinstance(missing_since, int):
         missing_since = now
