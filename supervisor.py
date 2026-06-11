@@ -2084,6 +2084,18 @@ def _runtime_state_event(
     return event
 
 
+def _append_runtime_state_event(
+    events: list[dict[str, str]],
+    event: dict[str, str],
+) -> None:
+    if events and events[-1].get("type") == event.get("type"):
+        merged = dict(events[-1])
+        merged.update(event)
+        events[-1] = merged
+        return
+    events.append(event)
+
+
 def _runtime_state_event_history(
     state: dict[str, Any],
     *,
@@ -2123,7 +2135,7 @@ def _runtime_state_event_history(
         if key in seen:
             continue
         seen.add(key)
-        events.append(event)
+        _append_runtime_state_event(events, event)
     if event_type:
         event = _runtime_state_event(event_type, detail, now=now)
         key = (
@@ -2132,7 +2144,7 @@ def _runtime_state_event_history(
             event.get("detail", ""),
         )
         if key not in seen:
-            events.append(event)
+            _append_runtime_state_event(events, event)
     return events[-RUNTIME_STATE_MAX_EVENTS:]
 
 
@@ -2201,7 +2213,13 @@ def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
     except Exception as exc:
         _runtime_state_platform_post_cache["signature"] = None
         _runtime_state_platform_post_cache["ts"] = 0.0
-        _mark_runtime_state_platform_unreachable(payload, exc)
+        try:
+            _mark_runtime_state_platform_unreachable(payload, exc)
+        except Exception as marker_exc:
+            log.warning(
+                "runtime_state platform unreachable marker failed: %s",
+                marker_exc,
+            )
         log.warning("runtime_state platform POST failed: %s", exc)
         return False
     log.info(

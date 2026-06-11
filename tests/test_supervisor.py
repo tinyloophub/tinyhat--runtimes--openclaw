@@ -935,6 +935,96 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertNotEqual(payload.get("last_error_category"), "platform_unreachable")
             self.assertEqual(os.stat(state_path).st_mode & 0o777, 0o600)
 
+    def test_runtime_state_platform_post_failure_retries_without_event_churn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+            }
+            posted: list[tuple[str, dict]] = []
+
+            def fake_post_json(path: str, body: dict) -> dict:
+                posted.append((path, body))
+                raise RuntimeError("network down")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.time, "time", return_value=1000),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "platform unavailable",
+                    gateway_active=False,
+                    openclaw_ready=False,
+                )
+                supervisor._write_runtime_state(
+                    "degraded_workload",
+                    "platform unavailable",
+                    gateway_active=False,
+                    openclaw_ready=False,
+                )
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(len(posted), 2)
+            event_types = [
+                event["type"] for event in payload.get("runtime_events", [])
+            ]
+            self.assertEqual(event_types.count("platform_unreachable"), 1)
+            self.assertEqual(
+                payload["runtime_events"][-1]["type"],
+                "platform_unreachable",
+            )
+
+    def test_runtime_state_platform_post_marker_failure_is_best_effort(
+        self,
+    ) -> None:
+        env = {"TINYHAT_PLATFORM_BASE_URL": "https://platform.test"}
+        payload = {
+            "schema": supervisor.RUNTIME_STATE_SCHEMA,
+            "observed_at": "2026-06-11T17:00:00Z",
+            "updated_at_unix": 1_780_000_000,
+        }
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(supervisor, "post_json", side_effect=RuntimeError("boom")),
+            patch.object(
+                supervisor,
+                "_mark_runtime_state_platform_unreachable",
+                side_effect=OSError("disk full"),
+            ),
+        ):
+            self.assertFalse(supervisor._post_runtime_state_to_platform(payload))
+
+    def test_runtime_state_collapses_consecutive_same_type_events(self) -> None:
+        events = supervisor._runtime_state_event_history(
+            {
+                "runtime_events": [
+                    {
+                        "type": "manual_recovery_set",
+                        "at": "2026-06-11T17:00:00Z",
+                    },
+                    {
+                        "type": "platform_unreachable",
+                        "at": "2026-06-11T17:00:10Z",
+                        "detail": "RuntimeError: network down",
+                    },
+                ]
+            },
+            event_type="platform_unreachable",
+            detail="RuntimeError: network down",
+            now=1_760_000_000,
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["manual_recovery_set", "platform_unreachable"],
+        )
+        self.assertEqual(events[-1]["at"], "2025-10-09T08:53:20Z")
+
     def test_runtime_state_preserves_bounded_sanitized_typed_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
