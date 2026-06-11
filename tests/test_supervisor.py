@@ -1066,6 +1066,43 @@ class RuntimeStateV1Tests(unittest.TestCase):
         self.assertEqual(payload["last_error"]["category"], "health_check_failed")
         self.assertEqual(payload["runtime_health"], "openclaw_not_ready")
 
+    def test_runtime_state_sanitizer_redacts_freeform_log_secrets(self) -> None:
+        aws_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        slack_token = "xoxb-" + "123456789012-abcdefghijklmnop"
+        detail = (
+            "provider rejected sk-proj-AbCdEf012345678901234567890abc "
+            "anthropic 401 sk-ant-api03-AbCdEf0123456789012345678901234567 "
+            "openrouter retry sk-or-v1-0123456789abcdef0123456789abcdef "
+            "clone https://oauth2:GENERICtoken@github.com/example/repo.git "
+            "{\"access_token\": \"json-access-token-secret\", "
+            "\"password\": \"json-password-secret\"} "
+            f"aws key {aws_access_key} "
+            "aws_secret_access_key=\"aws-secret-access-key-value\" "
+            f"slack {slack_token}"
+        )
+
+        redacted = supervisor._sanitize_runtime_state_text(detail, limit=4096)
+
+        self.assertNotIn("sk-proj-AbCdEf012345678901234567890abc", redacted)
+        self.assertNotIn(
+            "sk-ant-api03-AbCdEf0123456789012345678901234567",
+            redacted,
+        )
+        self.assertNotIn(
+            "sk-or-v1-0123456789abcdef0123456789abcdef",
+            redacted,
+        )
+        self.assertNotIn("GENERICtoken", redacted)
+        self.assertNotIn("json-access-token-secret", redacted)
+        self.assertNotIn("json-password-secret", redacted)
+        self.assertNotIn(aws_access_key, redacted)
+        self.assertNotIn("aws-secret-access-key-value", redacted)
+        self.assertNotIn(slack_token, redacted)
+        self.assertIn("[redacted-api-key]", redacted)
+        self.assertIn("[redacted-userinfo]", redacted)
+        self.assertIn("[redacted-aws-key]", redacted)
+        self.assertIn("[redacted-slack-token]", redacted)
+
     def test_control_plane_state_dir_chowns_root_when_running_as_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             control_dir = os.path.join(tmpdir, "tinyhat-control")
