@@ -778,6 +778,79 @@ class RuntimeStateV1Tests(unittest.TestCase):
         self.assertIn("[redacted-identity-token]", raw)
         self.assertIn("[local-path]", raw)
 
+    def test_runtime_state_dev_mode_mirrors_gateway_log_file_excerpts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            runtime_home = os.path.join(tmpdir, "runtime-home")
+            os.makedirs(runtime_home, exist_ok=True)
+            gateway_log_path = os.path.join(runtime_home, "openclaw-gateway.log")
+            gateway_lines = [
+                f"[gateway] dev line {index} ok"
+                for index in range(supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES + 4)
+            ]
+            # The dev gateway runs --verbose, so its log is exactly where
+            # bare provider keys can land: prove redaction for a bare
+            # (unassigned) key, an assignment, a bearer header, a cookie,
+            # and a signed URL.
+            gateway_lines[-2] = (
+                "[telegram] connected Authorization: Bearer dev-gateway-token "
+                "Cookie: session=dev-secret-cookie "
+                "sk-or-v1-devbare01234567890123456789"
+            )
+            gateway_lines[-1] = (
+                "[gateway] callback https://example.com/cb?signature=devsig123 "
+                "ANTHROPIC_API_KEY=sk-ant-api03-devsecret0123456789012345 "
+                + "x" * 2_000
+            )
+            with open(gateway_log_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(gateway_lines))
+
+            env = {
+                **self._env(state_path),
+                "TINYHAT_RUNTIME_HOME": runtime_home,
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "0",
+            }
+
+            def fail_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("journalctl must not run in dev mode")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fail_run),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                payload = supervisor.read_runtime_state()
+
+        journal = payload["gateway"]["journal"]
+        self.assertEqual(
+            len(journal),
+            supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+        )
+        self.assertTrue(journal[0]["text"].startswith("[gateway] dev line 4"))
+        # Dev entries come from a log file, not a systemd unit.
+        self.assertNotIn("unit", journal[0])
+        self.assertLessEqual(
+            len(journal[-1]["text"]),
+            supervisor.RUNTIME_STATE_LOG_LINE_MAX_CHARS,
+        )
+        # Journald-only sources stay absent in dev.
+        self.assertNotIn("journal", payload["supervisor"])
+        self.assertNotIn("bootstrap", payload)
+        raw = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("dev-gateway-token", raw)
+        self.assertNotIn("dev-secret-cookie", raw)
+        self.assertNotIn("devsig123", raw)
+        self.assertNotIn("devbare", raw)
+        self.assertNotIn("devsecret", raw)
+        self.assertIn("[redacted-api-key]", raw)
+        self.assertIn("[redacted-signed-url]", raw)
+
     def test_runtime_state_posts_payload_with_metadata_only_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
