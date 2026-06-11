@@ -676,6 +676,108 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(posted[0][1], payload)
             self.assertEqual(posted[0][1]["runtime_health"], "healthy")
 
+    def test_runtime_state_includes_bounded_redacted_log_excerpts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            bootstrap_log_path = os.path.join(tmpdir, "tinyhat-bootstrap.log")
+            bootstrap_lines = [
+                f"bootstrap line {index} ok"
+                for index in range(supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES + 5)
+            ]
+            bootstrap_lines[-1] = (
+                "bootstrap Authorization: Bearer bootstrap-token "
+                "/var/lib/tinyhat-openclaw/workspace/private.txt "
+                + "x" * 2_000
+            )
+            with open(bootstrap_log_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(bootstrap_lines))
+
+            jwt = "eyJ" + ("a" * 12) + "." + ("b" * 12) + "." + ("c" * 12)
+            journal_lines = {
+                supervisor.SUPERVISOR_SYSTEMD_UNIT: [
+                    f"2026-06-11T10:00:{index:02d} supervisor ok {index}"
+                    for index in range(supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES + 2)
+                ],
+                supervisor.GATEWAY_SYSTEMD_UNIT: [
+                    f"2026-06-11T10:01:{index:02d} gateway ok {index}"
+                    for index in range(supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES + 2)
+                ],
+            }
+            journal_lines[supervisor.SUPERVISOR_SYSTEMD_UNIT][-1] = (
+                "2026-06-11T10:00:59 supervisor Cookie: session=secret-cookie "
+                f"identity={jwt}"
+            )
+            journal_lines[supervisor.GATEWAY_SYSTEMD_UNIT][-1] = (
+                "2026-06-11T10:01:59 gateway "
+                "https://storage.googleapis.com/b?X-Goog-Signature=deadbeef "
+                "OPENROUTER_API_KEY=sk-or-v1-secret"
+            )
+
+            def fake_run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+                unit = args[args.index("-u") + 1]
+                limit = int(args[args.index("-n") + 1])
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="\n".join(journal_lines[unit][-limit:]),
+                    stderr="",
+                )
+
+            env = {
+                **self._env(state_path),
+                supervisor.TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH_ENV: bootstrap_log_path,
+                supervisor.TINYHAT_GCE_METADATA_AVAILABLE_ENV: "0",
+                "TINYHAT_DEV_RUNTIME": "",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                supervisor._write_runtime_state(
+                    "healthy",
+                    "openclaw gateway started",
+                    gateway_active=True,
+                    gateway_action="started",
+                    openclaw_ready=True,
+                )
+                payload = supervisor.read_runtime_state()
+
+        self.assertEqual(
+            len(payload["bootstrap"]["log_excerpt_lines"]),
+            supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+        )
+        self.assertEqual(
+            len(payload["supervisor"]["journal"]),
+            supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+        )
+        self.assertEqual(
+            len(payload["gateway"]["journal"]),
+            supervisor.RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+        )
+        self.assertTrue(
+            payload["bootstrap"]["log_excerpt_lines"][0]["text"].startswith(
+                "bootstrap line 5"
+            )
+        )
+        self.assertLessEqual(
+            len(payload["bootstrap"]["log_excerpt_lines"][-1]["text"]),
+            supervisor.RUNTIME_STATE_LOG_LINE_MAX_CHARS,
+        )
+        self.assertEqual(
+            payload["gateway"]["journal"][-1]["unit"],
+            supervisor.GATEWAY_SYSTEMD_UNIT,
+        )
+        raw = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("bootstrap-token", raw)
+        self.assertNotIn("secret-cookie", raw)
+        self.assertNotIn("deadbeef", raw)
+        self.assertNotIn("sk-or-v1-secret", raw)
+        self.assertNotIn(jwt, raw)
+        self.assertNotIn("/var/lib/tinyhat-openclaw", raw)
+        self.assertIn("[redacted]", raw)
+        self.assertIn("[redacted-signed-url]", raw)
+        self.assertIn("[redacted-identity-token]", raw)
+        self.assertIn("[local-path]", raw)
+
     def test_runtime_state_posts_payload_with_metadata_only_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "runtime-state.json")
