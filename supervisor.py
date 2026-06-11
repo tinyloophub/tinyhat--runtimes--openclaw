@@ -2295,6 +2295,34 @@ def _runtime_state_log_entries(
     return entries
 
 
+def _gateway_runtime_log_entries() -> list[dict[str, str]]:
+    """Gateway tail for runtime-state mirroring.
+
+    Production reads the gateway's systemd journal. The dev container
+    has no journald — there the supervisor spawns the gateway directly
+    and streams its output to ``openclaw-gateway.log`` (see
+    :func:`_start_openclaw_gateway_dev`), so dev tails that file
+    instead. Both paths get the same line/count caps and client-side
+    redaction; without this fallback a dev Computer would always
+    report an empty gateway excerpt. Dev entries carry no ``unit``
+    because they do not come from a systemd unit.
+    """
+    if _dev_mode():
+        return _runtime_state_log_entries(
+            _tail_runtime_log_file(
+                _dev_gateway_log_path(),
+                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+            )
+        )
+    return _runtime_state_log_entries(
+        _journal_runtime_log_lines(
+            GATEWAY_SYSTEMD_UNIT,
+            limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
+        ),
+        unit=GATEWAY_SYSTEMD_UNIT,
+    )
+
+
 def _runtime_state_recent_log_excerpts() -> dict[str, list[dict[str, str]]]:
     """Collect a small, redacted diagnostic tail for runtime-state mirroring."""
     bootstrap_lines = _tail_runtime_log_file(
@@ -2310,13 +2338,7 @@ def _runtime_state_recent_log_excerpts() -> dict[str, list[dict[str, str]]]:
             ),
             unit=SUPERVISOR_SYSTEMD_UNIT,
         ),
-        "gateway": _runtime_state_log_entries(
-            _journal_runtime_log_lines(
-                GATEWAY_SYSTEMD_UNIT,
-                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
-            ),
-            unit=GATEWAY_SYSTEMD_UNIT,
-        ),
+        "gateway": _gateway_runtime_log_entries(),
     }
 
 
