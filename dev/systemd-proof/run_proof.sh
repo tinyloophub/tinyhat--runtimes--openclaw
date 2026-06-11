@@ -157,9 +157,25 @@ cmd_demo_no_early_healthy() {
   say "D3 PASS: active-but-not-ready never healthy; healthy only after readiness"
 }
 
+# D4 clean-shutdown teardown: with PartOf gone, an explicit
+# `systemctl stop` of the supervisor must still stop the gateway, via the
+# supervisor's own clean-shutdown guard (NOT systemd auto-propagation).
+cmd_demo_clean_stop() {
+  systemctl start "${SUP_UNIT}" "${GW_UNIT}" >/dev/null 2>&1 || true
+  touch "${READY_FILE}"
+  for _ in $(seq 1 20); do [ "$(health)" = "healthy" ] && break; sleep 2; done
+  say "D4 clean-stop: before — gateway=$(systemctl is-active ${GW_UNIT}) supervisor=$(systemctl is-active ${SUP_UNIT})"
+  systemctl stop "${SUP_UNIT}"
+  sleep 3
+  local gw_state; gw_state="$(systemctl is-active ${GW_UNIT} || true)"
+  say "D4: after 'systemctl stop ${SUP_UNIT}' — gateway=${gw_state}"
+  [ "${gw_state}" != "active" ] || { say "D4 FAIL: gateway still active after clean supervisor stop (orphaned)"; return 1; }
+  say "D4 PASS: clean supervisor stop tore down the gateway (supervisor-owned, no PartOf)"
+}
+
 cmd_all() {
   cmd_install; cmd_show_units; cmd_up
-  cmd_demo_reattach; cmd_demo_watchdog; cmd_demo_no_early_healthy
+  cmd_demo_reattach; cmd_demo_watchdog; cmd_demo_no_early_healthy; cmd_demo_clean_stop
   say "ALL DEMOS PASSED"
 }
 
@@ -170,6 +186,7 @@ case "${1:-all}" in
   reattach) cmd_demo_reattach ;;
   watchdog) cmd_demo_watchdog ;;
   no-early-healthy) cmd_demo_no_early_healthy ;;
+  clean-stop) cmd_demo_clean_stop ;;
   all) cmd_all ;;
-  *) echo "usage: $0 {install|show-units|up|reattach|watchdog|no-early-healthy|all}"; exit 2 ;;
+  *) echo "usage: $0 {install|show-units|up|reattach|watchdog|no-early-healthy|clean-stop|all}"; exit 2 ;;
 esac

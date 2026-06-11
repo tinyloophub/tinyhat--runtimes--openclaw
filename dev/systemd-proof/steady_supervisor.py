@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import signal
 import sys
 import time
 
@@ -48,9 +49,21 @@ def _load_supervisor():
 def main() -> int:
     sup = _load_supervisor()
     sup.log.info("proof steady driver starting (period=%.1fs)", PERIOD_SECONDS)
+
+    # The signal handler ONLY sets the stop flag — exactly like the real
+    # main()'s _on_signal — so the teardown runs in normal main-thread
+    # flow (not in the handler, where a nested systemctl subprocess
+    # misbehaves). A hard kill (SIGKILL / watchdog) never sets the flag
+    # or reaches the teardown, so the gateway survives for reattach.
+    def _on_term(signum, frame):
+        sup._stop_holder["stop"] = True
+
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+
     # Real READY=1 — this is what flips the systemd notify unit to active.
     sup.notify_supervisor_ready()
-    while True:
+    while not sup._stop_holder["stop"]:
         active = sup.is_openclaw_gateway_active()
         try:
             ready, detail = sup.probe_current_openclaw_gateway_health()
@@ -70,7 +83,14 @@ def main() -> int:
         )
         # Real forward-progress checkpoint -> real WATCHDOG=1.
         sup.checkpoint_supervisor_progress("steady", inspect_gateway=True)
-        time.sleep(PERIOD_SECONDS)
+        # Sleep in small slices so a clean stop is noticed promptly.
+        slept = 0.0
+        while slept < PERIOD_SECONDS and not sup._stop_holder["stop"]:
+            time.sleep(0.5)
+            slept += 0.5
+    # Clean main-thread exit: run the REAL #685 teardown guard.
+    sup._stop_gateway_on_clean_shutdown()
+    return 0
 
 
 if __name__ == "__main__":

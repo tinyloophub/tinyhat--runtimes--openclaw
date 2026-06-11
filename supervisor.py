@@ -6224,6 +6224,34 @@ def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 
 
+def _stop_gateway_on_clean_shutdown() -> None:
+    """Stop any active gateway when the supervisor exits CLEANLY (#685).
+
+    The gateway unit is no longer ``PartOf=`` the supervisor (that bounced
+    a healthy gateway on every supervisor crash/watchdog restart). With
+    ``PartOf=`` gone, systemd no longer stops the gateway when the
+    supervisor unit stops, so the supervisor must own teardown itself.
+    ``_run_one_binding_cycle`` already stops the gateway in its Phase C/D
+    ``finally``, but a clean SIGTERM/SIGINT that arrives while the
+    respawned supervisor is still in Phase A/B (a gateway from a prior
+    crash-continuity instance still running) returns BEFORE that ``finally``
+    exists — orphaning the gateway. This top-level guard closes that gap.
+
+    Deliberately NOT a blanket ``try/finally`` around ``main()``: that would
+    also fire when ``main()`` exits via an unhandled exception (a supervisor
+    crash), re-introducing the gateway bounce on crash/watchdog restart that
+    this PR removes. It only runs on the explicit clean-stop code path, and
+    a hard kill (SIGKILL/watchdog) never reaches it — the gateway survives
+    for the respawned supervisor to reattach, which is the whole point.
+    """
+    if not _stop_holder["stop"]:
+        return
+    if not is_openclaw_gateway_active():
+        return
+    log.info("clean shutdown: stopping active OpenClaw gateway")
+    stop_openclaw_gateway()
+
+
 def main() -> int:
     log.info("supervisor starting")
 
@@ -6245,6 +6273,7 @@ def main() -> int:
             return exit_code
         if _stop_holder["stop"] and not _stop_holder["rebind"]:
             log.info("supervisor exiting cleanly")
+            _stop_gateway_on_clean_shutdown()
             return 0
         # Rebind path: clear the per-cycle flags and loop.
         _stop_holder["stop"] = False
@@ -6253,6 +6282,7 @@ def main() -> int:
             "rebind: platform unassigned this Computer; awaiting a fresh "
             "/me/binding"
         )
+    _stop_gateway_on_clean_shutdown()
     return 0
 
 

@@ -7075,3 +7075,74 @@ class PluginLoadDetectionTests(unittest.TestCase):
                 later["runtime_health"], "unsupported_openclaw_version"
             )
             self.assertEqual(later["plugin"]["load_check"], "not_loaded")
+
+
+class CleanShutdownGatewayTeardownTests(unittest.TestCase):
+    """#685 (PR #81 review): with PartOf= gone the supervisor must stop an
+    active gateway on a CLEAN exit — even when stopped before Phase D —
+    but must NOT stop it on a crash/exception (continuity)."""
+
+    def setUp(self) -> None:
+        self._old_stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update({"stop": False, "rebind": False})
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._old_stop_holder)
+
+    def test_clean_stop_before_phase_d_stops_active_gateway(self) -> None:
+        # Codex repro: a SIGTERM lands while the respawned supervisor is
+        # still in Phase A/B, so _run_one_binding_cycle returns 0 before
+        # its Phase C/D finally — with a gateway from the prior
+        # crash-continuity instance still running.
+        def fake_cycle() -> int:
+            supervisor._stop_holder["stop"] = True
+            return 0
+
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", side_effect=fake_cycle),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_called_once()
+
+    def test_clean_stop_with_no_active_gateway_does_not_call_stop(self) -> None:
+        def fake_cycle() -> int:
+            supervisor._stop_holder["stop"] = True
+            return 0
+
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", side_effect=fake_cycle),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=False),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 0)
+        stop_gw.assert_not_called()
+
+    def test_error_exit_does_not_trigger_clean_shutdown_teardown(self) -> None:
+        # A non-zero cycle exit (broken/crash path) returns early; the
+        # top-level clean-shutdown guard must NOT fire — error paths own
+        # their own gateway handling and a crash must leave the gateway
+        # for reattach.
+        with (
+            patch.object(supervisor, "_run_one_binding_cycle", return_value=1),
+            patch.object(supervisor, "notify_supervisor_ready", return_value=True),
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            self.assertEqual(supervisor.main(), 1)
+        stop_gw.assert_not_called()
+
+    def test_guard_is_noop_when_stop_flag_not_set(self) -> None:
+        # Defensive: the guard keys off the clean-stop flag, never the
+        # gateway state alone, so it cannot bounce a gateway mid-run.
+        supervisor._stop_holder["stop"] = False
+        with (
+            patch.object(supervisor, "is_openclaw_gateway_active", return_value=True),
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gw,
+        ):
+            supervisor._stop_gateway_on_clean_shutdown()
+        stop_gw.assert_not_called()
