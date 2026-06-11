@@ -97,6 +97,8 @@ _DEFAULT_RUNTIME_STATE_CLEAR_MANUAL_PATH = (
 RUNTIME_STATE_SCHEMA = "runtime_state_v1"
 RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH = 127
 RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS = 60
+RUNTIME_STATE_MAX_EVENTS = 8
+RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS = 512
 RUNTIME_STATE_LOG_SOURCE_MAX_LINES = 15
 RUNTIME_STATE_LOG_LINE_MAX_CHARS = 1024
 RUNTIME_STATE_LOG_COMMAND_TIMEOUT_SECONDS = 2
@@ -2064,6 +2066,129 @@ def _runtime_state_platform_post_signature(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _runtime_state_event(
+    event_type: str,
+    detail: str | None,
+    *,
+    now: int,
+) -> dict[str, str]:
+    event: dict[str, str] = {
+        "type": _sanitize_runtime_state_text(event_type, limit=96),
+        "at": _runtime_state_observed_at(now),
+    }
+    if detail:
+        event["detail"] = _sanitize_runtime_state_text(
+            detail,
+            limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
+        )
+    return event
+
+
+def _append_runtime_state_event(
+    events: list[dict[str, str]],
+    event: dict[str, str],
+) -> None:
+    if events and events[-1].get("type") == event.get("type"):
+        merged = dict(events[-1])
+        merged.update(event)
+        events[-1] = merged
+        return
+    events.append(event)
+
+
+def _runtime_state_event_history(
+    state: dict[str, Any],
+    *,
+    event_type: str | None = None,
+    detail: str | None = None,
+    now: int,
+) -> list[dict[str, str]]:
+    source = state.get("runtime_events")
+    if not isinstance(source, list):
+        source = state.get("events")
+    raw_events = source if isinstance(source, list) else []
+    events: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_events:
+        if not isinstance(item, dict):
+            continue
+        raw_type = item.get("type")
+        if not isinstance(raw_type, str) or not raw_type.strip():
+            continue
+        event: dict[str, str] = {
+            "type": _sanitize_runtime_state_text(raw_type, limit=96)
+        }
+        raw_at = item.get("at") or item.get("observed_at")
+        if isinstance(raw_at, str) and raw_at.strip():
+            event["at"] = _sanitize_runtime_state_text(raw_at, limit=64)
+        raw_detail = item.get("detail") or item.get("message")
+        if isinstance(raw_detail, str) and raw_detail.strip():
+            event["detail"] = _sanitize_runtime_state_text(
+                raw_detail,
+                limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
+            )
+        key = (
+            event["type"],
+            event.get("at", ""),
+            event.get("detail", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        _append_runtime_state_event(events, event)
+    if event_type:
+        event = _runtime_state_event(event_type, detail, now=now)
+        key = (
+            event["type"],
+            event.get("at", ""),
+            event.get("detail", ""),
+        )
+        if key not in seen:
+            _append_runtime_state_event(events, event)
+    return events[-RUNTIME_STATE_MAX_EVENTS:]
+
+
+def _mark_runtime_state_platform_unreachable(
+    payload: dict[str, Any],
+    exc: Exception,
+) -> None:
+    path = runtime_state_path()
+    observed_at = str(payload.get("observed_at") or "")
+    try:
+        now = int(payload.get("updated_at_unix") or time.time())
+    except (TypeError, ValueError):
+        now = int(time.time())
+    if not observed_at:
+        observed_at = _runtime_state_observed_at(now)
+    detail = _sanitize_runtime_state_text(
+        f"{type(exc).__name__}: {exc}",
+        limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
+    )
+    updated = dict(payload)
+    platform = updated.get("platform")
+    if not isinstance(platform, dict):
+        platform = {}
+    else:
+        platform = dict(platform)
+    platform.update(
+        {
+            "status": "unreachable",
+            "last_error_category": "platform_unreachable",
+            "last_error": detail,
+            "last_error_at": observed_at,
+        }
+    )
+    updated["platform"] = platform
+    updated["platform_unreachable"] = True
+    updated["runtime_events"] = _runtime_state_event_history(
+        updated,
+        event_type="platform_unreachable",
+        detail=detail,
+        now=now,
+    )
+    _atomic_write_json(path, updated, mode=0o600)
+
+
 def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
     """Best-effort platform mirror for the local runtime_state_v1 payload."""
     try:
@@ -2086,6 +2211,15 @@ def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
         _runtime_state_platform_post_cache["ts"] = now
         post_json("/hapi/v1/computers/me/runtime-state", payload)
     except Exception as exc:
+        _runtime_state_platform_post_cache["signature"] = None
+        _runtime_state_platform_post_cache["ts"] = 0.0
+        try:
+            _mark_runtime_state_platform_unreachable(payload, exc)
+        except Exception as marker_exc:
+            log.warning(
+                "runtime_state platform unreachable marker failed: %s",
+                marker_exc,
+            )
         log.warning("runtime_state platform POST failed: %s", exc)
         return False
     log.info(
@@ -2394,6 +2528,8 @@ def _write_runtime_state(
     gateway_recovery: dict[str, Any] | None = None,
     gateway_cgroup: dict[str, Any] | None = None,
     last_error_category: str | None = None,
+    event_type: str | None = None,
+    event_detail: str | None = None,
 ) -> None:
     path = runtime_state_path()
     parent = os.path.dirname(path)
@@ -2479,6 +2615,12 @@ def _write_runtime_state(
         gateway_payload["action"] = gateway_action
     identity = _runtime_state_identity()
     recent_logs = _runtime_state_recent_log_excerpts()
+    runtime_events = _runtime_state_event_history(
+        existing_state,
+        event_type=event_type,
+        detail=event_detail or safe_detail,
+        now=now,
+    )
     payload: dict[str, Any] = {
         "schema": RUNTIME_STATE_SCHEMA,
         "schema_version": 1,
@@ -2520,6 +2662,8 @@ def _write_runtime_state(
         payload["config_fingerprint"] = dict(config_fingerprint)
     if safe_last_error_category:
         payload["last_error_category"] = safe_last_error_category
+    if runtime_events:
+        payload["runtime_events"] = runtime_events
     if gateway_recovery:
         payload["gateway_recovery"] = gateway_recovery
     _atomic_write_json(path, payload, mode=0o600)
@@ -2605,6 +2749,7 @@ def _record_gateway_recovery_failure(
                 gateway_recovery=policy,
                 gateway_cgroup=snapshot,
                 last_error_category=reason,
+                event_type="manual_recovery_set",
             )
             return "manual"
         cycles += 1
@@ -2625,6 +2770,7 @@ def _record_gateway_recovery_failure(
             gateway_recovery=policy,
             gateway_cgroup=snapshot,
             last_error_category=reason,
+            event_type="gateway_restart_hold_down_entered",
         )
         return "hold_down"
 
@@ -2687,6 +2833,7 @@ def _record_gateway_recovery_window_timeout(
             gateway_recovery=policy,
             gateway_cgroup=snapshot,
             last_error_category="recovery_window_timeout",
+            event_type="manual_recovery_set",
         )
         return "manual"
 
@@ -2708,6 +2855,7 @@ def _record_gateway_recovery_window_timeout(
         gateway_recovery=policy,
         gateway_cgroup=snapshot,
         last_error_category="recovery_window_timeout",
+        event_type="gateway_restart_hold_down_entered",
     )
     return "hold_down"
 
@@ -4302,6 +4450,7 @@ def ensure_openclaw_gateway_ready(
                 gateway_active=is_openclaw_gateway_active(),
                 gateway_action="blocked",
                 openclaw_ready=False,
+                event_type="manual_recovery_set",
             )
             raise ManualRecoveryRequired(detail)
         manual_recovery_cleared = True
@@ -4326,6 +4475,11 @@ def ensure_openclaw_gateway_ready(
                 gateway_active=True,
                 gateway_action="reattached",
                 openclaw_ready=True,
+                event_type=(
+                    "manual_recovery_clear"
+                    if manual_recovery_cleared
+                    else "supervisor_watchdog_restart"
+                ),
             )
             return {
                 "action": "reattached",
@@ -4392,6 +4546,11 @@ def ensure_openclaw_gateway_ready(
         gateway_active=True,
         gateway_action="started",
         openclaw_ready=True,
+        event_type=(
+            "manual_recovery_clear"
+            if manual_recovery_cleared
+            else "gateway_restart"
+        ),
     )
     return {
         "action": "started",
