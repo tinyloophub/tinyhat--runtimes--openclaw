@@ -5070,8 +5070,12 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
     def test_gateway_unit_is_bounded_unprivileged_workload(self) -> None:
         unit = _bootstrap_unit_block("GATEWAY_UNIT")
 
+        # #685: deliberately NOT PartOf= the supervisor — that bounced
+        # the gateway on every supervisor watchdog/crash restart and
+        # broke reattach continuity. Teardown is owned by the
+        # supervisor's finally: stop_openclaw_gateway().
+        self.assertNotIn("PartOf=", unit)
         for directive in (
-            "PartOf=${SUPERVISOR_UNIT_NAME}",
             "After=network-online.target ${SUPERVISOR_UNIT_NAME}",
             "StartLimitIntervalSec=10min",
             "StartLimitBurst=3",
