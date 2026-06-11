@@ -6609,6 +6609,7 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                 supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
             ),
             patch.object(supervisor.os, "chown", side_effect=fake_chown),
+            patch.object(supervisor.os, "lchown", side_effect=fake_chown),
         ):
             self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
         return plugin_dir
@@ -6675,6 +6676,7 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                     supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
                 ),
                 patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "lchown", side_effect=fake_chown),
                 patch.object(
                     supervisor, "_is_tinyhat_plugin_registered", return_value=True
                 ),
@@ -6699,6 +6701,63 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                     supervisor, "_runtime_ownership_ids", return_value=None
                 ),
                 patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "lchown", side_effect=fake_chown),
             ):
                 supervisor._chown_runtime_owned_tree(tmpdir)
             self.assertEqual(chowned, [])
+
+    def test_tree_chown_never_follows_symlinks(self) -> None:
+        """A symlink inside the plugin tree must not chown its target.
+
+        The tree content ultimately comes from a platform-pinned public
+        repo; a hostile or mispinned checkout could plant symlinks at
+        arbitrary host paths. The sync must lchown the link entry itself,
+        never the target, and must not descend into symlinked dirs.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outside_file = os.path.join(tmpdir, "outside-secret")
+            outside_dir = os.path.join(tmpdir, "outside-dir")
+            os.makedirs(outside_dir)
+            with open(outside_file, "w", encoding="utf-8") as fh:
+                fh.write("root-owned host file")
+            with open(
+                os.path.join(outside_dir, "inner"), "w", encoding="utf-8"
+            ) as fh:
+                fh.write("inside an outside dir")
+
+            tree = os.path.join(tmpdir, "platform-plugins")
+            os.makedirs(os.path.join(tree, "tinyhat"))
+            file_link = os.path.join(tree, "tinyhat", "evil-file-link")
+            dir_link = os.path.join(tree, "tinyhat", "evil-dir-link")
+            os.symlink(outside_file, file_link)
+            os.symlink(outside_dir, dir_link)
+
+            lchowned: list[str] = []
+            followed: list[str] = []
+
+            def fake_lchown(path, uid, gid):
+                lchowned.append(path)
+
+            def fake_chown(path, uid, gid):  # pragma: no cover - must not run
+                followed.append(path)
+
+            with (
+                patch.object(
+                    supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+                ),
+                patch.object(supervisor.os, "lchown", side_effect=fake_lchown),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+            ):
+                supervisor._chown_runtime_owned_tree(tree)
+
+            # The link entries themselves are handed over (lchown)…
+            self.assertIn(file_link, lchowned)
+            self.assertIn(dir_link, lchowned)
+            # …but no follow-style chown happened at all, the symlink
+            # targets were never touched, and the walk did not descend
+            # into the symlinked directory.
+            self.assertEqual(followed, [])
+            self.assertNotIn(outside_file, lchowned)
+            self.assertNotIn(outside_dir, lchowned)
+            self.assertNotIn(os.path.join(outside_dir, "inner"), lchowned)
+            self.assertNotIn(os.path.join(dir_link, "inner"), lchowned)

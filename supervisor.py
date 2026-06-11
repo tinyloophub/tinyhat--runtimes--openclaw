@@ -1586,6 +1586,27 @@ def _prepare_runtime_owned_dir(path: str, *, mode: int = 0o700) -> None:
     _chown_runtime_owned_path(path)
 
 
+def _lchown_runtime_owned_path(path: str) -> None:
+    """Chown one entry WITHOUT following symlinks.
+
+    The recursive tree sync runs privileged over content that ultimately
+    comes from a platform-pinned public repo (and from OpenClaw's install
+    copy of it). A symlink inside that tree must never redirect the chown
+    to its target — otherwise a compromised or mispinned plugin checkout
+    could change ownership of arbitrary paths on the Computer. ``lchown``
+    affects the link entry itself and behaves like ``chown`` for regular
+    files/dirs.
+    """
+    ownership = _runtime_ownership_ids()
+    if ownership is None:
+        return
+    uid, gid = ownership
+    try:
+        os.lchown(path, uid, gid)
+    except OSError as exc:
+        log.warning("failed to set runtime ownership on %s: %s", path, exc)
+
+
 def _chown_runtime_owned_tree(path: str) -> None:
     """Recursively hand a supervisor-written tree to the workload user.
 
@@ -1597,17 +1618,22 @@ def _chown_runtime_owned_tree(path: str) -> None:
     entry stays enabled, and every Tinyhat tool/skill is missing from
     the agent. No-op when no runtime user is configured (dev mode and
     pre-isolation images keep current behaviour).
+
+    Symlink-safe: the walk does not descend into symlinked directories
+    (``os.walk`` default) and every entry is chowned with ``lchown``, so
+    a symlink inside the plugin tree can never change ownership of its
+    target outside the tree.
     """
     if _runtime_ownership_ids() is None:
         return
     if not os.path.lexists(path):
         return
-    _chown_runtime_owned_path(path)
+    _lchown_runtime_owned_path(path)
     for root, dirs, files in os.walk(path):
         for name in dirs:
-            _chown_runtime_owned_path(os.path.join(root, name))
+            _lchown_runtime_owned_path(os.path.join(root, name))
         for name in files:
-            _chown_runtime_owned_path(os.path.join(root, name))
+            _lchown_runtime_owned_path(os.path.join(root, name))
 
 
 def _sync_tinyhat_plugin_runtime_ownership() -> None:
