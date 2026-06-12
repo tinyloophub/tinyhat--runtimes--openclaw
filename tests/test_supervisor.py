@@ -269,7 +269,7 @@ class OpenRouterModelPackageTests(unittest.TestCase):
 
         self.assertEqual(
             config["agents"]["defaults"]["model"],
-            {"primary": "openrouter/moonshotai/kimi-k2.6"},
+            {"primary": "openrouter/deepseek/deepseek-v4-pro"},
         )
 
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:

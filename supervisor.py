@@ -115,9 +115,12 @@ RUNTIME_HEALTH_VALUES = frozenset(
 )
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
-OPENROUTER_DEFAULT_MODEL = "moonshotai/kimi-k2.6"
-# OpenRouter's catalog can report very large per-model completion ceilings
-# (for example Kimi K2.6 advertises ~262k). OpenClaw treats the model
+# Fallback only. New bindings should carry the backend-issued OpenRouter model
+# package; if an older/malformed binding omits it, use a concrete agentic model
+# rather than OpenRouter aliases or a fast-changing default.
+OPENROUTER_DEFAULT_MODEL = "deepseek/deepseek-v4-pro"
+# OpenRouter's catalog can report very large per-model completion ceilings.
+# OpenClaw treats the model
 # completion ceiling as the default request cap unless the model has an
 # explicit params override, so keep Computer chat replies bounded.
 OPENROUTER_COMPLETION_TOKEN_CAP = 8192
