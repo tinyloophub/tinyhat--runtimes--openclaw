@@ -191,7 +191,11 @@ cmd_case6() {
 cmd_case7() {
   clean_slate
   say "C7 runner-lost readiness transaction reconciles before a second restart"
-  [ -f "/etc/systemd/system/${GW_UNIT}" ] || bash "${PROOF_DIR}/run_proof.sh" install
+  # Always install the proof units: on a real Computer the production
+  # gateway unit file exists but never reaches telegram-connected
+  # readiness unbound — case 7 needs the stub's ready-file readiness.
+  bash "${PROOF_DIR}/run_proof.sh" install
+  systemctl stop tinyhat-openclaw.service 2>/dev/null || true
   rm -f "${READY_FILE}"
   systemctl reset-failed "${GW_UNIT}" 2>/dev/null || true
   systemctl restart "${GW_UNIT}"
