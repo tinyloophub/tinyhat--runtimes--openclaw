@@ -280,6 +280,7 @@ class CapabilityVerificationTests(unittest.TestCase):
         # making the permission math answer "no" for one skill dir.
         broken = os.path.join(self.extension_dir, "skills", "beta")
         os.chmod(broken, 0o700)
+        self._make_ancestors_world_traversable()
         with (
             patch.object(
                 supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
@@ -296,6 +297,65 @@ class CapabilityVerificationTests(unittest.TestCase):
         self.assertEqual(capabilities["status"], "shortfall")
         self.assertIn("skill:beta", capabilities["missing"])
         self.assertLess(capabilities["mounted_skills"], 3)
+
+    def _make_ancestors_world_traversable(self) -> None:
+        # tmpdir parents default to 0o700; the ancestor-chain check
+        # must see only the deliberately-broken entry as unreadable.
+        os.chmod(self.state_dir, 0o755)
+        os.chmod(os.path.join(self.state_dir, "extensions"), 0o755)
+        os.chmod(self.extension_dir, 0o755)
+        skills_root = os.path.join(self.extension_dir, "skills")
+        if os.path.isdir(skills_root):
+            os.chmod(skills_root, 0o755)
+
+    def test_unreadable_parent_hides_readable_leaf_skills(self) -> None:
+        """Codex P1 regression: a root-owned 0700 skills ROOT with
+        world-readable leaf skills must not count as mounted — the
+        unprivileged gateway cannot traverse the parent, while the
+        privileged checker's leaf-only stat sees everything."""
+        _write_manifest(
+            self.extension_dir, tools=DECLARED_TOOLS, skills=DECLARED_SKILLS
+        )
+        self._make_ancestors_world_traversable()
+        os.chmod(os.path.join(self.extension_dir, "skills"), 0o700)
+        with (
+            patch.object(
+                supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+            ),
+            patch.object(
+                supervisor,
+                "openclaw_plugin_registry_entry",
+                return_value=(_registry_entry(DECLARED_TOOLS), None),
+            ),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["status"], "shortfall")
+        self.assertEqual(capabilities["mounted_skills"], 0)
+        self.assertEqual(
+            capabilities["missing"],
+            [f"skill:{name}" for name in DECLARED_SKILLS],
+        )
+
+    def test_unreadable_extension_dir_hides_all_skills(self) -> None:
+        """Same class one level up: the extension dir itself 0700."""
+        _write_manifest(
+            self.extension_dir, tools=DECLARED_TOOLS, skills=DECLARED_SKILLS
+        )
+        self._make_ancestors_world_traversable()
+        os.chmod(self.extension_dir, 0o700)
+        with (
+            patch.object(
+                supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+            ),
+            patch.object(
+                supervisor,
+                "openclaw_plugin_registry_entry",
+                return_value=(_registry_entry(DECLARED_TOOLS), None),
+            ),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["status"], "shortfall")
+        self.assertEqual(capabilities["mounted_skills"], 0)
 
     # ── mechanism: self_check (registry unavailable) ──────────────────
 
@@ -456,17 +516,14 @@ class CapabilityVerificationTests(unittest.TestCase):
                 None,
             )
 
-        with (
-            patch.object(
-                supervisor, "capability_verification", side_effect=fake_verification
-            ),
-            patch.object(supervisor, "_lifecycle_marks", {}, create=True),
+        with patch.object(
+            supervisor, "capability_verification", side_effect=fake_verification
         ):
             supervisor.capability_verification_cached(now=1000)
             supervisor.capability_verification_cached(now=1100)
             self.assertEqual(calls, [1000])
             # Gateway became ready after the last check → re-verify.
-            supervisor._lifecycle_marks["gateway_ready_at_unix"] = 1150
+            supervisor.note_gateway_ready()
             supervisor.capability_verification_cached(now=1200)
             self.assertEqual(calls, [1000, 1200])
             # TTL lapse → re-verify.
@@ -474,6 +531,59 @@ class CapabilityVerificationTests(unittest.TestCase):
                 now=1200 + supervisor.CAPABILITY_VERIFICATION_TTL_SECONDS + 1
             )
             self.assertEqual(len(calls), 3)
+
+    def test_cache_invalidates_on_every_later_gateway_restart(self) -> None:
+        """Codex P1 regression: the lifecycle mark records first-boot-wins
+        timestamps, so a LATER gateway restart in the same daemon never
+        advanced it and a cached (possibly stale) verdict survived the
+        restart. The readiness generation must invalidate every time."""
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS[:1], skills=[])
+        self._write_marker("0.5.0")
+        calls: list[int] = []
+
+        def fake_verification(*, now: int):
+            calls.append(now)
+            return ({"status": "shortfall", "checked_at_unix": now}, None)
+
+        with patch.object(
+            supervisor, "capability_verification", side_effect=fake_verification
+        ):
+            # First boot: ready → check.
+            supervisor.note_gateway_ready()
+            supervisor.capability_verification_cached(now=1000)
+            self.assertEqual(calls, [1000])
+            # Second restart inside the TTL window → must re-verify.
+            supervisor.note_gateway_ready()
+            supervisor.capability_verification_cached(now=1050)
+            self.assertEqual(calls, [1000, 1050])
+            # Third restart, same story.
+            supervisor.note_gateway_ready()
+            supervisor.capability_verification_cached(now=1090)
+            self.assertEqual(calls, [1000, 1050, 1090])
+
+    def test_cache_invalidates_when_readiness_lands_in_the_same_second(self) -> None:
+        """Codex P1 regression: integer-second timestamps made a
+        readiness event in the same second as a pre-ready check look
+        old (`>` comparison) and the stale verdict was reused. The
+        generation counter is time-independent."""
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS[:1], skills=[])
+        self._write_marker("0.5.0")
+        calls: list[int] = []
+
+        def fake_verification(*, now: int):
+            calls.append(now)
+            return ({"status": "ok", "checked_at_unix": now}, None)
+
+        with patch.object(
+            supervisor, "capability_verification", side_effect=fake_verification
+        ):
+            # Pre-ready check at second 1000…
+            supervisor.capability_verification_cached(now=1000)
+            self.assertEqual(calls, [1000])
+            # …readiness lands within the SAME second.
+            supervisor.note_gateway_ready()
+            supervisor.capability_verification_cached(now=1000)
+            self.assertEqual(calls, [1000, 1000])
 
 
 class CapabilityDemotionTests(unittest.TestCase):

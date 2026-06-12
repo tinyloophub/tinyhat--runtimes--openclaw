@@ -205,16 +205,36 @@ _capability_verification_cache: dict[str, Any] = {
     "framework": None,
     "checked_at": 0,
     "plugin_version": None,
+    "gateway_ready_generation": 0,
 }
+
+# Updating gateway-readiness signal for the cache — deliberately NOT a
+# lifecycle mark: ``_mark_lifecycle`` records first-boot-wins
+# timestamps (``setdefault``), so ``gateway_ready_at_unix`` never
+# advances on later gateway restarts in the same daemon. This counter
+# increments on EVERY readiness event, so "re-checked after every
+# gateway start" survives restarts and same-second readiness.
+_gateway_ready_generation = 0
+
+
+def note_gateway_ready() -> None:
+    """Record a gateway readiness event (called from the shared
+    readiness wait on every successful probe, daemon and restart
+    transaction alike)."""
+    global _gateway_ready_generation
+    _gateway_ready_generation += 1
 
 
 def _reset_capability_verification_cache() -> None:
+    global _gateway_ready_generation
+    _gateway_ready_generation = 0
     _capability_verification_cache.update(
         {
             "capabilities": None,
             "framework": None,
             "checked_at": 0,
             "plugin_version": None,
+            "gateway_ready_generation": 0,
         }
     )
 
@@ -332,10 +352,24 @@ def _mounted_skills(declared: dict[str, Any]) -> tuple[int, list[str]]:
     installed extension copy; the registry does not expose skill
     mounts, so presence + workload readability of ``<root>/<name>/
     SKILL.md`` is the runtime's honest observable for "mounted".
+    Readability is checked along the whole ancestor chain the gateway
+    must traverse — the install-managed parent, the extension dir, and
+    the declared skill root — not just the leaf: a root-owned ``0700``
+    parent with a world-readable leaf still hides the skill from the
+    unprivileged gateway (the privileged checker itself traverses
+    everything, so a leaf-only stat cannot see that).
     Returns ``(mounted_count, missing_names)``.
     """
     source_dir = str(declared.get("source_dir") or "")
     skill_roots = declared.get("skill_roots") or []
+    source_chain_ok = _workload_readable(
+        os.path.dirname(source_dir), directory=True
+    ) and _workload_readable(source_dir, directory=True)
+    root_ok = {
+        root: source_chain_ok
+        and _workload_readable(os.path.join(source_dir, root), directory=True)
+        for root in skill_roots
+    }
     mounted = 0
     missing: list[str] = []
     for name in declared.get("skills") or []:
@@ -345,8 +379,10 @@ def _mounted_skills(declared: dict[str, Any]) -> tuple[int, list[str]]:
             skill_md = os.path.join(skill_dir, "SKILL.md")
             if not os.path.isfile(skill_md):
                 continue
-            if _workload_readable(skill_dir, directory=True) and _workload_readable(
-                skill_md, directory=False
+            if (
+                root_ok.get(root, False)
+                and _workload_readable(skill_dir, directory=True)
+                and _workload_readable(skill_md, directory=False)
             ):
                 readable = True
                 break
@@ -523,18 +559,17 @@ def capability_verification_cached(
 
     The registry inspection is a subprocess; the daemon's state writes
     are frequent. Re-verify when the TTL lapses, when the gateway
-    became ready after the last check (verification after gateway
-    start is the contract), or when the installed plugin version
-    changed. ``checked_at_unix`` stays the time of the real check.
+    became ready after the last check — tracked by an updating
+    readiness *generation*, not the first-boot-wins lifecycle mark, so
+    every gateway restart (and a readiness landing in the same second
+    as a pre-ready check) invalidates — or when the installed plugin
+    version changed. ``checked_at_unix`` stays the time of the real
+    check.
     """
     sup = _sup()
     cache = _capability_verification_cache
     marker = sup._read_installed_plugin_marker()
     installed_version = str(marker.get("version") or "").strip()
-    marks = getattr(sup, "_lifecycle_marks", None)
-    gateway_ready_at = (
-        marks.get("gateway_ready_at_unix") if isinstance(marks, dict) else None
-    )
     checked_at = cache["checked_at"]
     # A backwards-moving clock (NTP step, test time control) must
     # invalidate rather than pin a stale verdict forever.
@@ -542,7 +577,7 @@ def capability_verification_cached(
         checked_at
         and 0 <= now - checked_at < CAPABILITY_VERIFICATION_TTL_SECONDS
         and cache["plugin_version"] == installed_version
-        and not (isinstance(gateway_ready_at, int) and gateway_ready_at > checked_at)
+        and cache["gateway_ready_generation"] == _gateway_ready_generation
     )
     if fresh:
         return cache["capabilities"], cache["framework"]
@@ -553,6 +588,7 @@ def capability_verification_cached(
             "framework": framework,
             "checked_at": now,
             "plugin_version": installed_version,
+            "gateway_ready_generation": _gateway_ready_generation,
         }
     )
     return capabilities, framework

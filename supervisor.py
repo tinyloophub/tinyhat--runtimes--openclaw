@@ -426,6 +426,7 @@ from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
     _workload_readable,
     capability_verification,
     capability_verification_cached,
+    note_gateway_ready,
     read_declared_capabilities,
     tinyhat_plugin_beacon_path,
 )
