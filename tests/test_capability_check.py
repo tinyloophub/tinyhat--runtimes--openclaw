@@ -162,8 +162,64 @@ class CapabilityVerificationTests(unittest.TestCase):
         self.assertEqual(capabilities["registered_tools"], 9)
         self.assertEqual(capabilities["missing"], DECLARED_TOOLS[9:])
 
-    def test_inspect_not_registered_is_a_shortfall_with_all_names(self) -> None:
-        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS[:3], skills=[])
+    def test_registry_miss_with_fresh_beacon_is_self_check_ok(self) -> None:
+        """The bound-canary reality (OpenClaw 2026.6.6): the CLI-side
+        derived registry can omit a config-enabled, gateway-loaded
+        install-dir plugin entirely. A registry miss is NOT evidence of
+        a shortfall — the fresh manifest-covering beacon decides."""
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS, skills=[])
+        self._write_marker("0.4.5")
+        self._write_beacon("0.4.5", declared_tools=DECLARED_TOOLS)
+        with patch.object(
+            supervisor,
+            "openclaw_plugin_registry_entry",
+            return_value=(None, "not_registered"),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["mechanism"], "self_check")
+        self.assertEqual(capabilities["status"], "ok")
+        self.assertEqual(capabilities["registered_tools"], 12)
+
+    def test_registry_entry_without_tool_names_falls_to_self_check(self) -> None:
+        """An entry whose toolNames is empty exposes no tool-level data;
+        claiming an inspect verdict from it would invent a shortfall."""
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS, skills=[])
+        self._write_marker("0.5.0")
+        self._write_beacon("0.5.0", declared_tools=DECLARED_TOOLS)
+        with patch.object(
+            supervisor,
+            "openclaw_plugin_registry_entry",
+            return_value=(_registry_entry([]), None),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["mechanism"], "self_check")
+        self.assertEqual(capabilities["status"], "ok")
+
+    def test_registry_miss_without_beacon_on_pre_beacon_plugin_is_unverifiable(
+        self,
+    ) -> None:
+        """A plugin generation that predates the beacon cannot be
+        distinguished from a load failure; never invent a verdict."""
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS, skills=[])
+        self._write_marker("0.4.5")
+        with patch.object(
+            supervisor,
+            "openclaw_plugin_registry_entry",
+            return_value=(None, "not_registered"),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["mechanism"], "self_check")
+        self.assertEqual(capabilities["status"], "unverifiable")
+        # unverifiable never demotes.
+        self.assertIsNone(
+            supervisor.capability_demotion("healthy", None, capabilities, None)
+        )
+
+    def test_registry_miss_without_beacon_on_beacon_capable_plugin_shortfalls(
+        self,
+    ) -> None:
+        _write_manifest(self.extension_dir, tools=DECLARED_TOOLS, skills=[])
+        self._write_marker("0.5.0")
         with patch.object(
             supervisor,
             "openclaw_plugin_registry_entry",
@@ -171,9 +227,34 @@ class CapabilityVerificationTests(unittest.TestCase):
         ):
             capabilities, _ = supervisor.capability_verification(now=1000)
         self.assertEqual(capabilities["status"], "shortfall")
-        self.assertEqual(capabilities["mechanism"], "inspect")
         self.assertEqual(capabilities["registered_tools"], 0)
-        self.assertEqual(capabilities["missing"], DECLARED_TOOLS[:3])
+        self.assertEqual(capabilities["missing"], [])
+
+    def test_pre_beacon_plugin_with_broken_skills_still_shortfalls(self) -> None:
+        """The on-disk skills check is mechanism-independent observed
+        data: even an unverifiable plugin generation reports a missing
+        declared skill, and the demotion names capability_shortfall
+        (not plugin_not_loaded — the tools state is unknown)."""
+        _write_manifest(
+            self.extension_dir, tools=DECLARED_TOOLS, skills=DECLARED_SKILLS
+        )
+        self._write_marker("0.4.5")
+        import shutil
+
+        shutil.rmtree(os.path.join(self.extension_dir, "skills", "beta"))
+        with patch.object(
+            supervisor,
+            "openclaw_plugin_registry_entry",
+            return_value=(None, "not_registered"),
+        ):
+            capabilities, _ = supervisor.capability_verification(now=1000)
+        self.assertEqual(capabilities["status"], "shortfall")
+        self.assertIn("skill:beta", capabilities["missing"])
+        demotion = supervisor.capability_demotion(
+            "healthy", None, capabilities, None
+        )
+        self.assertEqual(demotion[0], "degraded_workload")
+        self.assertEqual(demotion[1], "capability_shortfall")
 
     def test_missing_list_caps_at_ten_names_and_flags_truncation(self) -> None:
         _write_manifest(
@@ -182,10 +263,11 @@ class CapabilityVerificationTests(unittest.TestCase):
         with patch.object(
             supervisor,
             "openclaw_plugin_registry_entry",
-            return_value=(_registry_entry([]), None),
+            return_value=(_registry_entry(["tinyhat_unrelated_tool"]), None),
         ):
             capabilities, _ = supervisor.capability_verification(now=1000)
         # 12 missing tools + 0 missing skills → capped at 10 + flag.
+        self.assertEqual(capabilities["mechanism"], "inspect")
         self.assertEqual(len(capabilities["missing"]), 10)
         self.assertTrue(capabilities["missing_truncated"])
         self.assertEqual(capabilities["missing"], DECLARED_TOOLS[:10])

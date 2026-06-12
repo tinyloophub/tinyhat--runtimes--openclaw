@@ -12,9 +12,12 @@ runtime's published `VERSION` on each new Computer row.
 - Declared-vs-registered capability verification: after gateway start the
   runtime compares the installed plugin's declared manifest
   (`contracts.tools` / `contracts.skills` / `contracts.framework`) against
-  the framework registry (`openclaw plugins inspect`, the primary
-  mechanism) or — when the registry cannot be asked — the plugin's load
-  beacon (`self_check`, never inventing missing names). The verdict ships
+  the framework registry (`openclaw plugins inspect` — used only when it
+  exposes positive tool-level data; proven live on a bound canary, the
+  2026.6.6 CLI-side derived registry can omit a config-enabled,
+  gateway-loaded install-dir plugin entirely) or the plugin's load beacon
+  (`self_check`, never inventing missing names; plugin generations that
+  predate the beacon report `unverifiable` instead of false shortfalls). The verdict ships
   as the additive `capabilities` block of `runtime_state_v1`
   (`{declared_tools, registered_tools, declared_skills, mounted_skills,
   missing: [<=10 names], missing_truncated, checked_at_unix, mechanism,

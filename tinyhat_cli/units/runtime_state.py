@@ -614,7 +614,11 @@ def capability_demotion(
     if isinstance(capabilities, dict) and capabilities.get("status") == "shortfall":
         declared = capabilities.get("declared_tools") or 0
         registered = capabilities.get("registered_tools") or 0
-        if declared > 0 and registered == 0:
+        missing = capabilities.get("missing") or []
+        skills_only = bool(missing) and all(
+            str(name).startswith("skill:") for name in missing
+        )
+        if declared > 0 and registered == 0 and not skills_only:
             return (
                 "degraded_workload",
                 "plugin_not_loaded",

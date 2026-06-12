@@ -437,22 +437,35 @@ def capability_verification(*, now: int) -> tuple[dict[str, Any] | None, dict[st
     mounted_count, missing_skills = sup._mounted_skills(declared)
     block["mounted_skills"] = mounted_count
 
-    entry, miss_reason = sup.openclaw_plugin_registry_entry(sup.TINYHAT_PLUGIN_ID)
+    # Mechanism selection — claim `inspect` ONLY on positive tool-level
+    # registry data. Proven live on a bound GCE canary (OpenClaw
+    # 2026.6.6): the CLI-side registry derives its index from the
+    # bundled extension set and can omit a config-enabled, gateway-
+    # loaded install-dir plugin entirely ("Plugin not found" while the
+    # agent demonstrably has the tools). A registry miss — or an entry
+    # without toolNames — is therefore NOT evidence of a shortfall; the
+    # load beacon is, in both directions.
+    entry, _miss_reason = sup.openclaw_plugin_registry_entry(sup.TINYHAT_PLUGIN_ID)
+    registered_names = (
+        _clean_name_list(entry.get("toolNames")) if entry is not None else []
+    )
     missing: list[str] = []
-    if entry is not None or miss_reason == "not_registered":
+    unverifiable = False
+    if registered_names:
         block["mechanism"] = "inspect"
-        registered_names = (
-            _clean_name_list(entry.get("toolNames")) if entry is not None else []
-        )
         block["registered_tools"] = len(registered_names)
         missing.extend(
             name for name in declared_tools if name not in registered_names
         )
     else:
-        # Registry unavailable: the load beacon is the fallback. A
-        # fresh beacon for the installed version covers the declared
-        # manifest (that version's manifest IS the declaration); a
-        # missing or stale beacon is a shortfall reported by counts.
+        # self_check: a fresh beacon for the installed version covers
+        # the declared manifest (that version's manifest IS the
+        # declaration); a missing/stale beacon on a beacon-capable
+        # plugin is a shortfall reported by counts — never invented
+        # names. Plugin versions that predate the beacon cannot be
+        # distinguished from a load failure, so they report
+        # `unverifiable` and never degrade health (the same version
+        # gate `_plugin_load_check` applies).
         block["mechanism"] = "self_check"
         marker = sup._read_installed_plugin_marker()
         installed_version = str(marker.get("version") or "").strip()
@@ -477,6 +490,9 @@ def capability_verification(*, now: int) -> tuple[dict[str, Any] | None, dict[st
                 # match itself is the coverage proof.
                 block["registered_tools"] = len(declared_tools)
         else:
+            parsed = sup._parse_plugin_version(installed_version)
+            if parsed is None or parsed < sup.TINYHAT_PLUGIN_BEACON_MIN_VERSION:
+                unverifiable = True
             block["registered_tools"] = 0
 
     missing.extend(missing_skills)
@@ -485,6 +501,12 @@ def capability_verification(*, now: int) -> tuple[dict[str, Any] | None, dict[st
         block["missing_truncated"] = True
     else:
         block["missing"] = missing
+    if unverifiable and not missing_skills:
+        # No registry data, no beacon expected from this plugin
+        # generation, and the on-disk skills tree is intact: there is
+        # no mechanism to verify against — never invent a verdict.
+        block["status"] = "unverifiable"
+        return block, framework
     shortfall = (
         bool(missing)
         or block["registered_tools"] < block["declared_tools"]
