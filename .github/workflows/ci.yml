@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Shell syntax
+        run: bash -n bootstrap.sh dev/entrypoint.sh
+      - name: Byte-compile
+        run: python -m compileall -q supervisor.py tinyhat_cli
+      - name: Characterization net (unmodified)
+        run: python -m unittest tests.test_supervisor -v
+      - name: CLI unit + proof-gate tests
+        run: python -m unittest tests.test_tinyhat_cli tests.test_extraction_guards -v
