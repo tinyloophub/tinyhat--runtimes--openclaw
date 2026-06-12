@@ -32,4 +32,22 @@ Subcommands: `install`, `show-units`, `up`, `reattach`, `watchdog`,
 `no-early-healthy`, `all`. `WATCHDOG_SEC` / `PERIOD_SECONDS` env override
 the proof-speed timings (production `WatchdogSec` is 180s).
 
+## Global command lock proof (`command-lock-concurrency`)
+
+`lock_proof.sh` drives the seven live lock cases against the REAL
+`tinyhat_cli.units.command_lock` (+ the real locked gateway-restart
+transaction) — daemon-vs-human deferral, watchdog-restart convergence,
+deadline pgid kill, idempotency replay, hard-crash stale recovery,
+contender-blocked-while-child-survives, and runner-lost readiness
+reconcile-before-second-restart:
+
+```bash
+sudo bash dev/systemd-proof/lock_proof.sh all     # or case1 .. case7
+```
+
+Case 7 reuses this harness's stub gateway unit (`run_proof.sh install`)
+with the ready-file driving readiness. `lock_proof_helper.py` is the
+per-action driver; its output lines (`ACQUIRED`, `BUSY`, `STALE-TAKEOVER`,
+`RESULT`, `REPLAYED`) are what the shell asserts on.
+
 This harness is a dev asset; it is excluded from the packaged runtime.
