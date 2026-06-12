@@ -7,6 +7,16 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.4
+
+### Fixed
+
+- Run Tinyhat platform-plugin Git/update/install subprocesses as the
+  OpenClaw runtime user after repairing checkout ownership. This fixes
+  upgraded cloud Computers where the post-subscription restart still
+  tripped Git's `safe.directory` guard because root was running `git -C`
+  against a checkout already handed to the gateway user.
+
 ## 0.12.3
 
 ### Fixed

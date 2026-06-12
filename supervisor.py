@@ -1349,12 +1349,14 @@ def ensure_tinyhat_plugin_installed(
     # root-owned checkout. Repair before the first `git -C` call so
     # Git's safe.directory guard does not reject the repo.
     _sync_tinyhat_plugin_runtime_ownership()
+    runtime_subprocess_kwargs = _runtime_user_subprocess_kwargs()
     if os.path.isdir(os.path.join(plugin_dir, ".git")):
         remote = subprocess.run(
             ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],
             capture_output=True,
             text=True,
             timeout=30,
+            **runtime_subprocess_kwargs,
         )
         if remote.returncode != 0:
             detail = (remote.stderr or remote.stdout or "").strip()
@@ -1364,6 +1366,7 @@ def ensure_tinyhat_plugin_installed(
             capture_output=True,
             text=True,
             timeout=120,
+            **runtime_subprocess_kwargs,
         )
         if fetch.returncode != 0:
             detail = (fetch.stderr or fetch.stdout or "").strip()
@@ -1376,6 +1379,7 @@ def ensure_tinyhat_plugin_installed(
             capture_output=True,
             text=True,
             timeout=120,
+            **runtime_subprocess_kwargs,
         )
         if clone.returncode != 0:
             detail = (clone.stderr or clone.stdout or "").strip()
@@ -1386,6 +1390,7 @@ def ensure_tinyhat_plugin_installed(
         capture_output=True,
         text=True,
         timeout=60,
+        **runtime_subprocess_kwargs,
     )
     if checkout.returncode != 0:
         detail = (checkout.stderr or checkout.stdout or "").strip()
@@ -1396,6 +1401,7 @@ def ensure_tinyhat_plugin_installed(
         capture_output=True,
         text=True,
         timeout=30,
+        **runtime_subprocess_kwargs,
     )
     if rev_parse.returncode != 0:
         detail = (rev_parse.stderr or rev_parse.stdout or "").strip()
@@ -1448,6 +1454,7 @@ def ensure_tinyhat_plugin_installed(
         text=True,
         timeout=120,
         env=_openclaw_cli_env(),
+        **runtime_subprocess_kwargs,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -2636,6 +2643,21 @@ def _drop_to_runtime_user_for_exec() -> None:
         os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)
+
+
+def _runtime_user_subprocess_kwargs() -> dict[str, Any]:
+    """Return subprocess kwargs that run child commands as the gateway user.
+
+    Plugin checkout commands run after the supervisor repairs the checkout
+    tree to the unprivileged gateway user. Running Git as root at that point
+    trips Git's `safe.directory` protection because root no longer owns the
+    repository. Run those child commands under the same uid/gid as the
+    gateway so repository ownership, installed extension ownership, and Git's
+    safety check all agree.
+    """
+    if _runtime_ownership_ids() is None:
+        return {}
+    return {"preexec_fn": _drop_to_runtime_user_for_exec}
 
 
 def _chatgpt_subscription_profile_suffix(profile_id: str) -> str:

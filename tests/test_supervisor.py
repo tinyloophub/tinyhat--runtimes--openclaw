@@ -7702,6 +7702,10 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                 ]:
                     self.assertIn(os.path.dirname(plugin_dir), chowned_paths())
                     self.assertIn(os.path.join(plugin_dir, ".git"), chowned_paths())
+                    self.assertIs(
+                        kwargs.get("preexec_fn"),
+                        supervisor._drop_to_runtime_user_for_exec,
+                    )
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 if cmd == [
                     "git",
@@ -7720,6 +7724,10 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                         returncode=0, stdout="abc123def4567890\n", stderr=""
                     )
                 if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    self.assertIs(
+                        kwargs.get("preexec_fn"),
+                        supervisor._drop_to_runtime_user_for_exec,
+                    )
                     ext_dir = os.path.join(tmpdir, "extensions", "tinyhat")
                     os.makedirs(ext_dir, exist_ok=True)
                     with open(
