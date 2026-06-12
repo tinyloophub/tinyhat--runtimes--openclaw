@@ -21,6 +21,7 @@ record, **nothing is written** and the caller gets a typed error.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -133,9 +134,12 @@ def append_result(record: dict[str, Any]) -> str:
     sup._prepare_control_plane_state_dir(directory)
     finished = sanitized.get("finished_at_unix")
     stamp = finished if isinstance(finished, int) else int(time.time())
+    # The filename's key part is for ordering/uniqueness only (semantics
+    # live inside the record): a short digest keeps any caller-supplied
+    # key — long, slashed, unicode — within filesystem limits.
     key = str(sanitized.get("idempotency_key") or "no-key")
-    safe_key = "".join(ch for ch in key if ch.isalnum() or ch in "-_.")
-    filename = f"{stamp:012d}-{safe_key or 'no-key'}.json"
+    key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    filename = f"{stamp:012d}-{key_digest}.json"
     path = os.path.join(directory, filename)
 
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)

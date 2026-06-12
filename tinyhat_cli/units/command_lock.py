@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -424,9 +425,13 @@ def store_result(idempotency_key: str, record: dict[str, Any]) -> None:
     sup = _sup()
     results_dir = _results_dir()
     sup._prepare_control_plane_state_dir(results_dir)
+    # Stamp the exact key into the record so load_result can verify it:
+    # the filename is a digest, never the key itself.
+    stamped = dict(record)
+    stamped.setdefault("idempotency_key", str(idempotency_key))
     sup._atomic_write_json(
         os.path.join(results_dir, _result_filename(idempotency_key)),
-        record,
+        stamped,
         mode=0o600,
     )
     _prune_results(results_dir)
@@ -439,14 +444,28 @@ def load_result(idempotency_key: str) -> dict[str, Any] | None:
             payload = json.load(fh)
     except (OSError, ValueError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    # Replay returns a stored result only for the EXACT key it was
+    # stored under — a digest collision or a record written under a
+    # different scheme must never replay as someone else's result.
+    stored_key = payload.get("idempotency_key")
+    if stored_key is not None and str(stored_key) != str(idempotency_key):
+        return None
+    return payload
 
 
 def _result_filename(idempotency_key: str) -> str:
-    safe = "".join(
-        ch for ch in str(idempotency_key) if ch.isalnum() or ch in "-_."
-    )
-    return f"{safe or 'invalid-key'}.json"
+    """Fixed-length, collision-free filename for any caller-supplied key.
+
+    ``--idempotency-key`` is operator-controlled free text. Deriving the
+    path by stripping characters would let distinct keys collide
+    (``a/b`` vs ``ab``) and let a long key blow the filename limit AFTER
+    the mutation already ran — so the path is a digest of the exact
+    key, and the key itself lives (verified) inside the record.
+    """
+    digest = hashlib.sha256(str(idempotency_key).encode("utf-8")).hexdigest()
+    return f"{digest}.json"
 
 
 def _prune_results(results_dir: str) -> None:

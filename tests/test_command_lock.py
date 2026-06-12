@@ -239,12 +239,50 @@ class CommandLockTransactionTests(unittest.TestCase):
                 command_lock.IDEMPOTENCY_MAX_RECORDS,
             )
             # Age cap: a record older than 24h is pruned on the next store.
-            old = os.path.join(results_dir, "key-007.json")
+            old = os.path.join(
+                results_dir, command_lock._result_filename("key-007")
+            )
             if os.path.exists(old):
                 stale_mtime = time.time() - command_lock.IDEMPOTENCY_MAX_AGE_SECONDS - 60
                 os.utime(old, (stale_mtime, stale_mtime))
                 command_lock.store_result("fresh", _ring_record("fresh"))
                 self.assertFalse(os.path.exists(old))
+
+    def test_result_store_keys_never_collide_after_encoding(self) -> None:
+        """Review finding: `a/b` and `ab` must never replay each other."""
+        with _LockEnvironment():
+            command_lock.store_result("ab", _ring_record("ab"))
+            self.assertIsNone(command_lock.load_result("a/b"))
+            command_lock.store_result("a/b", _ring_record("a/b"))
+            self.assertEqual(
+                command_lock.load_result("a/b")["idempotency_key"], "a/b"
+            )
+            self.assertEqual(
+                command_lock.load_result("ab")["idempotency_key"], "ab"
+            )
+            # A record stored under one key never answers another even if
+            # the file were planted at the other key's path.
+            planted = command_lock._result_filename("planted-key")
+            with open(
+                os.path.join(command_lock._results_dir(), planted),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"idempotency_key": "someone-else", "outcome": "succeeded"}, fh)
+            self.assertIsNone(command_lock.load_result("planted-key"))
+
+    def test_result_store_accepts_arbitrarily_long_keys(self) -> None:
+        """Review finding: a 300-char key must not fail AFTER the mutation."""
+        with _LockEnvironment():
+            long_key = "k" * 300
+            command_lock.store_result(long_key, _ring_record(long_key))
+            stored = command_lock.load_result(long_key)
+            self.assertEqual(stored["idempotency_key"], long_key)
+            # The spool tolerates the same key shape (filename is a digest).
+            path = command_spool.append_result(
+                _ring_record(long_key, finished_at_unix=1_760_000_500)
+            )
+            self.assertLessEqual(len(os.path.basename(path)), 64)
 
     def test_lock_unavailable_without_root_or_override(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
@@ -308,12 +346,14 @@ class CommandSpoolTests(unittest.TestCase):
                 )
             files = env.spool_files()
             self.assertEqual(len(files), command_spool.MAX_SPOOL_RECORDS)
-            # The oldest five (000–004) were pruned.
-            self.assertNotIn("001760000000-key-000.json", files)
-            self.assertIn(
-                f"{1_760_000_000 + command_spool.MAX_SPOOL_RECORDS + 4:012d}-"
-                f"key-{command_spool.MAX_SPOOL_RECORDS + 4:03d}.json",
-                files,
+            # The oldest five (stamps …000–…004) were pruned; the newest
+            # stamp survives. Filenames carry a key digest, so assert on
+            # the sortable stamp prefix.
+            stamps = sorted(name.split("-")[0] for name in files)
+            self.assertEqual(stamps[0], f"{1_760_000_005:012d}")
+            self.assertEqual(
+                stamps[-1],
+                f"{1_760_000_000 + command_spool.MAX_SPOOL_RECORDS + 4:012d}",
             )
 
     def test_corrupt_records_quarantine_bounded(self) -> None:
