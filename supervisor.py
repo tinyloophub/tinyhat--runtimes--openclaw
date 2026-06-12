@@ -67,6 +67,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1520,6 +1521,26 @@ def _chown_runtime_owned_path(path: str) -> None:
         log.warning("failed to set runtime ownership on %s: %s", path, exc)
 
 
+def _chmod_runtime_owned_file(path: str, *, mode: int = 0o600) -> None:
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("failed to stat runtime-owned file %s: %s", path, exc)
+        return
+    if stat.S_ISLNK(entry.st_mode):
+        log.warning("refusing to chmod/chown symlinked runtime file %s", path)
+        return
+    if not stat.S_ISREG(entry.st_mode):
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        log.warning("failed to chmod runtime-owned file %s: %s", path, exc)
+    _lchown_runtime_owned_path(path)
+
+
 def _prepare_runtime_owned_dir(path: str, *, mode: int = 0o700) -> None:
     os.makedirs(path, mode=mode, exist_ok=True)
     try:
@@ -2563,6 +2584,56 @@ def openclaw_auth_sqlite_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> s
     )
 
 
+def openclaw_agent_state_dir(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> str:
+    return os.path.dirname(openclaw_auth_sqlite_path(agent_id=agent_id))
+
+
+def _prepare_openclaw_agent_auth_store_ownership(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> None:
+    """Hand OpenClaw's per-agent auth store back to the gateway user.
+
+    The supervisor runs as root in production, while the OpenClaw gateway
+    runs as the isolated ``tinyhat`` user. Device-code auth is launched by
+    the supervisor; without this ownership repair, the CLI can leave
+    ``openclaw-agent.sqlite`` root-owned and the restarted gateway fails with
+    SQLite's opaque ``unable to open database file``.
+    """
+    if not _dev_mode() and _runtime_ownership_ids() is None:
+        return
+    state_dir = openclaw_state_dir()
+    agents_dir = os.path.join(state_dir, "agents")
+    agent_dir = os.path.join(agents_dir, agent_id)
+    auth_dir = openclaw_agent_state_dir(agent_id=agent_id)
+    for path in (state_dir, agents_dir, agent_dir, auth_dir):
+        _prepare_runtime_owned_dir(path)
+
+    sqlite_path = openclaw_auth_sqlite_path(agent_id=agent_id)
+    for path in (sqlite_path, f"{sqlite_path}-wal", f"{sqlite_path}-shm"):
+        _chmod_runtime_owned_file(path, mode=0o600)
+    _chmod_runtime_owned_file(
+        openclaw_auth_profiles_path(agent_id=agent_id),
+        mode=0o600,
+    )
+
+
+def _drop_to_runtime_user_for_exec() -> None:
+    """Drop a forked child to the same uid/gid as the gateway service.
+
+    No-op in dev mode/non-root tests where no runtime user is configured.
+    In production, fail closed: if a configured runtime user cannot be
+    entered, the child exits instead of writing root-owned OpenClaw state.
+    """
+    ownership = _runtime_ownership_ids()
+    if ownership is None:
+        return
+    uid, gid = ownership
+    if hasattr(os, "setgroups"):
+        os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
 def _chatgpt_subscription_profile_suffix(profile_id: str) -> str:
     tail = profile_id.split(":", 1)[1] if ":" in profile_id else profile_id
     return tail.strip() or "default"
@@ -2743,6 +2814,7 @@ def _chatgpt_subscription_profile_from_store(data: Any) -> dict | None:
 def _read_chatgpt_subscription_profile_from_sqlite(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> dict | None:
+    _prepare_openclaw_agent_auth_store_ownership(agent_id=agent_id)
     path = openclaw_auth_sqlite_path(agent_id=agent_id)
     if not os.path.exists(path):
         return None
@@ -2815,6 +2887,7 @@ def read_chatgpt_subscription_profile(
 def _wipe_chatgpt_subscription_profiles_from_sqlite(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> list[str]:
+    _prepare_openclaw_agent_auth_store_ownership(agent_id=agent_id)
     path = openclaw_auth_sqlite_path(agent_id=agent_id)
     if not os.path.exists(path):
         return []
@@ -2870,6 +2943,8 @@ def _wipe_chatgpt_subscription_profiles_from_sqlite(
         return []
     finally:
         conn.close()
+    if removed:
+        _prepare_openclaw_agent_auth_store_ownership(agent_id=agent_id)
     return removed
 
 
@@ -2941,6 +3016,7 @@ def write_openclaw_config(
     _prepare_runtime_owned_dir(os.path.dirname(config_path))
     _prepare_runtime_owned_dir(state_dir)
     _prepare_runtime_owned_dir(workspace_dir)
+    _prepare_openclaw_agent_auth_store_ownership()
 
     # OpenRouter runtime config when the platform delivered it on
     # this binding. OpenClaw's OpenRouter provider reads
@@ -4158,6 +4234,7 @@ def _run_chatgpt_device_code_login_in_thread(
         return
 
     try:
+        _prepare_openclaw_agent_auth_store_ownership()
         ensure_chatgpt_subscription_provider_available()
     except Exception as exc:
         log.warning(
@@ -4206,14 +4283,17 @@ def _run_chatgpt_device_code_login_in_thread(
     if pid == 0:
         # Child: exec the CLI in the PTY. Env is inherited from the
         # supervisor process so the resulting auth profile lands in
-        # this Computer's per-agent auth store.
+        # this Computer's per-agent auth store. Drop to the same
+        # unprivileged user as the gateway before exec so SQLite auth
+        # state remains writable after the gateway restarts.
         try:
+            _drop_to_runtime_user_for_exec()
             os.execvpe(
                 openclaw_bin,
                 _chatgpt_subscription_login_command(openclaw_bin),
                 {**os.environ, **_openclaw_cli_env()},
             )
-        except OSError as exc:
+        except Exception as exc:
             # exec failed; print so the parent's stdout-reader can
             # see the message, then exit non-zero.
             sys.stderr.write(f"openclaw exec failed: {exc}\n")

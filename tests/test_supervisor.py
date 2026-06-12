@@ -3627,6 +3627,105 @@ class RuntimeOwnershipTests(unittest.TestCase):
             chown.assert_not_called()
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
+    def test_auth_store_ownership_repairs_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"TINYHAT_DEV_RUNTIME": "1", "TINYHAT_RUNTIME_HOME": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                auth_dir = supervisor.openclaw_agent_state_dir()
+                os.makedirs(auth_dir, exist_ok=True)
+                sqlite_path = supervisor.openclaw_auth_sqlite_path()
+                touched = [
+                    sqlite_path,
+                    f"{sqlite_path}-wal",
+                    f"{sqlite_path}-shm",
+                    supervisor.openclaw_auth_profiles_path(),
+                ]
+                for path in touched:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write("{}")
+
+                chowned_dirs: list[tuple[str, int, int]] = []
+                lchowned_files: list[tuple[str, int, int]] = []
+
+                with (
+                    patch.object(
+                        supervisor,
+                        "_runtime_ownership_ids",
+                        return_value=(123, 456),
+                    ),
+                    patch.object(
+                        supervisor.os,
+                        "chown",
+                        side_effect=lambda p, u, g: chowned_dirs.append((p, u, g)),
+                    ),
+                    patch.object(
+                        supervisor.os,
+                        "lchown",
+                        side_effect=lambda p, u, g: lchowned_files.append(
+                            (p, u, g)
+                        ),
+                    ),
+                ):
+                    supervisor._prepare_openclaw_agent_auth_store_ownership()
+
+                self.assertIn((tmpdir, 123, 456), chowned_dirs)
+                self.assertIn((os.path.join(tmpdir, "agents"), 123, 456), chowned_dirs)
+                self.assertIn(
+                    (os.path.join(tmpdir, "agents", "main"), 123, 456),
+                    chowned_dirs,
+                )
+                self.assertIn((auth_dir, 123, 456), chowned_dirs)
+                for path in touched:
+                    self.assertIn((path, 123, 456), lchowned_files)
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_drop_to_runtime_user_for_exec_uses_gateway_uid_gid(self) -> None:
+        calls: list[tuple[str, object]] = []
+        with (
+            patch.object(
+                supervisor,
+                "_runtime_ownership_ids",
+                return_value=(123, 456),
+            ),
+            patch.object(
+                supervisor.os,
+                "setgroups",
+                side_effect=lambda groups: calls.append(("setgroups", groups)),
+                create=True,
+            ),
+            patch.object(
+                supervisor.os,
+                "setgid",
+                side_effect=lambda gid: calls.append(("setgid", gid)),
+            ),
+            patch.object(
+                supervisor.os,
+                "setuid",
+                side_effect=lambda uid: calls.append(("setuid", uid)),
+            ),
+        ):
+            supervisor._drop_to_runtime_user_for_exec()
+
+        self.assertEqual(
+            calls,
+            [
+                ("setgroups", []),
+                ("setgid", 456),
+                ("setuid", 123),
+            ],
+        )
+
+    def test_drop_to_runtime_user_for_exec_noops_without_runtime_user(self) -> None:
+        with (
+            patch.object(supervisor, "_runtime_ownership_ids", return_value=None),
+            patch.object(supervisor.os, "setgid") as setgid,
+            patch.object(supervisor.os, "setuid") as setuid,
+        ):
+            supervisor._drop_to_runtime_user_for_exec()
+
+        setgid.assert_not_called()
+        setuid.assert_not_called()
+
 
 def _subscription_binding(*, with_openrouter: bool) -> dict:
     """Binding for a Computer opted into the ChatGPT BYO subscription."""
@@ -5282,6 +5381,38 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         path, body = calls[0]
         self.assertEqual(body["status"], "failed")
         self.assertIn("pseudo-terminal", body["error"])
+
+    def test_pty_child_drops_to_runtime_user_before_exec(self) -> None:
+        import pty as pty_mod
+
+        with (
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                return_value=True,
+            ),
+            patch.object(
+                supervisor,
+                "_prepare_openclaw_agent_auth_store_ownership",
+            ),
+            patch.object(pty_mod, "fork", return_value=(0, 99)),
+            patch.object(supervisor, "_drop_to_runtime_user_for_exec") as drop_user,
+            patch.object(
+                supervisor.os,
+                "execvpe",
+                side_effect=OSError("exec failed after drop"),
+            ) as execvpe,
+            patch.object(supervisor.os, "_exit", side_effect=SystemExit) as exit_,
+        ):
+            with self.assertRaises(SystemExit):
+                supervisor._run_chatgpt_device_code_login_in_thread(
+                    session_id="drop-before-exec-test",
+                    openclaw_bin="/bin/false",
+                )
+
+        drop_user.assert_called_once_with()
+        execvpe.assert_called_once()
+        exit_.assert_called_once_with(127)
 
     def test_provider_check_failure_posts_terminal_failed(self) -> None:
         calls: list[tuple[str, dict]] = []

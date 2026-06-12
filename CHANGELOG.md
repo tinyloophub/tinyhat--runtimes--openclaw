@@ -7,6 +7,17 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.2
+
+### Fixed
+
+- Run the ChatGPT/Codex device-code auth CLI as the same unprivileged
+  runtime user as the OpenClaw gateway, and repair the per-agent auth
+  store ownership before auth/config reads. This fixes cloud Computers
+  where OAuth completed but the restarted gateway could not open
+  `openclaw-agent.sqlite` because the supervisor-created SQLite store
+  was root-owned.
+
 ## 0.12.1
 
 ### Fixed
