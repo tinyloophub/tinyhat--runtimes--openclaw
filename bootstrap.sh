@@ -193,6 +193,22 @@ else
 fi
 chown_runtime_paths
 
+# Root-only on-box CLI (the `tinyhat` diagnose surface). A thin
+# wrapper so a root support shell can run
+# `tinyhat status|health|manifest show|manifest drift|whoami`.
+# Privilege enforcement (euid==0) lives in the Python entrypoint;
+# diagnose commands never mutate runtime state. The wrapper bakes the
+# checkout path at bootstrap time — the runtime self-update re-checks
+# the repo out at the same path, so the wrapper stays valid.
+TINYHAT_CLI_WRAPPER="/usr/local/bin/tinyhat"
+cat > "${TINYHAT_CLI_WRAPPER}" <<WRAPPER
+#!/usr/bin/env bash
+export PYTHONPATH="${RUNTIME_DIR}\${PYTHONPATH:+:\${PYTHONPATH}}"
+exec /usr/bin/python3 -m tinyhat_cli "\$@"
+WRAPPER
+chmod 0755 "${TINYHAT_CLI_WRAPPER}"
+echo "[tinyhat-runtime] installed tinyhat CLI wrapper at ${TINYHAT_CLI_WRAPPER}"
+
 # Fallback runtime config. The supervisor prefers GCE instance
 # metadata (tinyhat-backend-audience / tinyhat-platform-base-url)
 # and only reads this file if the metadata server is unreachable.

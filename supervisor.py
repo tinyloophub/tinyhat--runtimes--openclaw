@@ -371,15 +371,6 @@ def tinyhat_plugin_checkout_dir() -> str:
     return os.path.join(openclaw_state_dir(), "platform-plugins", TINYHAT_PLUGIN_ID)
 
 
-def _openclaw_cli_env() -> dict[str, str]:
-    return {
-        **os.environ,
-        "HOME": openclaw_state_dir(),
-        "OPENCLAW_CONFIG_PATH": openclaw_config_path(),
-        "OPENCLAW_STATE_DIR": openclaw_state_dir(),
-    }
-
-
 # Back-compat names kept for callers that reach in by attribute
 # (tests + the prod bootstrap heredoc). These are the prod paths;
 # dev callers must go through the helper functions above.
@@ -397,8 +388,118 @@ log = logging.getLogger("tinyhat-supervisor")
 
 _base_url_cache = {"value": None, "ts": 0.0}
 _audience_cache = {"value": None, "ts": 0.0}
-_runtime_state_platform_post_cache: dict[str, Any] = {"signature": None, "ts": 0.0}
 _last_watchdog_checkpoint_ts = 0.0
+
+# ── v0.12.0 M1 extraction — delegating re-exports ────────────────────
+# The implementations below moved into the tinyhat_cli package (units +
+# the single OpenClaw adapter); the authoritative move list is
+# tinyhat_cli/extraction_map.json, enforced by
+# tests/test_extraction_guards.py. The names stay importable AND
+# patchable on this module: extracted code resolves its cross-module
+# calls back through this namespace at call time
+# (tinyhat_cli._facade.supervisor_module), so the characterization
+# net's patch.object(supervisor, ...) targets keep applying. These
+# re-exports are the only allowed surface for the moved ranges — a
+# second live implementation in this file is a guard failure.
+from tinyhat_cli.adapters.openclaw import (  # noqa: E402,F401
+    _OPENCLAW_VERSION_RE,
+    _inspect_openclaw_plugin,
+    _openclaw_cli_env,
+    _openclaw_plugin_from_inspect_payload,
+    _read_openclaw_framework_version,
+)
+from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
+    PLUGIN_LOAD_GRACE_SECONDS,
+    TINYHAT_PLUGIN_BEACON_FILENAME,
+    TINYHAT_PLUGIN_BEACON_MIN_VERSION,
+    _PLUGIN_BEACON_MAX_BYTES,
+    _parse_plugin_version,
+    _plugin_load_check,
+    _read_plugin_load_beacon,
+    tinyhat_plugin_beacon_path,
+)
+from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
+    delete_telegram_webhook,
+    start_openclaw_gateway,
+    wait_for_openclaw_start,
+)
+from tinyhat_cli.units.manifest import (  # noqa: E402,F401
+    _component_update_state_path,
+    _read_component_update_state,
+    _read_installed_plugin_marker,
+    _read_runtime_git_sha,
+    _read_runtime_repo_version,
+    collect_component_versions,
+    manifest_drift,
+    manifest_show,
+    read_creation_specs,
+)
+from tinyhat_cli.units.redaction import (  # noqa: E402,F401
+    _RUNTIME_STATE_AUTH_SCHEME_RE,
+    _RUNTIME_STATE_AWS_ACCESS_KEY_RE,
+    _RUNTIME_STATE_GITHUB_TOKEN_RE,
+    _RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE,
+    _RUNTIME_STATE_GOOGLE_API_KEY_RE,
+    _RUNTIME_STATE_JWT_RE,
+    _RUNTIME_STATE_LLM_PROVIDER_KEY_RE,
+    _RUNTIME_STATE_LOCAL_PATH_RE,
+    _RUNTIME_STATE_SECRET_ASSIGNMENT_RE,
+    _RUNTIME_STATE_SIGNED_QUERY_RE,
+    _RUNTIME_STATE_SIGNED_URL_RE,
+    _RUNTIME_STATE_SLACK_TOKEN_RE,
+    _RUNTIME_STATE_TAILSCALE_KEY_RE,
+    _RUNTIME_STATE_TELEGRAM_TOKEN_RE,
+    _RUNTIME_STATE_URL_USERINFO_RE,
+    _sanitize_runtime_state_text,
+)
+from tinyhat_cli.units.runtime_state import (  # noqa: E402,F401
+    RUNTIME_STATE_PLATFORM_POST_MAX_BYTES,
+    _append_runtime_state_event,
+    _gateway_restart_count_window,
+    _gateway_runtime_log_entries,
+    _gateway_status,
+    _gce_instance_id,
+    _journal_runtime_log_lines,
+    _mark_runtime_state_platform_unreachable,
+    _post_runtime_state_to_platform,
+    _reset_runtime_state_identity_cache,
+    _reset_runtime_state_platform_post_cache,
+    _runtime_computer_id,
+    _runtime_health_value,
+    _runtime_ref,
+    _runtime_state_event,
+    _runtime_state_event_history,
+    _runtime_state_gateway_recovery,
+    _runtime_state_identity,
+    _runtime_state_identity_cache,
+    _runtime_state_is_unrecoverable_manual,
+    _runtime_state_last_error,
+    _runtime_state_log_entries,
+    _runtime_state_log_entry,
+    _runtime_state_name,
+    _runtime_state_observed_at,
+    _runtime_state_platform_post_cache,
+    _runtime_state_platform_post_signature,
+    _runtime_state_recent_log_excerpts,
+    _runtime_supervisor_status,
+    _tail_runtime_log_file,
+    _write_runtime_state,
+    budget_runtime_state_payload,
+    lifecycle_block,
+    plugin_demotion,
+    read_runtime_state,
+)
+
+# Coarse boot lifecycle marks (v0.12.0 M1 rider). The binding cycle and
+# the extracted gateway unit stamp phase timestamps here; the
+# runtime-state unit renders them as spans once Phase A has actually
+# run (see tinyhat_cli.units.runtime_state.lifecycle_block).
+_lifecycle_marks: dict[str, int] = {"supervisor_started_at_unix": int(time.time())}
+
+
+def _mark_lifecycle(name: str) -> None:
+    """Record a lifecycle phase timestamp once (first boot story wins)."""
+    _lifecycle_marks.setdefault(name, int(time.time()))
 
 
 def _read_metadata_path(path: str, timeout: int = 5) -> str:
@@ -953,261 +1054,13 @@ def _write_tinyhat_plugin_source_override(
     )
 
 
-def _read_runtime_repo_version() -> str:
-    """Version string for this runtime checkout (the repo-root ``VERSION``).
-
-    Returns ``""`` when the file is missing so the caller omits the
-    runtime version rather than reporting a placeholder.
-    """
-    version_path = os.path.join(runtime_dir(), "VERSION")
-    try:
-        with open(version_path, encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
-
-
-def _read_runtime_git_sha() -> str:
-    """Full git SHA of this runtime checkout, or ``""`` when not a git tree.
-
-    The production Computer clones the runtime repo at a pinned ref, so a
-    ``rev-parse HEAD`` resolves the exact commit. A non-git deployment
-    (e.g. a tarball drop) returns ``""`` and the caller sends a null sha.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", runtime_dir(), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    return (result.stdout or "").strip()
-
-
-def _read_installed_plugin_marker() -> dict:
-    """Read the Tinyhat plugin install marker (written at install time).
-
-    Shape mirrors :func:`ensure_tinyhat_plugin_installed`'s payload:
-    ``{repo_url, repo_ref, resolved_commit_sha, version}``. Returns an
-    empty dict when the marker is missing or unreadable.
-    """
-    marker_path = _tinyhat_plugin_marker_path()
-    try:
-        with open(marker_path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-# ── Plugin load detection (#77) ─────────────────────────────────────
-#
-# "Installed" is not "loaded": OpenClaw skips an enabled extension it
-# cannot read or import WITHOUT failing the gateway, and
-# `openclaw plugins inspect` reports registration, not loadability. The
-# plugin ships a load beacon since v0.5.0 (tinyhat-ai/tinyhat#125): when
-# its extension module evaluates successfully it writes
-# ``tinyhat-plugin-loaded.json`` (plugin, version, loaded_at, pid, node)
-# into the OpenClaw state dir. The supervisor reads that beacon to tell
-# the platform when an enabled plugin never actually loaded — the silent
-# capability loss behind the v0.11.13 ownership regression (#78).
-
-TINYHAT_PLUGIN_BEACON_FILENAME = "tinyhat-plugin-loaded.json"
 # First plugin version that writes the beacon. Older plugins cannot be
 # distinguished from a load failure, so they report "unknown" instead of
 # degrading runtime health.
-TINYHAT_PLUGIN_BEACON_MIN_VERSION = (0, 5, 0)
 # How long an enabled, beacon-capable plugin may stay beacon-less after
 # the gateway is active before the runtime reports it as not loaded.
 # Generous against slow extension startup; tiny against the hours/days a
 # real silent loss would otherwise persist.
-PLUGIN_LOAD_GRACE_SECONDS = 180
-_PLUGIN_BEACON_MAX_BYTES = 8192
-
-
-def tinyhat_plugin_beacon_path() -> str:
-    """Where the plugin's load beacon lands (gateway-written)."""
-    return os.path.join(openclaw_state_dir(), TINYHAT_PLUGIN_BEACON_FILENAME)
-
-
-def _parse_plugin_version(value: Any) -> tuple[int, ...] | None:
-    """Parse ``0.5.0``-style versions; ``None`` for anything else."""
-    text = str(value or "").strip()
-    if not text:
-        return None
-    parts: list[int] = []
-    for segment in text.split("."):
-        digits = "".join(ch for ch in segment if ch.isdigit())
-        if not digits:
-            return None
-        parts.append(int(digits))
-    return tuple(parts) if parts else None
-
-
-def _read_plugin_load_beacon() -> dict | None:
-    """Read the beacon file; ``None`` when missing/oversized/invalid."""
-    path = tinyhat_plugin_beacon_path()
-    try:
-        if os.path.getsize(path) > _PLUGIN_BEACON_MAX_BYTES:
-            return None
-        with open(path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _plugin_load_check(
-    existing_state: dict[str, Any],
-    *,
-    gateway_active: bool | None,
-    now: int,
-) -> dict[str, Any] | None:
-    """Classify whether the enabled Tinyhat plugin actually loaded.
-
-    Returns ``None`` when no plugin is installed (nothing to check).
-    Otherwise a payload block::
-
-        {"installed_version", "load_check", "reason"?,
-         "beacon_loaded_at"?, "missing_since_unix"?}
-
-    ``load_check`` values:
-
-    - ``loaded`` — a beacon for the installed plugin version exists;
-    - ``not_loaded`` — beacon-capable plugin, gateway active, and no
-      matching beacon for longer than the grace window (degrades
-      runtime health to ``unsupported_openclaw_version``);
-    - ``pending`` — same, but still inside the grace window;
-    - ``unknown`` — the check cannot conclude (pre-beacon plugin
-      version, gateway not active) and must never degrade health.
-
-    Known limitation (documented, accepted): the beacon is matched by
-    plugin version, not gateway start time, so a plugin that loaded
-    once and silently broke mid-life without a version change is not
-    detected until the next plugin update or reprovision. The incident
-    class this targets (#78) breaks at boot/install time.
-    """
-    marker = _read_installed_plugin_marker()
-    installed_version = str(marker.get("version") or "").strip()
-    if not installed_version:
-        return None
-    check: dict[str, Any] = {"installed_version": installed_version}
-    # Positive evidence first: a beacon matching the installed version is
-    # definitive proof of load, whatever the version metadata says (a
-    # pre-release build of a beacon-capable plugin can still carry an
-    # older version string).
-    beacon = _read_plugin_load_beacon()
-    if (
-        isinstance(beacon, dict)
-        and str(beacon.get("version") or "").strip() == installed_version
-    ):
-        check["load_check"] = "loaded"
-        loaded_at = str(beacon.get("loaded_at") or "").strip()
-        if loaded_at:
-            check["beacon_loaded_at"] = loaded_at
-        return check
-    # Absence is only meaningful for plugin versions that are known to
-    # write the beacon; older plugins cannot be distinguished from a
-    # load failure and must never degrade health.
-    parsed = _parse_plugin_version(installed_version)
-    if parsed is None or parsed < TINYHAT_PLUGIN_BEACON_MIN_VERSION:
-        check["load_check"] = "unknown"
-        check["reason"] = "plugin_predates_load_beacon"
-        return check
-    check["reason"] = (
-        "beacon_version_mismatch" if isinstance(beacon, dict) else "beacon_missing"
-    )
-    if gateway_active is not True:
-        # The plugin cannot have loaded into a gateway that is not
-        # running; report unknown rather than start the clock.
-        check["load_check"] = "unknown"
-        return check
-    # The missing-beacon clock is scoped to the installed version: a
-    # plugin install/update must get its own grace window instead of
-    # inheriting a stale verdict from the previous version. The reason
-    # may flip between beacon_missing and beacon_version_mismatch for
-    # the same unloaded install; both mean "this version has not
-    # loaded", so they share one clock.
-    prior = existing_state.get("plugin")
-    prior_version = (
-        str(prior.get("installed_version") or "").strip()
-        if isinstance(prior, dict)
-        else ""
-    )
-    missing_since = (
-        prior.get("missing_since_unix")
-        if isinstance(prior, dict) and prior_version == installed_version
-        else None
-    )
-    if not isinstance(missing_since, int):
-        missing_since = now
-    check["missing_since_unix"] = missing_since
-    if now - missing_since >= PLUGIN_LOAD_GRACE_SECONDS:
-        check["load_check"] = "not_loaded"
-    else:
-        check["load_check"] = "pending"
-    return check
-
-
-def _openclaw_plugin_from_inspect_payload(plugin_id: str, payload: Any) -> dict | None:
-    if not isinstance(payload, dict):
-        return None
-    plugin = payload.get("plugin")
-    if not isinstance(plugin, dict):
-        plugin = payload
-    resolved_id = str(plugin.get("id") or plugin.get("pluginId") or "").strip()
-    if resolved_id != plugin_id:
-        return None
-    return plugin
-
-
-def _inspect_openclaw_plugin(plugin_id: str) -> dict | None:
-    """Return OpenClaw's plugin-registry entry, or None when missing/broken."""
-    try:
-        result = subprocess.run(
-            ["openclaw", "plugins", "inspect", plugin_id, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=_openclaw_cli_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("could not inspect OpenClaw plugin %s: %s", plugin_id, exc)
-        return None
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        log.warning(
-            "OpenClaw plugin %s is not registered: %s",
-            plugin_id,
-            detail[:500] if detail else f"openclaw exited {result.returncode}",
-        )
-        return None
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        log.warning("OpenClaw plugin %s inspect returned invalid JSON: %s", plugin_id, exc)
-        return None
-    plugin = _openclaw_plugin_from_inspect_payload(plugin_id, payload)
-    if plugin is None:
-        log.warning(
-            "OpenClaw plugin inspect returned unexpected payload for %s",
-            plugin_id,
-        )
-        return None
-    dependency_status = plugin.get("dependencyStatus")
-    if (
-        isinstance(dependency_status, dict)
-        and dependency_status.get("requiredInstalled") is False
-    ):
-        log.warning("OpenClaw plugin %s has missing dependencies", plugin_id)
-        return None
-    return plugin
 
 
 def _is_openclaw_plugin_registered(
@@ -1452,101 +1305,6 @@ def _chatgpt_device_code_worker_kwargs() -> dict[str, float | int]:
             CHATGPT_DEVICE_CODE_OVERALL_TIMEOUT_ENV, 900.0, minimum=0.001
         ),
     }
-
-
-_OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
-
-
-def _read_openclaw_framework_version() -> str:
-    """Installed OpenClaw (framework) version via ``openclaw --version``.
-
-    Best-effort: returns ``""`` when the CLI is absent or errors. The
-    framework is an npm package with no git checkout, so its component
-    sha is always ``None``.
-    """
-    try:
-        result = subprocess.run(
-            ["openclaw", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-            env=_openclaw_cli_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    output = (result.stdout or result.stderr or "").strip()
-    match = _OPENCLAW_VERSION_RE.search(output)
-    if match:
-        return match.group(1)
-    return output.splitlines()[0].strip() if output else ""
-
-
-def collect_component_versions() -> dict:
-    """Best-effort snapshot of installed component versions for the heartbeat.
-
-    Returns the shape the platform ingests on ``POST /me/heartbeat``::
-
-        {"runtime":   {"version": <str|None>, "sha": <str|None>},
-         "plugin":    {"version": <str|None>, "sha": <str|None>},
-         "framework": {"version": <str|None>, "sha": None}}
-
-    Each component is resolved under its own ``try``/``except`` so one
-    failing source never suppresses the others, and the whole function
-    degrades to ``{}`` on any unexpected error — the heartbeat must never
-    throw because version collection failed. A component is omitted
-    entirely when neither its version nor its sha can be resolved; the
-    platform then falls back to its provisioning manifest for that
-    component.
-    """
-    components: dict[str, dict[str, Any]] = {}
-    try:
-        # runtime: this repo's VERSION file + the checkout's git SHA.
-        try:
-            runtime_version = _read_runtime_repo_version()
-            runtime_sha = _read_runtime_git_sha()
-            if runtime_version or runtime_sha:
-                components["runtime"] = {
-                    "version": runtime_version or None,
-                    "sha": runtime_sha or None,
-                }
-        except Exception as exc:
-            log.warning("could not collect runtime component version: %s", exc)
-
-        # plugin: read from the install marker the plugin installer wrote.
-        # A "unknown" version (no package.json/version.txt at install) is
-        # treated as not-reported so the platform uses its manifest value,
-        # while the real resolved sha is still surfaced.
-        try:
-            marker = _read_installed_plugin_marker()
-            plugin_version = str(marker.get("version") or "").strip()
-            if plugin_version.lower() == "unknown":
-                plugin_version = ""
-            plugin_sha = str(marker.get("resolved_commit_sha") or "").strip()
-            if plugin_version or plugin_sha:
-                components["plugin"] = {
-                    "version": plugin_version or None,
-                    "sha": plugin_sha or None,
-                }
-        except Exception as exc:
-            log.warning("could not collect plugin component version: %s", exc)
-
-        # framework: OpenClaw npm package version. No git sha for an npm pkg.
-        try:
-            framework_version = _read_openclaw_framework_version()
-            if framework_version:
-                components["framework"] = {
-                    "version": framework_version,
-                    "sha": None,
-                }
-        except Exception as exc:
-            log.warning("could not collect framework component version: %s", exc)
-    except Exception as exc:  # pragma: no cover - belt and suspenders
-        log.warning("component version collection failed entirely: %s", exc)
-        return {}
-    return components
 
 
 def ensure_tinyhat_plugin_installed(
@@ -1860,34 +1618,6 @@ def _prepare_control_plane_state_dir(path: str) -> None:
             log.warning("failed to chown control-plane state dir %s: %s", path, exc)
 
 
-def read_runtime_state() -> dict[str, Any]:
-    path = runtime_state_path()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:  # noqa: BLE001 - corrupt state must not crash boot
-        log.warning("failed to read runtime state from %s: %s", path, exc)
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _runtime_state_name(state: dict[str, Any]) -> str:
-    for key in ("state", "runtime_health", "runtime_state", "health", "primary"):
-        value = state.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def _runtime_state_is_unrecoverable_manual(state: dict[str, Any]) -> bool:
-    return (
-        _runtime_state_name(state) == "unrecoverable_manual"
-        or state.get("manual_recovery_required") is True
-    )
-
-
 def _runtime_manual_recovery_requested() -> bool:
     return os.path.exists(runtime_state_manual_marker_path())
 
@@ -1921,111 +1651,8 @@ def _consume_runtime_manual_clear_marker() -> bool:
     return True
 
 
-def _runtime_state_gateway_recovery(state: dict[str, Any]) -> dict[str, Any]:
-    raw = state.get("gateway_recovery")
-    policy: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-    failures = []
-    for item in policy.get("failures") or []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            at_unix = int(item.get("at_unix"))
-        except (TypeError, ValueError):
-            continue
-        reason = str(item.get("reason") or "unknown").strip() or "unknown"
-        compact = {"at_unix": at_unix, "reason": reason}
-        for key in (
-            "oom_kill",
-            "oom",
-            "memory_current_bytes",
-            "memory_max_bytes",
-            "control_group",
-        ):
-            if key in item:
-                compact[key] = item[key]
-        failures.append(compact)
-    policy["failures"] = failures
-    try:
-        policy["hold_down_cycles"] = int(policy.get("hold_down_cycles") or 0)
-    except (TypeError, ValueError):
-        policy["hold_down_cycles"] = 0
-    return policy
-
-
 def _gateway_recovery_now() -> int:
     return int(time.time())
-
-
-_RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])([\"']?[A-Za-z0-9_-]*(?:api[_-]?key|"
-    r"access[_-]?token|refresh[_-]?token|token|password|secret|cookie|"
-    r"authorization)[A-Za-z0-9_-]*[\"']?)(\s*[:=]\s*[\"']?)([^\s,;\"'}]+)"
-)
-_RUNTIME_STATE_AUTH_SCHEME_RE = re.compile(
-    r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"
-)
-_RUNTIME_STATE_URL_USERINFO_RE = re.compile(
-    r"(?i)(\bhttps?://)[^/\s:@]+:[^/\s@]+@"
-)
-_RUNTIME_STATE_SIGNED_QUERY_RE = re.compile(
-    r"(?i)([?&][^=\s&]*(?:token|signature|credential|key|secret|password)"
-    r"[^=\s&]*=)[^&\s]+"
-)
-_RUNTIME_STATE_SIGNED_URL_RE = re.compile(
-    r"(?i)\bhttps?://[^\s'\"<>)]*\?[^\s'\"<>)]*"
-    r"(?:token|signature|credential|key|secret|password)=[^\s'\"<>)]*"
-)
-_RUNTIME_STATE_JWT_RE = re.compile(
-    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
-)
-_RUNTIME_STATE_LLM_PROVIDER_KEY_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])sk-(?:ant-api\d+-|ant-|or-v1-|proj-|live-)?"
-    r"[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
-)
-_RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE = re.compile(r"\bya29\.[A-Za-z0-9_-]{20,}\b")
-_RUNTIME_STATE_GOOGLE_API_KEY_RE = re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b")
-_RUNTIME_STATE_GITHUB_TOKEN_RE = re.compile(
-    r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
-)
-_RUNTIME_STATE_AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
-_RUNTIME_STATE_SLACK_TOKEN_RE = re.compile(
-    r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{10,})\b"
-)
-_RUNTIME_STATE_TELEGRAM_TOKEN_RE = re.compile(
-    r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}\b"
-)
-_RUNTIME_STATE_LOCAL_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9:/])/(?:Users|home|root|etc|var|tmp|private|opt)/"
-    r"[^\s,'\")]+"
-)
-
-
-def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
-    text = str(value or "")
-    text = _RUNTIME_STATE_SIGNED_URL_RE.sub("[redacted-signed-url]", text)
-    text = _RUNTIME_STATE_URL_USERINFO_RE.sub(r"\1[redacted-userinfo]@", text)
-    text = _RUNTIME_STATE_AUTH_SCHEME_RE.sub(
-        lambda match: f"{match.group(1)} [redacted]",
-        text,
-    )
-    text = _RUNTIME_STATE_JWT_RE.sub("[redacted-identity-token]", text)
-    text = _RUNTIME_STATE_LLM_PROVIDER_KEY_RE.sub("[redacted-api-key]", text)
-    text = _RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE.sub(
-        "[redacted-google-token]",
-        text,
-    )
-    text = _RUNTIME_STATE_GOOGLE_API_KEY_RE.sub("[redacted-api-key]", text)
-    text = _RUNTIME_STATE_GITHUB_TOKEN_RE.sub("[redacted-github-token]", text)
-    text = _RUNTIME_STATE_AWS_ACCESS_KEY_RE.sub("[redacted-aws-key]", text)
-    text = _RUNTIME_STATE_SLACK_TOKEN_RE.sub("[redacted-slack-token]", text)
-    text = _RUNTIME_STATE_TELEGRAM_TOKEN_RE.sub("[redacted-telegram-token]", text)
-    text = _RUNTIME_STATE_SIGNED_QUERY_RE.sub(r"\1[redacted]", text)
-    text = _RUNTIME_STATE_SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
-        text,
-    )
-    text = _RUNTIME_STATE_LOCAL_PATH_RE.sub("[local-path]", text)
-    return text[:limit]
 
 
 def _sanitize_platform_state_body(path: str, body: dict) -> dict:
@@ -2035,329 +1662,6 @@ def _sanitize_platform_state_body(path: str, body: dict) -> dict:
     if "detail" in safe_body:
         safe_body["detail"] = _sanitize_runtime_state_text(safe_body["detail"])
     return safe_body
-
-
-def _runtime_state_observed_at(now: int) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-
-
-def _runtime_health_value(state: str) -> str:
-    normalized = str(state or "").strip()
-    if normalized in RUNTIME_HEALTH_VALUES:
-        return normalized
-    return "degraded_workload"
-
-
-def _reset_runtime_state_platform_post_cache() -> None:
-    _runtime_state_platform_post_cache.clear()
-    _runtime_state_platform_post_cache.update({"signature": None, "ts": 0.0})
-
-
-def _runtime_state_platform_post_signature(payload: dict[str, Any]) -> str:
-    stable_payload = dict(payload)
-    stable_payload.pop("observed_at", None)
-    stable_payload.pop("updated_at_unix", None)
-    raw = json.dumps(
-        stable_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _runtime_state_event(
-    event_type: str,
-    detail: str | None,
-    *,
-    now: int,
-) -> dict[str, str]:
-    event: dict[str, str] = {
-        "type": _sanitize_runtime_state_text(event_type, limit=96),
-        "at": _runtime_state_observed_at(now),
-    }
-    if detail:
-        event["detail"] = _sanitize_runtime_state_text(
-            detail,
-            limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
-        )
-    return event
-
-
-def _append_runtime_state_event(
-    events: list[dict[str, str]],
-    event: dict[str, str],
-) -> None:
-    if events and events[-1].get("type") == event.get("type"):
-        merged = dict(events[-1])
-        merged.update(event)
-        events[-1] = merged
-        return
-    events.append(event)
-
-
-def _runtime_state_event_history(
-    state: dict[str, Any],
-    *,
-    event_type: str | None = None,
-    detail: str | None = None,
-    now: int,
-) -> list[dict[str, str]]:
-    source = state.get("runtime_events")
-    if not isinstance(source, list):
-        source = state.get("events")
-    raw_events = source if isinstance(source, list) else []
-    events: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in raw_events:
-        if not isinstance(item, dict):
-            continue
-        raw_type = item.get("type")
-        if not isinstance(raw_type, str) or not raw_type.strip():
-            continue
-        event: dict[str, str] = {
-            "type": _sanitize_runtime_state_text(raw_type, limit=96)
-        }
-        raw_at = item.get("at") or item.get("observed_at")
-        if isinstance(raw_at, str) and raw_at.strip():
-            event["at"] = _sanitize_runtime_state_text(raw_at, limit=64)
-        raw_detail = item.get("detail") or item.get("message")
-        if isinstance(raw_detail, str) and raw_detail.strip():
-            event["detail"] = _sanitize_runtime_state_text(
-                raw_detail,
-                limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
-            )
-        key = (
-            event["type"],
-            event.get("at", ""),
-            event.get("detail", ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        _append_runtime_state_event(events, event)
-    if event_type:
-        event = _runtime_state_event(event_type, detail, now=now)
-        key = (
-            event["type"],
-            event.get("at", ""),
-            event.get("detail", ""),
-        )
-        if key not in seen:
-            _append_runtime_state_event(events, event)
-    return events[-RUNTIME_STATE_MAX_EVENTS:]
-
-
-def _mark_runtime_state_platform_unreachable(
-    payload: dict[str, Any],
-    exc: Exception,
-) -> None:
-    path = runtime_state_path()
-    observed_at = str(payload.get("observed_at") or "")
-    try:
-        now = int(payload.get("updated_at_unix") or time.time())
-    except (TypeError, ValueError):
-        now = int(time.time())
-    if not observed_at:
-        observed_at = _runtime_state_observed_at(now)
-    detail = _sanitize_runtime_state_text(
-        f"{type(exc).__name__}: {exc}",
-        limit=RUNTIME_STATE_EVENT_DETAIL_MAX_CHARS,
-    )
-    updated = dict(payload)
-    platform = updated.get("platform")
-    if not isinstance(platform, dict):
-        platform = {}
-    else:
-        platform = dict(platform)
-    platform.update(
-        {
-            "status": "unreachable",
-            "last_error_category": "platform_unreachable",
-            "last_error": detail,
-            "last_error_at": observed_at,
-        }
-    )
-    updated["platform"] = platform
-    updated["platform_unreachable"] = True
-    updated["runtime_events"] = _runtime_state_event_history(
-        updated,
-        event_type="platform_unreachable",
-        detail=detail,
-        now=now,
-    )
-    _atomic_write_json(path, updated, mode=0o600)
-
-
-def _post_runtime_state_to_platform(payload: dict[str, Any]) -> bool:
-    """Best-effort platform mirror for the local runtime_state_v1 payload."""
-    try:
-        env_base_url = (os.environ.get("TINYHAT_PLATFORM_BASE_URL") or "").strip()
-        if not env_base_url and not _gce_metadata_available():
-            return False
-        if not get_backend_base_url():
-            return False
-        now = time.time()
-        signature = _runtime_state_platform_post_signature(payload)
-        previous_signature = _runtime_state_platform_post_cache.get("signature")
-        previous_ts = float(_runtime_state_platform_post_cache.get("ts") or 0.0)
-        if (
-            signature == previous_signature
-            and now - previous_ts < RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
-        ):
-            log.debug("runtime_state platform POST skipped: unchanged payload")
-            return False
-        _runtime_state_platform_post_cache["signature"] = signature
-        _runtime_state_platform_post_cache["ts"] = now
-        post_json("/hapi/v1/computers/me/runtime-state", payload)
-    except Exception as exc:
-        _runtime_state_platform_post_cache["signature"] = None
-        _runtime_state_platform_post_cache["ts"] = 0.0
-        try:
-            _mark_runtime_state_platform_unreachable(payload, exc)
-        except Exception as marker_exc:
-            log.warning(
-                "runtime_state platform unreachable marker failed: %s",
-                marker_exc,
-            )
-        log.warning("runtime_state platform POST failed: %s", exc)
-        return False
-    log.info(
-        "runtime_state platform POST succeeded: health=%s observed_at=%s",
-        payload.get("runtime_health"),
-        payload.get("observed_at"),
-    )
-    return True
-
-
-def _runtime_computer_id() -> str | None:
-    for env_name in (TINYHAT_COMPUTER_ID_ENV, "DEV_AUTO_COMPUTER_ID"):
-        value = (os.environ.get(env_name) or "").strip()
-        if value:
-            return value
-    if _dev_mode():
-        return None
-    if not _gce_metadata_available():
-        return None
-    try:
-        return _read_metadata_value(METADATA_COMPUTER_ID_KEY, timeout=2) or None
-    except Exception as exc:
-        log.debug("runtime state computer id metadata unavailable: %s", exc)
-        return None
-
-
-def _gce_instance_id() -> str | None:
-    value = (os.environ.get(TINYHAT_GCE_INSTANCE_ID_ENV) or "").strip()
-    if value:
-        return value
-    if _dev_mode():
-        return None
-    if not _gce_metadata_available():
-        return None
-    try:
-        return _read_metadata_path("instance/id", timeout=2) or None
-    except Exception as exc:
-        log.debug("runtime state GCE instance id metadata unavailable: %s", exc)
-        return None
-
-
-def _runtime_ref() -> str | None:
-    try:
-        version = _read_runtime_repo_version()
-    except Exception:
-        version = ""
-    try:
-        sha = _read_runtime_git_sha()
-    except Exception:
-        sha = ""
-    if version and sha:
-        return f"{version}@{sha[:12]}"
-    if sha:
-        return sha
-    return version or None
-
-
-_runtime_state_identity_cache: dict[str, str] = {}
-
-
-def _reset_runtime_state_identity_cache() -> None:
-    _runtime_state_identity_cache.clear()
-
-
-def _runtime_state_identity() -> dict[str, str | None]:
-    identity: dict[str, str | None] = {}
-    for key, resolver in (
-        ("computer_id", _runtime_computer_id),
-        ("instance_id", _gce_instance_id),
-        ("runtime_ref", _runtime_ref),
-    ):
-        value = _runtime_state_identity_cache.get(key)
-        if not value:
-            resolved = resolver()
-            if resolved:
-                _runtime_state_identity_cache[key] = resolved
-                value = resolved
-        identity[key] = value or None
-    return identity
-
-
-def _runtime_supervisor_status(runtime_health: str) -> str:
-    if runtime_health in RUNTIME_HEALTH_VALUES:
-        return runtime_health
-    return "degraded_workload"
-
-
-def _gateway_status(
-    runtime_health: str,
-    *,
-    gateway_active: bool | None,
-    openclaw_ready: bool | None,
-) -> str:
-    if runtime_health == "unrecoverable_manual":
-        return "unrecoverable_manual"
-    if runtime_health == "openclaw_not_ready":
-        return "openclaw_not_ready"
-    if gateway_active is False:
-        return "inactive"
-    if openclaw_ready is False:
-        return "not_ready"
-    return runtime_health
-
-
-def _gateway_restart_count_window(
-    gateway_recovery: dict[str, Any],
-    *,
-    now: int,
-) -> int:
-    count = 0
-    for item in gateway_recovery.get("failures") or []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            at_unix = int(item.get("at_unix"))
-        except (TypeError, ValueError):
-            continue
-        if now - at_unix <= GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS:
-            count += 1
-    return count
-
-
-def _runtime_state_last_error(
-    runtime_health: str,
-    detail: str,
-    *,
-    category: str | None,
-) -> dict[str, str] | None:
-    if runtime_health == "healthy" and not category:
-        return None
-    safe_category = _sanitize_runtime_state_text(
-        category or runtime_health,
-        limit=RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
-    )
-    return {
-        "category": safe_category or runtime_health,
-        "detail": _sanitize_runtime_state_text(detail),
-    }
 
 
 def report_ready_runtime_state() -> None:
@@ -2371,122 +1675,6 @@ def report_ready_runtime_state() -> None:
         )
     except Exception as exc:  # noqa: BLE001 - startup state must keep moving
         log.warning("runtime_state ready mirror failed: %s", exc)
-
-
-def _runtime_state_log_entry(text: Any, *, unit: str | None = None) -> dict[str, str] | None:
-    safe_text = _sanitize_runtime_state_text(
-        text,
-        limit=RUNTIME_STATE_LOG_LINE_MAX_CHARS,
-    ).strip()
-    if not safe_text:
-        return None
-    entry = {"text": safe_text}
-    if unit:
-        entry["unit"] = unit
-    return entry
-
-
-def _tail_runtime_log_file(path: str, *, limit: int) -> list[str]:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            return [line.rstrip("\r\n") for line in deque(fh, maxlen=limit)]
-    except FileNotFoundError:
-        return []
-    except Exception as exc:  # noqa: BLE001 - diagnostics must stay best-effort
-        log.debug("runtime log tail unavailable for %s: %s", path, exc)
-        return []
-
-
-def _journal_runtime_log_lines(unit: str, *, limit: int) -> list[str]:
-    if _dev_mode() or not unit:
-        return []
-    try:
-        result = subprocess.run(
-            [
-                "journalctl",
-                "-u",
-                unit,
-                "-n",
-                str(limit),
-                "--no-pager",
-                "--output=short-iso",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=RUNTIME_STATE_LOG_COMMAND_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.debug("runtime journal tail unavailable for %s: %s", unit, exc)
-        return []
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        if detail:
-            log.debug("runtime journal tail failed for %s: %s", unit, detail[:200])
-        return []
-    return [line for line in (result.stdout or "").splitlines() if line.strip()][
-        -limit:
-    ]
-
-
-def _runtime_state_log_entries(
-    lines: list[str],
-    *,
-    unit: str | None = None,
-) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
-    for line in lines[-RUNTIME_STATE_LOG_SOURCE_MAX_LINES:]:
-        entry = _runtime_state_log_entry(line, unit=unit)
-        if entry is not None:
-            entries.append(entry)
-    return entries
-
-
-def _gateway_runtime_log_entries() -> list[dict[str, str]]:
-    """Gateway tail for runtime-state mirroring.
-
-    Production reads the gateway's systemd journal. The dev container
-    has no journald — there the supervisor spawns the gateway directly
-    and streams its output to ``openclaw-gateway.log`` (see
-    :func:`_start_openclaw_gateway_dev`), so dev tails that file
-    instead. Both paths get the same line/count caps and client-side
-    redaction; without this fallback a dev Computer would always
-    report an empty gateway excerpt. Dev entries carry no ``unit``
-    because they do not come from a systemd unit.
-    """
-    if _dev_mode():
-        return _runtime_state_log_entries(
-            _tail_runtime_log_file(
-                _dev_gateway_log_path(),
-                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
-            )
-        )
-    return _runtime_state_log_entries(
-        _journal_runtime_log_lines(
-            GATEWAY_SYSTEMD_UNIT,
-            limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
-        ),
-        unit=GATEWAY_SYSTEMD_UNIT,
-    )
-
-
-def _runtime_state_recent_log_excerpts() -> dict[str, list[dict[str, str]]]:
-    """Collect a small, redacted diagnostic tail for runtime-state mirroring."""
-    bootstrap_lines = _tail_runtime_log_file(
-        runtime_bootstrap_log_path(),
-        limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
-    )
-    return {
-        "bootstrap": _runtime_state_log_entries(bootstrap_lines),
-        "supervisor": _runtime_state_log_entries(
-            _journal_runtime_log_lines(
-                SUPERVISOR_SYSTEMD_UNIT,
-                limit=RUNTIME_STATE_LOG_SOURCE_MAX_LINES,
-            ),
-            unit=SUPERVISOR_SYSTEMD_UNIT,
-        ),
-        "gateway": _gateway_runtime_log_entries(),
-    }
 
 
 def _gateway_cgroup_event(snapshot: dict[str, Any] | None, key: str) -> int | None:
@@ -2515,159 +1703,6 @@ def _gateway_recovery_policy_with_cgroup_baseline(
     if snapshot.get("control_group"):
         policy["control_group"] = snapshot["control_group"]
     return policy
-
-
-def _write_runtime_state(
-    state: str,
-    detail: str,
-    *,
-    config_fingerprint: dict[str, str] | None = None,
-    gateway_active: bool | None = None,
-    gateway_action: str | None = None,
-    openclaw_ready: bool | None = None,
-    gateway_recovery: dict[str, Any] | None = None,
-    gateway_cgroup: dict[str, Any] | None = None,
-    last_error_category: str | None = None,
-    event_type: str | None = None,
-    event_detail: str | None = None,
-) -> None:
-    path = runtime_state_path()
-    parent = os.path.dirname(path)
-    _prepare_control_plane_state_dir(parent)
-    existing_state = read_runtime_state()
-    now = int(time.time())
-    runtime_health = _runtime_health_value(state)
-    safe_detail = _sanitize_runtime_state_text(detail)
-    safe_last_error_category = (
-        _sanitize_runtime_state_text(
-            last_error_category,
-            limit=RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
-        )
-        if last_error_category
-        else None
-    )
-    if gateway_recovery is None:
-        gateway_recovery = _runtime_state_gateway_recovery(existing_state)
-    if config_fingerprint is None:
-        existing_fingerprint = existing_state.get("config_fingerprint")
-        if isinstance(existing_fingerprint, dict):
-            config_fingerprint = dict(existing_fingerprint)
-    if openclaw_ready is None:
-        existing_openclaw = existing_state.get("openclaw")
-        if isinstance(existing_openclaw, dict) and isinstance(
-            existing_openclaw.get("ready"),
-            bool,
-        ):
-            openclaw_ready = existing_openclaw["ready"]
-    if gateway_cgroup is not None:
-        gateway_recovery = _gateway_recovery_policy_with_cgroup_baseline(
-            gateway_recovery,
-            gateway_cgroup,
-        )
-    # Plugin load detection (#77): an enabled plugin that never loaded
-    # must not let the runtime report healthy. Only ever demotes
-    # `healthy` — every other state already carries a stronger signal.
-    effective_gateway_active = gateway_active
-    if effective_gateway_active is None:
-        existing_gateway = existing_state.get("gateway")
-        if isinstance(existing_gateway, dict) and isinstance(
-            existing_gateway.get("active"),
-            bool,
-        ):
-            effective_gateway_active = existing_gateway["active"]
-    plugin_check = _plugin_load_check(
-        existing_state,
-        gateway_active=effective_gateway_active,
-        now=now,
-    )
-    if (
-        runtime_health == "healthy"
-        and isinstance(plugin_check, dict)
-        and plugin_check.get("load_check") == "not_loaded"
-    ):
-        runtime_health = "unsupported_openclaw_version"
-        safe_detail = _sanitize_runtime_state_text(
-            f"{detail}; tinyhat plugin enabled but not loaded "
-            "(no fresh load beacon)"
-        )
-        if not safe_last_error_category:
-            safe_last_error_category = "plugin_not_loaded"
-    runtime_version = ""
-    try:
-        runtime_version = _read_runtime_repo_version()
-    except Exception:
-        runtime_version = ""
-    gateway_payload: dict[str, Any] = {
-        "unit": GATEWAY_SYSTEMD_UNIT,
-        "status": _gateway_status(
-            runtime_health,
-            gateway_active=gateway_active,
-            openclaw_ready=openclaw_ready,
-        ),
-        "restart_count_window": _gateway_restart_count_window(
-            gateway_recovery,
-            now=now,
-        ),
-    }
-    if gateway_active is not None:
-        gateway_payload["active"] = bool(gateway_active)
-    if gateway_action:
-        gateway_payload["action"] = gateway_action
-    identity = _runtime_state_identity()
-    recent_logs = _runtime_state_recent_log_excerpts()
-    runtime_events = _runtime_state_event_history(
-        existing_state,
-        event_type=event_type,
-        detail=event_detail or safe_detail,
-        now=now,
-    )
-    payload: dict[str, Any] = {
-        "schema": RUNTIME_STATE_SCHEMA,
-        "schema_version": 1,
-        "computer_id": identity["computer_id"],
-        "instance_id": identity["instance_id"],
-        "runtime_ref": identity["runtime_ref"],
-        "observed_at": _runtime_state_observed_at(now),
-        "runtime_health": runtime_health,
-        "runtime_state": runtime_health,
-        "state": runtime_health,
-        "detail": safe_detail,
-        "updated_at_unix": now,
-        "supervisor": {
-            "version": runtime_version or None,
-            "status": _runtime_supervisor_status(runtime_health),
-        },
-        "manual_recovery_required": runtime_health == "unrecoverable_manual",
-        "manual_recovery_marker_path": runtime_state_manual_marker_path(),
-        "manual_recovery_clear_marker_path": runtime_state_clear_manual_path(),
-        "gateway": gateway_payload,
-        "openclaw": {},
-        "last_error": _runtime_state_last_error(
-            runtime_health,
-            safe_detail,
-            category=safe_last_error_category,
-        ),
-    }
-    if recent_logs["bootstrap"]:
-        payload["bootstrap"] = {"log_excerpt_lines": recent_logs["bootstrap"]}
-    if recent_logs["supervisor"]:
-        payload["supervisor"]["journal"] = recent_logs["supervisor"]
-    if recent_logs["gateway"]:
-        payload["gateway"]["journal"] = recent_logs["gateway"]
-    if openclaw_ready is not None:
-        payload["openclaw"]["ready"] = bool(openclaw_ready)
-    if plugin_check:
-        payload["plugin"] = plugin_check
-    if config_fingerprint:
-        payload["config_fingerprint"] = dict(config_fingerprint)
-    if safe_last_error_category:
-        payload["last_error_category"] = safe_last_error_category
-    if runtime_events:
-        payload["runtime_events"] = runtime_events
-    if gateway_recovery:
-        payload["gateway_recovery"] = gateway_recovery
-    _atomic_write_json(path, payload, mode=0o600)
-    _post_runtime_state_to_platform(payload)
 
 
 def _gateway_recovery_failure_entry(
@@ -4058,45 +3093,6 @@ def write_openclaw_config(
     )
 
 
-def delete_telegram_webhook(binding: dict) -> None:
-    """Clear Tinyhat's fallback webhook before OpenClaw long-polls."""
-    bot_token = str(binding.get("telegram_bot_token") or "").strip()
-    if not bot_token:
-        raise ValueError("binding is missing telegram_bot_token")
-    payload = json.dumps({"drop_pending_updates": False}).encode("utf-8")
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{bot_token}/deleteWebhook",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode("utf-8") or "{}"
-            data = json.loads(body)
-            if data.get("ok") is not True:
-                raise RuntimeError("Telegram deleteWebhook returned ok=false")
-            log.info(
-                "cleared Telegram webhook for OpenClaw long polling (bot=@%s)",
-                binding.get("telegram_bot_username"),
-            )
-            return
-        except Exception as exc:
-            last_error = exc
-            log.warning(
-                "Telegram deleteWebhook failed before OpenClaw handoff "
-                "(attempt %d): %s",
-                attempt,
-                exc,
-            )
-            time.sleep(min(2 * attempt, 10))
-    raise RuntimeError(
-        f"Telegram deleteWebhook failed before OpenClaw handoff: {last_error}"
-    )
-
-
 def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     try:
         result = subprocess.run(
@@ -4302,28 +3298,6 @@ def _stop_openclaw_gateway_dev() -> None:
         except subprocess.TimeoutExpired:
             log.error("dev: gateway did not exit on SIGKILL either")
     _dev_gateway["proc"] = None
-
-
-def start_openclaw_gateway(binding: dict) -> float:
-    """Start real OpenClaw.
-
-    In production the OpenClaw gateway runs as a separate systemd
-    unit so it has first-class lifecycle, logs, and crash-restart
-    semantics. In dev mode the supervisor runs it as a subprocess
-    instead (no systemd in a typical dev container).
-    """
-    if _dev_mode():
-        return _start_openclaw_gateway_dev(binding)
-    started_at = time.time()
-    log.info(
-        "starting OpenClaw gateway unit: bot=@%s owner=%s port=%s",
-        binding.get("telegram_bot_username"),
-        binding.get("telegram_owner_user_id"),
-        OPENCLAW_GATEWAY_PORT,
-    )
-    _run_systemctl("reset-failed", GATEWAY_SYSTEMD_UNIT, check=False)
-    _run_systemctl("restart", GATEWAY_SYSTEMD_UNIT)
-    return started_at
 
 
 def is_openclaw_gateway_active() -> bool:
@@ -4557,55 +3531,6 @@ def ensure_openclaw_gateway_ready(
         "started_at": started_at,
         "detail": "openclaw gateway started",
     }
-
-
-def wait_for_openclaw_start(started_at: float) -> None:
-    """Wait until OpenClaw reports the gateway is healthy."""
-    deadline = time.time() + OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS
-    last_checkpoint = time.time()
-    last_probe = ""
-
-    def _checkpoint_if_due() -> None:
-        nonlocal last_checkpoint
-        now = time.time()
-        if now - last_checkpoint >= OPENCLAW_GATEWAY_WAIT_CHECKPOINT_SECONDS:
-            checkpoint_supervisor_progress(
-                "phase-c-openclaw-wait",
-                inspect_gateway=True,
-            )
-            last_checkpoint = now
-
-    while time.time() < deadline:
-        if not is_openclaw_gateway_active():
-            ok, detail = probe_openclaw_gateway_health(started_at)
-            if ok:
-                log.info("OpenClaw gateway readiness probe succeeded")
-                return
-            if _is_openclaw_gateway_startup_failure(detail):
-                raise RuntimeError("openclaw gateway failed to start: " + detail)
-            inactive_detail = (
-                "openclaw subprocess exited"
-                if _dev_mode()
-                else "systemd unit is not active"
-            )
-            last_probe = detail if detail else inactive_detail
-            _checkpoint_if_due()
-            time.sleep(1)
-            continue
-        ok, detail = probe_openclaw_gateway_health(started_at)
-        if ok:
-            log.info("OpenClaw gateway readiness probe succeeded")
-            return
-        if _is_openclaw_gateway_startup_failure(detail):
-            raise RuntimeError("openclaw gateway failed to start: " + detail)
-        last_probe = detail
-        _checkpoint_if_due()
-        time.sleep(1)
-    raise RuntimeError(
-        "openclaw gateway did not become healthy within "
-        f"{OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS}s"
-        + (f": {last_probe}" if last_probe else "")
-    )
 
 
 def stop_openclaw_gateway() -> None:
@@ -5674,79 +4599,6 @@ def handle_apply_config_command(command: dict) -> None:
 # therefore never strands a half-updated runtime.
 
 
-def _component_update_state_path() -> str:
-    """Resolve the dedupe-state file path, stable across a supervisor restart.
-
-    The whole point of the persisted ``reported`` record is that the process
-    started AFTER a runtime self-update restart (systemd restart / ``os.execv``)
-    reads back the same file the pre-restart process wrote. That guarantee only
-    holds if this function returns the SAME absolute path before and after the
-    restart, so the path must not depend on anything that changes between boots
-    (the process cwd, or a location inside the runtime checkout that the
-    in-place re-checkout can move/erase).
-
-    Two hardening rules make that explicit rather than implicit:
-
-    - The result is always absolutized, so the returned path never depends on
-      the cwd the supervisor happens to be launched with.
-    - The ``TINYHAT_COMPONENT_UPDATE_STATE_PATH`` override stays honoured for
-      explicit operator control, but ONLY when it points outside the runtime
-      checkout dir. An override that resolves INSIDE ``runtime_dir()`` is the
-      exact footgun a reviewer flagged: the runtime self-update checks the repo
-      out in place, so a state file under that dir is not guaranteed to survive
-      the restart. In that case we warn and fall back to the fixed default
-      (a per-box absolute path outside the checkout) so the dedupe guarantee is
-      preserved instead of silently voided.
-
-    See tinyloophub/tinyloop#562 for the platform side of this contract.
-    """
-    default_path = os.path.abspath(
-        os.path.join(openclaw_state_dir(), "component-update-state.json")
-        if _dev_mode()
-        else _DEFAULT_COMPONENT_UPDATE_STATE_PATH.strip()
-    )
-    override = (os.environ.get("TINYHAT_COMPONENT_UPDATE_STATE_PATH") or "").strip()
-    if not override:
-        return default_path
-
-    override_abs = os.path.abspath(override)
-    checkout_dir = os.path.abspath(runtime_dir())
-    # ``os.path.commonpath`` raises on e.g. mixed drives; treat any failure as
-    # "not inside the checkout" and trust the operator's explicit absolute path.
-    try:
-        inside_checkout = (
-            os.path.commonpath([override_abs, checkout_dir]) == checkout_dir
-        )
-    except ValueError:
-        inside_checkout = False
-    if inside_checkout:
-        log.warning(
-            "TINYHAT_COMPONENT_UPDATE_STATE_PATH=%s resolves inside the runtime "
-            "checkout dir (%s); a runtime self-update re-checks-out that dir in "
-            "place, so the dedupe state would not survive the restart. Falling "
-            "back to the restart-stable default %s.",
-            override_abs,
-            checkout_dir,
-            default_path,
-        )
-        return default_path
-    return override_abs
-
-
-def _read_component_update_state() -> dict:
-    """Read the per-revision component-update dedupe record.
-
-    Returns an empty dict when the file is missing or unreadable so a first
-    update (or a wiped box) is never blocked.
-    """
-    try:
-        with open(_component_update_state_path(), encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
 def _write_component_update_state(
     revision: int,
     status: str,
@@ -6680,6 +5532,7 @@ def _run_one_binding_cycle() -> int:
             )
             log.info("reported state=ready (attempt %d)", attempt)
             checkpoint_supervisor_progress("phase-a-ready-post")
+            _mark_lifecycle("ready_reported_at_unix")
             break
         except urllib.error.HTTPError as http_exc:
             if http_exc.code == 400:
@@ -6689,6 +5542,7 @@ def _run_one_binding_cycle() -> int:
                     "provisioning. Proceeding to Phase B."
                 )
                 checkpoint_supervisor_progress("phase-a-ready-refused")
+                _mark_lifecycle("ready_reported_at_unix")
                 break
             log.warning(
                 "initial /me/state ready POST failed (attempt %d): %s",
@@ -6728,6 +5582,7 @@ def _run_one_binding_cycle() -> int:
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
             checkpoint_supervisor_progress("phase-b-binding-assigned")
+            _mark_lifecycle("binding_acquired_at_unix")
             break
         # Cold-start owner-release (Codex 01:19Z + 01:32Z reviews —
         # two attack paths that share the same root cause).
