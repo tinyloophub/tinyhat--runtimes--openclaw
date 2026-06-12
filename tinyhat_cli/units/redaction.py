@@ -97,17 +97,36 @@ def _sanitize_runtime_state_text(value: Any, *, limit: int = 1024) -> str:
 # pathological value cannot balloon the output.
 _SANITIZE_TREE_TEXT_LIMIT = 4096
 
+# Keys whose values are runtime-owned control-plane file paths the
+# operator must be able to read verbatim (`manifest show` would
+# otherwise print `creation spec: [local-path]`). Values under these
+# keys skip sanitization ONLY when they look like a plain absolute
+# path — a secret-shaped value under one of these keys still gets the
+# full treatment.
+_PATH_VALUE_KEY_ALLOWLIST = frozenset(
+    {"path", "override_path", "state_path"}
+)
+_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,256}$")
 
-def sanitize_json_tree(value: Any) -> Any:
+
+def sanitize_json_tree(value: Any, *, key: str | None = None) -> Any:
     """Sanitize every string leaf of a JSON-shaped tree (CLI egress).
 
     Keys are runtime-owned literals and stay untouched; only values are
     rewritten. Non-string scalars pass through unchanged.
     """
     if isinstance(value, str):
+        if (
+            key in _PATH_VALUE_KEY_ALLOWLIST
+            and _PLAIN_ABSOLUTE_PATH_RE.match(value)
+        ):
+            return value
         return _sanitize_runtime_state_text(value, limit=_SANITIZE_TREE_TEXT_LIMIT)
     if isinstance(value, dict):
-        return {key: sanitize_json_tree(item) for key, item in value.items()}
+        return {
+            item_key: sanitize_json_tree(item, key=item_key)
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
         return [sanitize_json_tree(item) for item in value]
     return value

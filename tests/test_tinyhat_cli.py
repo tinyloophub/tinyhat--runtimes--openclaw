@@ -299,6 +299,28 @@ class RedactionSentinelTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, rendered, f"tree sanitizer leaked {label}")
 
+    def test_path_key_allowlist_keeps_plain_paths_readable(self) -> None:
+        tree = {
+            "path": "/etc/tinyhat/runtime.env",
+            "override_path": "/var/lib/tinyhat/tinyhat-plugin-source.json",
+            "other": "/etc/tinyhat/runtime.env",
+        }
+        sanitized = redaction.sanitize_json_tree(tree)
+        # An operator must be able to read control-plane paths verbatim…
+        self.assertEqual(sanitized["path"], "/etc/tinyhat/runtime.env")
+        self.assertEqual(
+            sanitized["override_path"],
+            "/var/lib/tinyhat/tinyhat-plugin-source.json",
+        )
+        # …but the same value under a non-allowlisted key stays redacted,
+        self.assertEqual(sanitized["other"], "[local-path]")
+        # and a secret-shaped value under an allowlisted key is not a
+        # bypass: it fails the plain-path shape and gets sanitized.
+        evil = redaction.sanitize_json_tree(
+            {"path": "/tmp/x token=sk-or-v1-0123456789abcdef0123456789abcdef"}
+        )
+        self.assertNotIn("sk-or-v1-0123456789abcdef0123456789abcdef", evil["path"])
+
     def test_sentinel_can_fail(self) -> None:
         """The deliberately-failing leg: an identity transform MUST leak.
 
@@ -713,6 +735,19 @@ class EntrypointTests(unittest.TestCase):
     def test_schema_validator_can_fail(self) -> None:
         errors = schemas.validate_envelope("status", {"schema": "wrong"})
         self.assertTrue(errors, "schema validator accepted a broken envelope")
+
+    def test_cli_quiets_supervisor_info_logging(self) -> None:
+        import logging
+
+        logger = logging.getLogger("tinyhat-supervisor")
+        previous_level = logger.level
+        try:
+            logger.setLevel(logging.INFO)
+            with patch("os.geteuid", return_value=1000):
+                _run_cli(["status"])
+            self.assertEqual(logger.level, logging.WARNING)
+        finally:
+            logger.setLevel(previous_level)
 
 
 # ── gateway-restart skeleton (also proves the facade keeps patches) ──

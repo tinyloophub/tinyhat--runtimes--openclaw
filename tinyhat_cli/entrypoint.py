@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -87,6 +88,11 @@ def _generated_at(now: int) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The supervisor module logs INFO chatter (base-URL resolution and
+    # friends) that belongs in the daemon's journal, not interleaved
+    # with a diagnose answer. Warnings still surface.
+    logging.getLogger("tinyhat-supervisor").setLevel(logging.WARNING)
+
     registry = build_registry()
     parser = _build_parser(registry)
     namespace = parser.parse_args(argv)
