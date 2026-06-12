@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -253,6 +254,22 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         self.assertEqual(
             config["agents"]["defaults"]["compaction"],
             {"reserveTokensFloor": 20000},
+        )
+
+    def test_missing_binding_model_uses_agentic_openrouter_default(self) -> None:
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_token": "123456:ABC",
+            "telegram_bot_username": "Tinychattestbot",
+            "openrouter_api_key": "sk-or-v1-child",
+            "openrouter_base_url": "https://openrouter.ai/api/v1",
+        }
+
+        config = _write_config_in_temp_runtime(binding)
+
+        self.assertEqual(
+            config["agents"]["defaults"]["model"],
+            {"primary": "openrouter/moonshotai/kimi-k2.6"},
         )
 
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:
@@ -3656,6 +3673,76 @@ def _seed_auth_profile(state_dir: str) -> None:
         )
 
 
+def _seed_sqlite_auth_profile(state_dir: str) -> None:
+    """Drop an OpenClaw 2026.6.6 SQLite subscription profile."""
+    path = os.path.join(
+        state_dir, "agents", "main", "agent", "openclaw-agent.sqlite"
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    profiles = {
+        "openai:owner@example.com": {
+            "type": "oauth",
+            "provider": "openai",
+            "access": "redacted-access",
+            "refresh": "redacted-refresh",
+            "expires": 9999999999999,
+            "email": "owner@example.com",
+            "accountId": "acct-redacted",
+        }
+    }
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE auth_profile_store (
+              store_key TEXT NOT NULL PRIMARY KEY,
+              store_json TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE auth_profile_state (
+              state_key TEXT NOT NULL PRIMARY KEY,
+              state_json TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO auth_profile_store (store_key, store_json, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "primary",
+                json.dumps({"version": 1, "profiles": profiles}),
+                0,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_sqlite_auth_profiles(state_dir: str) -> dict:
+    path = os.path.join(
+        state_dir, "agents", "main", "agent", "openclaw-agent.sqlite"
+    )
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    store = json.loads(row[0])
+    return store["profiles"]
+
+
 def _seed_legacy_auth_profile(state_dir: str) -> None:
     """Drop the legacy openai-codex profile shape into the auth store."""
     path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
@@ -4162,6 +4249,54 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
             },
         )
 
+    def test_sqlite_profile_writes_subscription_config(self) -> None:
+        """OpenClaw 2026.6.6 stores device-code auth in SQLite.
+
+        A completed link must flip the Computer away from the OpenRouter
+        default; otherwise the user sees "ChatGPT/Codex sign-in is complete"
+        while the runtime keeps serving Kimi from platform credits.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
+                self.assertEqual(
+                    supervisor.read_chatgpt_subscription_profile()[
+                        "__profile_id"
+                    ],
+                    "openai:owner@example.com",
+                )
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        defaults = config["agents"]["defaults"]
+        self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
+        self.assertEqual(
+            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
+        )
+        self.assertEqual(
+            config["auth"],
+            {
+                "profiles": {
+                    "openai:owner@example.com": {
+                        "provider": "openai",
+                        "mode": "oauth",
+                        "email": "owner@example.com",
+                    },
+                },
+                "order": {"openai": ["openai:owner@example.com"]},
+            },
+        )
+
     def test_opted_in_without_profile_stays_on_default_config(self) -> None:
         """llm_auth_mode=chatgpt_subscription but NO auth-profile yet →
         default-mode (OpenClaw runtime + OpenRouter) so the agent keeps replying
@@ -4367,6 +4502,48 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
     """Issue #23 — admin-driven wipe of the per-agent OAuth credential."""
+
+    def test_wipe_removes_sqlite_openai_profile_and_preserves_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                state_dir = supervisor.openclaw_state_dir()
+                _seed_sqlite_auth_profile(state_dir)
+                profiles = _read_sqlite_auth_profiles(state_dir)
+                profiles["xai:other@example.com"] = {
+                    "type": "oauth",
+                    "provider": "xai",
+                    "access": "x-redacted",
+                }
+                path = supervisor.openclaw_auth_sqlite_path()
+                conn = sqlite3.connect(path)
+                try:
+                    conn.execute(
+                        """
+                        UPDATE auth_profile_store
+                        SET store_json = ?, updated_at = ?
+                        WHERE store_key = ?
+                        """,
+                        (
+                            json.dumps({"version": 1, "profiles": profiles}),
+                            1,
+                            "primary",
+                        ),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                removed = supervisor.wipe_chatgpt_subscription_profile()
+                self.assertEqual(removed, ["openai:owner@example.com"])
+
+                after = _read_sqlite_auth_profiles(state_dir)
+                self.assertNotIn("openai:owner@example.com", after)
+                self.assertIn("xai:other@example.com", after)
+                self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
 
     def test_wipe_removes_current_openai_profile_and_preserves_others(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

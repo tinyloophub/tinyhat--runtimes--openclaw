@@ -66,6 +66,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,7 @@ RUNTIME_HEALTH_VALUES = frozenset(
 )
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_DEFAULT_MODEL = "openai/gpt-5.2"
+OPENROUTER_DEFAULT_MODEL = "moonshotai/kimi-k2.6"
 # OpenRouter's catalog can report very large per-model completion ceilings
 # (for example Kimi K2.6 advertises ~262k). OpenClaw treats the model
 # completion ceiling as the default request cap unless the model has an
@@ -2547,6 +2549,20 @@ def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) ->
     )
 
 
+def openclaw_auth_sqlite_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> str:
+    """Resolve OpenClaw's current per-agent auth SQLite store path.
+
+    OpenClaw 2026.6.6 migrated model-auth profiles from
+    ``auth-profiles.json`` into ``openclaw-agent.sqlite``. Keep the
+    legacy JSON path above for rollback/older images, but treat SQLite
+    as the canonical store when it exists so a completed ChatGPT/Codex
+    device-code login actually flips the Computer to subscription mode.
+    """
+    return os.path.join(
+        openclaw_state_dir(), "agents", agent_id, "agent", "openclaw-agent.sqlite"
+    )
+
+
 def _chatgpt_subscription_profile_suffix(profile_id: str) -> str:
     tail = profile_id.split(":", 1)[1] if ":" in profile_id else profile_id
     return tail.strip() or "default"
@@ -2710,15 +2726,64 @@ def normalize_chatgpt_subscription_profile_store(
     return sorted(profile_id_map.items())
 
 
+def _chatgpt_subscription_profile_from_store(data: Any) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile_id, str) or not isinstance(profile, dict):
+            continue
+        if _is_chatgpt_subscription_profile(profile_id, profile):
+            out = dict(profile)
+            out["__profile_id"] = profile_id
+            return out
+    return None
+
+
+def _read_chatgpt_subscription_profile_from_sqlite(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> dict | None:
+    path = openclaw_auth_sqlite_path(agent_id=agent_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute(
+            """
+            SELECT store_key, store_json
+            FROM auth_profile_store
+            ORDER BY CASE WHEN store_key = 'primary' THEN 0 ELSE 1 END, store_key
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    for _store_key, store_json in rows:
+        try:
+            data = json.loads(store_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        profile = _chatgpt_subscription_profile_from_store(data)
+        if profile is not None:
+            return profile
+    return None
+
+
 def read_chatgpt_subscription_profile(
     *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
 ) -> dict | None:
     """Return the ChatGPT/Codex subscription profile entry, if present.
 
-    Returns the first matching profile dict from
-    ``auth-profiles.json``. OpenClaw 2026.6.x writes ChatGPT/Codex
+    Returns the first matching profile dict from OpenClaw's current
+    SQLite auth store, or from the legacy ``auth-profiles.json`` store
+    for older images. OpenClaw 2026.6.x writes ChatGPT/Codex
     subscription credentials under the ``openai`` provider, while older
-    runtimes used ``openai-codex``. Returns ``None`` when the file is
+    runtimes used ``openai-codex``. Returns ``None`` when the store is
     missing, malformed, or has no subscription credential.
 
     The OAuth token fields (``access``, ``refresh``, ``id``) ARE present
@@ -2726,6 +2791,12 @@ def read_chatgpt_subscription_profile(
     own use of this function is metadata-only (presence check + email
     for logging); the actual OAuth refresh is OpenClaw's own concern.
     """
+    sqlite_profile = _read_chatgpt_subscription_profile_from_sqlite(
+        agent_id=agent_id
+    )
+    if sqlite_profile is not None:
+        return sqlite_profile
+
     migrated = normalize_chatgpt_subscription_profile_store(agent_id=agent_id)
     if migrated:
         log.info(
@@ -2738,19 +2809,68 @@ def read_chatgpt_subscription_profile(
             data = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
-    if not isinstance(data, dict):
-        return None
-    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
-    for profile_id, profile in profiles.items():
-        if not isinstance(profile_id, str) or not isinstance(profile, dict):
-            continue
-        if _is_chatgpt_subscription_profile(profile_id, profile):
-            # Return a shallow copy with the profile id so callers can
-            # log it without re-reading.
-            out = dict(profile)
-            out["__profile_id"] = profile_id
-            return out
-    return None
+    return _chatgpt_subscription_profile_from_store(data)
+
+
+def _wipe_chatgpt_subscription_profiles_from_sqlite(
+    *, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID
+) -> list[str]:
+    path = openclaw_auth_sqlite_path(agent_id=agent_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        conn = sqlite3.connect(path)
+    except sqlite3.Error:
+        return []
+    removed: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT store_key, store_json FROM auth_profile_store ORDER BY store_key"
+        ).fetchall()
+        for store_key, store_json in rows:
+            try:
+                data = json.loads(store_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            profiles = (
+                data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+            )
+            store_removed: list[str] = []
+            for profile_id in list(profiles.keys()):
+                profile = profiles.get(profile_id)
+                if (
+                    isinstance(profile_id, str)
+                    and isinstance(profile, dict)
+                    and _is_chatgpt_subscription_profile(profile_id, profile)
+                ):
+                    del profiles[profile_id]
+                    store_removed.append(profile_id)
+            if not store_removed:
+                continue
+            data["profiles"] = profiles
+            conn.execute(
+                """
+                UPDATE auth_profile_store
+                SET store_json = ?, updated_at = ?
+                WHERE store_key = ?
+                """,
+                (
+                    json.dumps(data, separators=(",", ":"), sort_keys=True),
+                    int(time.time() * 1000),
+                    store_key,
+                ),
+            )
+            removed.extend(store_removed)
+        if removed:
+            conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        return []
+    finally:
+        conn.close()
+    return removed
 
 
 def wipe_chatgpt_subscription_profile(
@@ -2769,18 +2889,19 @@ def wipe_chatgpt_subscription_profile(
     Writes atomically via a ``.tmp`` rename so a partial write can't
     strand other-provider entries.
     """
+    removed = _wipe_chatgpt_subscription_profiles_from_sqlite(agent_id=agent_id)
     path = openclaw_auth_profiles_path(agent_id=agent_id)
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return []
+        return removed
     except (json.JSONDecodeError, OSError):
-        return []
+        return removed
     if not isinstance(data, dict):
-        return []
+        return removed
     profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
-    removed: list[str] = []
+    json_removed: list[str] = []
     for profile_id in list(profiles.keys()):
         profile = profiles.get(profile_id)
         if (
@@ -2789,12 +2910,13 @@ def wipe_chatgpt_subscription_profile(
             and _is_chatgpt_subscription_profile(profile_id, profile)
         ):
             del profiles[profile_id]
-            removed.append(profile_id)
-    if not removed:
-        return []
+            json_removed.append(profile_id)
+    if not json_removed:
+        return removed
     version = data.get("version") if isinstance(data.get("version"), int) else 1
     next_data = {"version": version, "profiles": profiles}
     _atomic_write_json(path, next_data, runtime_owned=True)
+    removed.extend(json_removed)
     return removed
 
 
@@ -2830,7 +2952,7 @@ def write_openclaw_config(
     openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
 
     def openrouter_model_ref(raw: str) -> str:
-        model = (raw or "deepseek/deepseek-v4-flash:free").strip()
+        model = (raw or OPENROUTER_DEFAULT_MODEL).strip()
         if model.startswith("openrouter/"):
             return model
         return "openrouter/" + model.lstrip("/")

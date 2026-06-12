@@ -7,6 +7,19 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.1
+
+### Fixed
+
+- Read and wipe ChatGPT/Codex subscription auth profiles from OpenClaw
+  2026.6.6's SQLite auth store in addition to the legacy
+  `auth-profiles.json` store. This fixes completed subscription links
+  that reported success but kept the Computer on the OpenRouter/Kimi
+  platform-credit route because the supervisor could not see the new
+  SQLite profile.
+- Use Kimi K2.6 as the supervisor's defensive OpenRouter default when a
+  keyed binding omits the explicit model field.
+
 ## 0.12.0
 
 This release is the first public stable-runtime artifact for Tinyhat's
