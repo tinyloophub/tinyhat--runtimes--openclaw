@@ -7,6 +7,13 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.0
+
+This release is the first public stable-runtime artifact for Tinyhat's
+verified v0.11.0 runtime work and the v0.12.0 on-box `tinyhat` CLI +
+capability-contract release. It pairs with Tinyhat plugin `v0.5.0` and the
+Tinyloop monorepo `v0.12.0` release cut.
+
 ### Added
 
 - Declared-vs-registered capability verification: after gateway start the
