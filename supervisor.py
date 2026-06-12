@@ -418,8 +418,14 @@ from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
     _read_plugin_load_beacon,
     tinyhat_plugin_beacon_path,
 )
+from tinyhat_cli.units.command_lock import (  # noqa: E402,F401
+    CommandLockBusy,
+    active_transaction as _active_command_lock_transaction,
+)
 from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
     delete_telegram_webhook,
+    reconcile_runner_lost,
+    run_locked_gateway_restart,
     start_openclaw_gateway,
     wait_for_openclaw_start,
 )
@@ -485,6 +491,7 @@ from tinyhat_cli.units.runtime_state import (  # noqa: E402,F401
     _tail_runtime_log_file,
     _write_runtime_state,
     budget_runtime_state_payload,
+    fold_command_results,
     lifecycle_block,
     plugin_demotion,
     read_runtime_state,
@@ -3093,9 +3100,29 @@ def write_openclaw_config(
     )
 
 
+# How long a daemon-owned mutation defers while another holder (a
+# human `tinyhat gateway restart`, a previous runner's surviving
+# child tree) keeps the global command lock: one full gateway-restart
+# deadline plus kill-grace headroom, with watchdog checkpoints per
+# poll so deferring never reads as a wedged supervisor.
+GATEWAY_RESTART_LOCK_WAIT_SECONDS = 150
+
+
+def _gateway_lock_wait_checkpoint() -> None:
+    checkpoint_supervisor_progress("command-lock-wait", inspect_gateway=False)
+
+
 def _run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    # Inside a held command-lock transaction the systemctl child must
+    # inherit the mutex fd (so the lock outlives a dying runner) and
+    # run in its own process group (so a deadline can kill the whole
+    # mutation tree). Only the holding thread routes through it.
+    runner = subprocess.run
+    lock_txn = _active_command_lock_transaction()
+    if lock_txn is not None:
+        runner = lock_txn.run_subprocess
     try:
-        result = subprocess.run(
+        result = runner(
             ["systemctl", *args],
             capture_output=True,
             text=True,
@@ -3496,11 +3523,31 @@ def ensure_openclaw_gateway_ready(
             notify_platform=True,
         )
     try:
-        delete_telegram_webhook(binding)
-        started_at = start_openclaw_gateway(binding)
-        wait_for_openclaw_start(started_at)
+        restart_result = run_locked_gateway_restart(
+            binding,
+            holder="daemon",
+            delete_webhook=True,
+            wait_for_lock_seconds=GATEWAY_RESTART_LOCK_WAIT_SECONDS,
+            on_lock_wait=_gateway_lock_wait_checkpoint,
+        )
     except ManualRecoveryRequired:
         raise
+    except CommandLockBusy as exc:
+        # A human (or another runner) holds the global command lock:
+        # defer, never race. Not a gateway failure — the recovery
+        # budget is for broken gateways, not busy mutexes.
+        detail = f"gateway restart deferred: {exc.reason}"
+        log.warning("%s", detail)
+        _write_runtime_state(
+            "openclaw_not_ready",
+            detail,
+            config_fingerprint=config_fingerprint,
+            gateway_active=is_openclaw_gateway_active(),
+            gateway_action="deferred",
+            openclaw_ready=False,
+            event_type="gateway_restart_deferred",
+        )
+        raise RuntimeError(detail) from exc
     except Exception as exc:
         mode = _record_gateway_recovery_failure(
             "restart_failed",
@@ -3513,6 +3560,30 @@ def ensure_openclaw_gateway_ready(
                 "gateway recovery exhausted; manual recovery required"
             ) from exc
         raise
+    if restart_result.outcome != "succeeded":
+        failure_detail = restart_result.detail or restart_result.outcome
+        recorded_detail = (
+            failure_detail
+            if failure_detail.startswith("gateway restart failed")
+            else f"gateway restart failed: {failure_detail}"
+        )
+        failure_exc = RuntimeError(failure_detail)
+        mode = _record_gateway_recovery_failure(
+            "restart_failed",
+            recorded_detail,
+            snapshot=gateway_cgroup_memory_snapshot(),
+            config_fingerprint=config_fingerprint,
+        )
+        if mode == "manual":
+            raise ManualRecoveryRequired(
+                "gateway recovery exhausted; manual recovery required"
+            ) from failure_exc
+        raise failure_exc
+    started_at = (
+        float(restart_result.operation_marker_unix)
+        if restart_result.operation_marker_unix is not None
+        else time.time()
+    )
     _write_runtime_state(
         "healthy",
         "openclaw gateway started",
@@ -4662,8 +4733,15 @@ def _restart_gateway_for_component_update(binding: dict | None = None) -> None:
     previous_marker = bool(_stop_holder.get("component_update_restart"))
     _stop_holder["component_update_restart"] = True
     try:
-        started_at = start_openclaw_gateway(binding or {})
-        wait_for_openclaw_start(started_at)
+        restart_result = run_locked_gateway_restart(
+            binding or {},
+            holder="daemon",
+            delete_webhook=False,
+            wait_for_lock_seconds=GATEWAY_RESTART_LOCK_WAIT_SECONDS,
+            on_lock_wait=_gateway_lock_wait_checkpoint,
+        )
+        if restart_result.outcome != "succeeded":
+            raise RuntimeError(restart_result.detail or restart_result.outcome)
         log.info("component update: OpenClaw gateway restarted and healthy")
     finally:
         _stop_holder["component_update_restart"] = previous_marker

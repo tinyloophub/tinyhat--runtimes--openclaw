@@ -122,3 +122,38 @@ def _inspect_openclaw_plugin(plugin_id: str) -> dict | None:
         log.warning("OpenClaw plugin %s has missing dependencies", plugin_id)
         return None
     return plugin
+
+
+def configured_telegram_binding() -> dict | None:
+    """The Telegram binding facts the box's OpenClaw config holds.
+
+    The gateway-restart transaction needs the bot token to clear the
+    Telegram webhook before OpenClaw long-polls; the daemon gets it
+    from its live platform binding, but the CLI runs without one. The
+    deployed OpenClaw config is the on-box source of those facts, and
+    config-path access belongs to this adapter. Returns ``None`` when
+    no config exists (an unbound box restarts without the webhook leg).
+    """
+    sup = _sup()
+    try:
+        with open(sup.openclaw_config_path(), encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    channels = config.get("channels")
+    telegram = channels.get("telegram") if isinstance(channels, dict) else None
+    if not isinstance(telegram, dict):
+        return None
+    token = str(telegram.get("botToken") or "").strip()
+    allow_from = telegram.get("allowFrom")
+    owner = ""
+    if isinstance(allow_from, list) and allow_from:
+        owner = str(allow_from[0] or "").strip()
+    if not token:
+        return None
+    return {
+        "telegram_bot_token": token,
+        "telegram_owner_user_id": owner or None,
+    }

@@ -27,3 +27,5 @@ jobs:
         run: python -m unittest tests.test_supervisor -v
       - name: CLI unit + proof-gate tests
         run: python -m unittest tests.test_tinyhat_cli tests.test_extraction_guards -v
+      - name: Command lock + spool + commands-ring tests
+        run: python -m unittest tests.test_command_lock -v
