@@ -1076,12 +1076,19 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 posted.append((path, body))
                 return {"ok": True}
 
+            # The fake clock is a function advanced explicitly between
+            # writes, NOT a finite side_effect list: patching the global
+            # time module means stdlib internals consume time.time() too
+            # (logging stamps every record with it on Python <= 3.12),
+            # and a finite list exhausts with StopIteration (#90).
+            clock = {"now": 1000.0}
+
             with (
                 patch.dict(os.environ, env, clear=False),
                 patch.object(
                     supervisor.time,
                     "time",
-                    side_effect=[1000, 1000, 1005, 1005, 1070, 1070],
+                    side_effect=lambda: clock["now"],
                 ),
                 patch.object(
                     supervisor,
@@ -1091,7 +1098,9 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 patch.object(supervisor, "post_json", side_effect=fake_post_json),
             ):
                 supervisor._write_runtime_state("degraded_workload", "holding")
+                clock["now"] = 1005.0
                 supervisor._write_runtime_state("degraded_workload", "holding")
+                clock["now"] = 1070.0
                 supervisor._write_runtime_state("degraded_workload", "holding")
 
             self.assertEqual(len(posted), 2)
@@ -1109,12 +1118,17 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 posted.append((path, body))
                 return {"ok": True}
 
+            # Function-shaped fake clock for the same reason as the
+            # unchanged-payload test above: a finite side_effect list is
+            # exhausted by logging's time.time() use on Python <= 3.12.
+            clock = {"now": 1000.0}
+
             with (
                 patch.dict(os.environ, env, clear=False),
                 patch.object(
                     supervisor.time,
                     "time",
-                    side_effect=[1000, 1000, 1005, 1005],
+                    side_effect=lambda: clock["now"],
                 ),
                 patch.object(
                     supervisor,
@@ -1124,6 +1138,7 @@ class RuntimeStateV1Tests(unittest.TestCase):
                 patch.object(supervisor, "post_json", side_effect=fake_post_json),
             ):
                 supervisor._write_runtime_state("degraded_workload", "holding")
+                clock["now"] = 1005.0
                 supervisor._write_runtime_state("openclaw_not_ready", "still booting")
 
             self.assertEqual(len(posted), 2)
@@ -2063,6 +2078,18 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "is_openclaw_gateway_active",
                     return_value=False,
                 ),
+                # _write_runtime_state collects journal excerpts and the
+                # checkout identity; where journalctl/git exist, those
+                # subprocesses' timeout handling busy-waits through the
+                # patched time.sleep and pollutes the counted calls
+                # nondeterministically (#90). Isolate both sources so the
+                # sleep count stays exactly the recovery loop's own.
+                patch.object(
+                    supervisor,
+                    "_journal_runtime_log_lines",
+                    return_value=[],
+                ),
+                patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
                 supervisor._wait_for_gateway_recovery_window()
@@ -2185,6 +2212,14 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "GATEWAY_RECOVERY_MEMORY_WAIT_MAX_SAMPLES",
                     3,
                 ),
+                # Subprocess isolation — same rationale as the
+                # memory-stability test above (#90).
+                patch.object(
+                    supervisor,
+                    "_journal_runtime_log_lines",
+                    return_value=[],
+                ),
+                patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
                 with self.assertRaises(supervisor.ManualRecoveryRequired):
@@ -2257,6 +2292,18 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "is_openclaw_gateway_active",
                     return_value=False,
                 ),
+                # Subprocess isolation — without it, hosts where
+                # journalctl/git exist busy-wait through the patched
+                # time.sleep during _write_runtime_state's excerpt and
+                # identity collection, inflating BOTH the counted calls
+                # and the fake clock (observed 185/179/1085 vs the
+                # expected 178 across environments; #90).
+                patch.object(
+                    supervisor,
+                    "_journal_runtime_log_lines",
+                    return_value=[],
+                ),
+                patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep", side_effect=_sleep) as sleep,
             ):
                 with self.assertRaises(supervisor.ManualRecoveryRequired):
