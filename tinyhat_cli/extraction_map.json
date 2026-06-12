@@ -1,0 +1,620 @@
+{
+  "schema": "tinyhat_extraction_map_v1",
+  "description": "Audited extraction map for the v0.12.0 M1 read-unit extraction. Each entry names one top-level function/constant moved out of supervisor.py, its source line range at the pre-extraction commit, and the destination module. supervisor.py keeps a delegating re-export for every name (the only allowed old-file surface); tests/test_extraction_guards.py enforces this map.",
+  "base_commit": "427769f73779b483fb8334949723a62ab05af143",
+  "supervisor_line_count_baseline": 7083,
+  "moves": [
+    {
+      "name": "_openclaw_cli_env",
+      "kind": "function",
+      "source_range": [
+        374,
+        380
+      ],
+      "destination": "tinyhat_cli.adapters.openclaw"
+    },
+    {
+      "name": "_runtime_state_platform_post_cache",
+      "kind": "constant",
+      "source_range": [
+        400,
+        400
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_read_runtime_repo_version",
+      "kind": "function",
+      "source_range": [
+        956,
+        967
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "_read_runtime_git_sha",
+      "kind": "function",
+      "source_range": [
+        970,
+        989
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "_read_installed_plugin_marker",
+      "kind": "function",
+      "source_range": [
+        992,
+        1005
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "TINYHAT_PLUGIN_BEACON_FILENAME",
+      "kind": "constant",
+      "source_range": [
+        1020,
+        1020
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "TINYHAT_PLUGIN_BEACON_MIN_VERSION",
+      "kind": "constant",
+      "source_range": [
+        1024,
+        1024
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "PLUGIN_LOAD_GRACE_SECONDS",
+      "kind": "constant",
+      "source_range": [
+        1029,
+        1029
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "_PLUGIN_BEACON_MAX_BYTES",
+      "kind": "constant",
+      "source_range": [
+        1030,
+        1030
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "tinyhat_plugin_beacon_path",
+      "kind": "function",
+      "source_range": [
+        1033,
+        1035
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "_parse_plugin_version",
+      "kind": "function",
+      "source_range": [
+        1038,
+        1049
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "_read_plugin_load_beacon",
+      "kind": "function",
+      "source_range": [
+        1052,
+        1062
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "_plugin_load_check",
+      "kind": "function",
+      "source_range": [
+        1065,
+        1154
+      ],
+      "destination": "tinyhat_cli.units.capability_check"
+    },
+    {
+      "name": "_openclaw_plugin_from_inspect_payload",
+      "kind": "function",
+      "source_range": [
+        1157,
+        1166
+      ],
+      "destination": "tinyhat_cli.adapters.openclaw"
+    },
+    {
+      "name": "_inspect_openclaw_plugin",
+      "kind": "function",
+      "source_range": [
+        1169,
+        1210
+      ],
+      "destination": "tinyhat_cli.adapters.openclaw"
+    },
+    {
+      "name": "_OPENCLAW_VERSION_RE",
+      "kind": "constant",
+      "source_range": [
+        1457,
+        1457
+      ],
+      "destination": "tinyhat_cli.adapters.openclaw"
+    },
+    {
+      "name": "_read_openclaw_framework_version",
+      "kind": "function",
+      "source_range": [
+        1460,
+        1484
+      ],
+      "destination": "tinyhat_cli.adapters.openclaw"
+    },
+    {
+      "name": "collect_component_versions",
+      "kind": "function",
+      "source_range": [
+        1487,
+        1549
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "read_runtime_state",
+      "kind": "function",
+      "source_range": [
+        1863,
+        1873
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_name",
+      "kind": "function",
+      "source_range": [
+        1876,
+        1881
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_is_unrecoverable_manual",
+      "kind": "function",
+      "source_range": [
+        1884,
+        1888
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_gateway_recovery",
+      "kind": "function",
+      "source_range": [
+        1924,
+        1952
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_RUNTIME_STATE_SECRET_ASSIGNMENT_RE",
+      "kind": "constant",
+      "source_range": [
+        1959,
+        1963
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_AUTH_SCHEME_RE",
+      "kind": "constant",
+      "source_range": [
+        1964,
+        1966
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_URL_USERINFO_RE",
+      "kind": "constant",
+      "source_range": [
+        1967,
+        1969
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_SIGNED_QUERY_RE",
+      "kind": "constant",
+      "source_range": [
+        1970,
+        1973
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_SIGNED_URL_RE",
+      "kind": "constant",
+      "source_range": [
+        1974,
+        1977
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_JWT_RE",
+      "kind": "constant",
+      "source_range": [
+        1978,
+        1980
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_LLM_PROVIDER_KEY_RE",
+      "kind": "constant",
+      "source_range": [
+        1981,
+        1984
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_GOOGLE_ACCESS_TOKEN_RE",
+      "kind": "constant",
+      "source_range": [
+        1985,
+        1985
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_GOOGLE_API_KEY_RE",
+      "kind": "constant",
+      "source_range": [
+        1986,
+        1986
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_GITHUB_TOKEN_RE",
+      "kind": "constant",
+      "source_range": [
+        1987,
+        1989
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_AWS_ACCESS_KEY_RE",
+      "kind": "constant",
+      "source_range": [
+        1990,
+        1990
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_SLACK_TOKEN_RE",
+      "kind": "constant",
+      "source_range": [
+        1991,
+        1993
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_TELEGRAM_TOKEN_RE",
+      "kind": "constant",
+      "source_range": [
+        1994,
+        1996
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_RUNTIME_STATE_LOCAL_PATH_RE",
+      "kind": "constant",
+      "source_range": [
+        1997,
+        2000
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_sanitize_runtime_state_text",
+      "kind": "function",
+      "source_range": [
+        2003,
+        2028
+      ],
+      "destination": "tinyhat_cli.units.redaction"
+    },
+    {
+      "name": "_runtime_state_observed_at",
+      "kind": "function",
+      "source_range": [
+        2040,
+        2041
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_health_value",
+      "kind": "function",
+      "source_range": [
+        2044,
+        2048
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_reset_runtime_state_platform_post_cache",
+      "kind": "function",
+      "source_range": [
+        2051,
+        2053
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_platform_post_signature",
+      "kind": "function",
+      "source_range": [
+        2056,
+        2066
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_event",
+      "kind": "function",
+      "source_range": [
+        2069,
+        2084
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_append_runtime_state_event",
+      "kind": "function",
+      "source_range": [
+        2087,
+        2096
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_event_history",
+      "kind": "function",
+      "source_range": [
+        2099,
+        2148
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_mark_runtime_state_platform_unreachable",
+      "kind": "function",
+      "source_range": [
+        2151,
+        2189
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_post_runtime_state_to_platform",
+      "kind": "function",
+      "source_range": [
+        2192,
+        2230
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_computer_id",
+      "kind": "function",
+      "source_range": [
+        2233,
+        2246
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_gce_instance_id",
+      "kind": "function",
+      "source_range": [
+        2249,
+        2261
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_ref",
+      "kind": "function",
+      "source_range": [
+        2264,
+        2277
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_identity_cache",
+      "kind": "constant",
+      "source_range": [
+        2280,
+        2280
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_reset_runtime_state_identity_cache",
+      "kind": "function",
+      "source_range": [
+        2283,
+        2284
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_identity",
+      "kind": "function",
+      "source_range": [
+        2287,
+        2301
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_supervisor_status",
+      "kind": "function",
+      "source_range": [
+        2304,
+        2307
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_gateway_status",
+      "kind": "function",
+      "source_range": [
+        2310,
+        2324
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_gateway_restart_count_window",
+      "kind": "function",
+      "source_range": [
+        2327,
+        2342
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_last_error",
+      "kind": "function",
+      "source_range": [
+        2345,
+        2360
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_log_entry",
+      "kind": "function",
+      "source_range": [
+        2376,
+        2386
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_tail_runtime_log_file",
+      "kind": "function",
+      "source_range": [
+        2389,
+        2397
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_journal_runtime_log_lines",
+      "kind": "function",
+      "source_range": [
+        2400,
+        2429
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_log_entries",
+      "kind": "function",
+      "source_range": [
+        2432,
+        2442
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_gateway_runtime_log_entries",
+      "kind": "function",
+      "source_range": [
+        2445,
+        2470
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_runtime_state_recent_log_excerpts",
+      "kind": "function",
+      "source_range": [
+        2473,
+        2489
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "_write_runtime_state",
+      "kind": "function",
+      "source_range": [
+        2520,
+        2670
+      ],
+      "destination": "tinyhat_cli.units.runtime_state"
+    },
+    {
+      "name": "delete_telegram_webhook",
+      "kind": "function",
+      "source_range": [
+        4061,
+        4097
+      ],
+      "destination": "tinyhat_cli.units.gateway_restart"
+    },
+    {
+      "name": "start_openclaw_gateway",
+      "kind": "function",
+      "source_range": [
+        4307,
+        4326
+      ],
+      "destination": "tinyhat_cli.units.gateway_restart"
+    },
+    {
+      "name": "wait_for_openclaw_start",
+      "kind": "function",
+      "source_range": [
+        4562,
+        4608
+      ],
+      "destination": "tinyhat_cli.units.gateway_restart"
+    },
+    {
+      "name": "_component_update_state_path",
+      "kind": "function",
+      "source_range": [
+        5677,
+        5733
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "_read_component_update_state",
+      "kind": "function",
+      "source_range": [
+        5736,
+        5747
+      ],
+      "destination": "tinyhat_cli.units.manifest"
+    }
+  ]
+}

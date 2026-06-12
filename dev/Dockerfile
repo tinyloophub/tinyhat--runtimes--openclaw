@@ -85,10 +85,11 @@ RUN HOME=/home/tinyhat/runtime \
 
 WORKDIR /opt/tinyhat-runtime
 
-# Copy the supervisor and bootstrap.sh. The supervisor is the only
-# Python file we actually run; bootstrap.sh is copied for parity with
-# the production runtime layout.
+# Copy the supervisor, the tinyhat_cli package it delegates the
+# extracted units to, and bootstrap.sh (copied for parity with the
+# production runtime layout).
 COPY supervisor.py bootstrap.sh VERSION README.md ./
+COPY tinyhat_cli ./tinyhat_cli
 COPY dev/entrypoint.sh ./dev-entrypoint.sh
 RUN chmod +x supervisor.py bootstrap.sh dev-entrypoint.sh \
     && chown -R tinyhat:tinyhat /opt/tinyhat-runtime

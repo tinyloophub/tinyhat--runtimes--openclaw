@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The characterization net is proven on 3.13 in a journald-less
+        # environment (the maintainer's dev machines). Three pre-existing
+        # tests patch the GLOBAL time module and collide with stdlib
+        # internals everywhere else — all fail identically on unmodified
+        # main (see issue #90):
+        #   * RuntimeStateV1Tests.test_runtime_state_{skips_repeated_
+        #     unchanged,posts_changed}_*: finite time.time side_effect
+        #     lists exhaust on <= 3.12 where logging stamps records via
+        #     time.time() (3.13 uses time.time_ns()).
+        #   * SupervisorWatchdogContractTests.test_gateway_recovery_wait_
+        #     timeout_cycles_escalate_with_real_budget: counts patched
+        #     time.sleep calls, but when journalctl exists, subprocess
+        #     timeout handling busy-waits via the patched sleep while
+        #     journalctl runs, inflating the count nondeterministically
+        #     (reproduced at 1085 vs expected 178 on unmodified main with
+        #     a 150ms journalctl).
+        # Both pins below revert once #90 makes the tests version- and
+        # environment-proof.
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Pin the proven test environment (no journalctl)
+        run: |
+          # GitHub runners ship journald; the net is proven on hosts
+          # without it (binary absent -> OSError -> no subprocess).
+          # Removing it from the EPHEMERAL runner makes the time-mock
+          # test above deterministic. Tracked in issue #90.
+          sudo rm -f "$(command -v journalctl || true)"
+          if command -v journalctl; then echo "journalctl still present" >&2; exit 1; fi
+      - name: Shell syntax
+        run: bash -n bootstrap.sh dev/entrypoint.sh
+      - name: Byte-compile
+        run: python -m compileall -q supervisor.py tinyhat_cli
+      - name: Characterization net (unmodified)
+        run: python -m unittest tests.test_supervisor -v
+      - name: CLI unit + proof-gate tests
+        run: python -m unittest tests.test_tinyhat_cli tests.test_extraction_guards -v
