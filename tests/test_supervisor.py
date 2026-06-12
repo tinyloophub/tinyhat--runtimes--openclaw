@@ -4211,6 +4211,88 @@ class BindingCycleManualRecoveryTests(unittest.TestCase):
 class ChatgptSubscriptionBranchTests(unittest.TestCase):
     """Issue #23 — supervisor branches on auth-profile presence."""
 
+    def test_subscription_runtime_verification_reports_openai_model(self) -> None:
+        posts: list[tuple[str, dict]] = []
+
+        def fake_run(cmd, **kwargs):
+            self.assertEqual(cmd, ["openclaw", "models", "status", "--json"])
+            self.assertIn("OPENCLAW_CONFIG_PATH", kwargs["env"])
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "defaultModel": "openai/gpt-5.5",
+                        "resolvedDefault": "openai/gpt-5.5",
+                    }
+                ),
+                stderr="",
+            )
+
+        def fake_post(path: str, body: dict) -> dict:
+            posts.append((path, body))
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(supervisor, "post_json", side_effect=fake_post),
+            ):
+                supervisor._report_subscription_runtime_verification(
+                    {
+                        "llm_auth_mode": "chatgpt_subscription",
+                        "llm_model_ref": "openai/gpt-5.5",
+                    }
+                )
+
+        self.assertEqual(
+            posts,
+            [
+                (
+                    "/hapi/v1/computers/me/subscription-link/runtime-verification",
+                    {
+                        "expected_model_ref": "openai/gpt-5.5",
+                        "observed_model_ref": "openai/gpt-5.5",
+                        "command": "openclaw models status --json",
+                        "verified": True,
+                    },
+                )
+            ],
+        )
+
+    def test_subscription_runtime_verification_reports_model_mismatch(self) -> None:
+        posts: list[tuple[str, dict]] = []
+
+        def fake_run(cmd, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"resolvedDefault": "openrouter/deepseek/v4"}),
+                stderr="",
+            )
+
+        with (
+            patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda p, b: posts.append((p, b)) or {},
+            ),
+        ):
+            supervisor._report_subscription_runtime_verification(
+                {
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                }
+            )
+
+        self.assertEqual(len(posts), 1)
+        self.assertFalse(posts[0][1]["verified"])
+        self.assertEqual(posts[0][1]["observed_model_ref"], "openrouter/deepseek/v4")
+
     def test_opted_in_with_profile_writes_subscription_config(self) -> None:
         """auth-profile present + llm_auth_mode=chatgpt_subscription on
         binding → openai/gpt-5.5, no provider runtime pin for OpenAI,
@@ -4353,7 +4435,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
         A completed link must flip the Computer away from the OpenRouter
         default; otherwise the user sees "ChatGPT/Codex sign-in is complete"
-        while the runtime keeps serving Kimi from platform credits.
+        while the runtime keeps serving platform credits.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {

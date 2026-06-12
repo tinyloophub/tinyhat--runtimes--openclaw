@@ -4019,6 +4019,69 @@ def _post_config_apply_result(
     post_json("/hapi/v1/computers/me/config/apply-result", body)
 
 
+def _openclaw_models_status_default_model(
+    *, openclaw_bin: str = "openclaw"
+) -> tuple[str | None, str | None]:
+    """Return OpenClaw's resolved default model via its stable CLI surface."""
+    try:
+        result = subprocess.run(
+            [openclaw_bin, "models", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=_openclaw_cli_env(),
+            **_runtime_user_subprocess_kwargs(),
+        )
+    except Exception as exc:  # noqa: BLE001 - verification is reported, not fatal
+        return None, f"openclaw models status failed: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return None, detail[:512] or f"openclaw exited {result.returncode}"
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return None, f"openclaw models status returned invalid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "openclaw models status returned a non-object payload"
+    observed = str(
+        payload.get("resolvedDefault") or payload.get("defaultModel") or ""
+    ).strip()
+    return (observed or None), None
+
+
+def _report_subscription_runtime_verification(binding: dict) -> None:
+    """Tell the platform whether OpenClaw now resolves to the OpenAI model."""
+    if str(binding.get("llm_auth_mode") or "") != "chatgpt_subscription":
+        return
+    expected_model = _chatgpt_subscription_model_ref(
+        str(binding.get("llm_model_ref") or "")
+    )
+    observed_model, detail = _openclaw_models_status_default_model()
+    verified = observed_model == expected_model
+    body = {
+        "expected_model_ref": expected_model,
+        "observed_model_ref": observed_model,
+        "command": "openclaw models status --json",
+        "verified": verified,
+    }
+    if detail:
+        body["detail"] = detail[:512]
+    try:
+        post_json(
+            "/hapi/v1/computers/me/subscription-link/runtime-verification",
+            body,
+        )
+        log.info(
+            "subscription runtime verification reported "
+            "verified=%s expected=%s observed=%s",
+            verified,
+            expected_model,
+            observed_model,
+        )
+    except Exception as exc:
+        log.warning("subscription runtime verification POST failed: %s", exc)
+
+
 def _report_cached_failed_revision() -> None:
     revision = _config_apply_state.get("failed_revision")
     if revision is None or _config_apply_state.get("failed_reported"):
@@ -5988,6 +6051,7 @@ def _run_one_binding_cycle() -> int:
             ),
             inspect_gateway=True,
         )
+        _report_subscription_runtime_verification(binding)
     except ManualRecoveryRequired as exc:
         log.error("OpenClaw gateway automatic recovery blocked: %s", exc)
         checkpoint_supervisor_progress(
