@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+UNIT_CATEGORY = "diagnostics"
+
 _RUNTIME_STATE_SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])([\"']?[A-Za-z0-9_-]*(?:api[_-]?key|"
     r"access[_-]?token|refresh[_-]?token|token|password|secret|cookie|"

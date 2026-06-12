@@ -7427,8 +7427,15 @@ class PluginLoadDetectionTests(unittest.TestCase):
 
     The detection consumes the load beacon the plugin writes since
     v0.5.0; older plugins and non-running gateways classify as
-    "unknown" and never degrade health.
+    "unknown" and never degrade health. v0.12.0 M3 maps the demotion
+    to ``degraded_workload`` + ``plugin_not_loaded`` (the previous
+    ``unsupported_openclaw_version`` value was wrong copy and is now
+    reserved for true framework-range violations).
     """
+
+    def setUp(self) -> None:
+        supervisor._reset_capability_verification_cache()
+        self.addCleanup(supervisor._reset_capability_verification_cache)
 
     def _env(self, tmpdir: str) -> dict[str, str]:
         return {
@@ -7526,9 +7533,7 @@ class PluginLoadDetectionTests(unittest.TestCase):
             self.assertEqual(pending["runtime_health"], "healthy")
             self.assertEqual(pending["plugin"]["load_check"], "pending")
             self.assertEqual(pending["plugin"]["missing_since_unix"], base)
-            self.assertEqual(
-                demoted["runtime_health"], "unsupported_openclaw_version"
-            )
+            self.assertEqual(demoted["runtime_health"], "degraded_workload")
             self.assertEqual(demoted["plugin"]["load_check"], "not_loaded")
             self.assertEqual(demoted["plugin"]["reason"], "beacon_missing")
             self.assertEqual(demoted["plugin"]["missing_since_unix"], base)
@@ -7557,9 +7562,7 @@ class PluginLoadDetectionTests(unittest.TestCase):
                         "healthy", "ok", gateway_active=True
                     )
                     payload = supervisor.read_runtime_state()
-            self.assertEqual(
-                payload["runtime_health"], "unsupported_openclaw_version"
-            )
+            self.assertEqual(payload["runtime_health"], "degraded_workload")
             self.assertEqual(
                 payload["plugin"]["reason"], "beacon_version_mismatch"
             )
@@ -7719,16 +7722,12 @@ class PluginLoadDetectionTests(unittest.TestCase):
                         "healthy", "ok", gateway_active=True
                     )
                     later = supervisor.read_runtime_state()
-            self.assertEqual(
-                demoted["runtime_health"], "unsupported_openclaw_version"
-            )
+            self.assertEqual(demoted["runtime_health"], "degraded_workload")
             self.assertEqual(fresh["runtime_health"], "healthy")
             self.assertEqual(fresh["plugin"]["load_check"], "pending")
             self.assertEqual(fresh["plugin"]["installed_version"], "0.6.0")
             self.assertEqual(fresh["plugin"]["missing_since_unix"], fresh_now)
-            self.assertEqual(
-                later["runtime_health"], "unsupported_openclaw_version"
-            )
+            self.assertEqual(later["runtime_health"], "degraded_workload")
             self.assertEqual(later["plugin"]["load_check"], "not_loaded")
 
 

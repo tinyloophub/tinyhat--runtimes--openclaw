@@ -13,6 +13,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "diagnostics"
+
 
 def run(ctx) -> dict[str, Any]:
     sup = _sup()
@@ -60,6 +62,7 @@ def run(ctx) -> dict[str, Any]:
             "action_from_state": gateway_state.get("action"),
         },
         "plugin": state.get("plugin"),
+        "capabilities": state.get("capabilities"),
         "recent_events": events[-3:],
         "lifecycle": state.get("lifecycle"),
     }
@@ -110,6 +113,20 @@ def render(data: dict[str, Any]) -> list[str]:
         )
     else:
         lines.append("plugin:    (not installed — installed on first agent bind)")
+    capabilities = data.get("capabilities") or {}
+    if capabilities:
+        lines.append(
+            f"capabilities: {capabilities.get('status')} "
+            f"[{capabilities.get('mechanism')}] "
+            f"tools {capabilities.get('registered_tools')}/{capabilities.get('declared_tools')} "
+            f"skills {capabilities.get('mounted_skills')}/{capabilities.get('declared_skills')}"
+            + (
+                f" missing: {', '.join(capabilities.get('missing') or [])}"
+                + (" …" if capabilities.get("missing_truncated") else "")
+                if capabilities.get("missing")
+                else ""
+            )
+        )
     last_error = data.get("last_error") or {}
     if last_error:
         lines.append(

@@ -14,6 +14,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "identity"
+
 
 def _binding_visibility() -> dict[str, Any]:
     """Non-secret binding facts from the OpenClaw config, if present."""

@@ -407,15 +407,26 @@ from tinyhat_cli.adapters.openclaw import (  # noqa: E402,F401
     _openclaw_cli_env,
     _openclaw_plugin_from_inspect_payload,
     _read_openclaw_framework_version,
+    openclaw_plugin_registry_entry,
 )
 from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
+    CAPABILITIES_MISSING_MAX_NAMES,
+    CAPABILITY_VERIFICATION_TTL_SECONDS,
     PLUGIN_LOAD_GRACE_SECONDS,
     TINYHAT_PLUGIN_BEACON_FILENAME,
     TINYHAT_PLUGIN_BEACON_MIN_VERSION,
     _PLUGIN_BEACON_MAX_BYTES,
+    _framework_compat,
+    _installed_plugin_dir,
+    _mounted_skills,
     _parse_plugin_version,
     _plugin_load_check,
     _read_plugin_load_beacon,
+    _reset_capability_verification_cache,
+    _workload_readable,
+    capability_verification,
+    capability_verification_cached,
+    read_declared_capabilities,
     tinyhat_plugin_beacon_path,
 )
 from tinyhat_cli.units.command_lock import (  # noqa: E402,F401
@@ -491,9 +502,9 @@ from tinyhat_cli.units.runtime_state import (  # noqa: E402,F401
     _tail_runtime_log_file,
     _write_runtime_state,
     budget_runtime_state_payload,
+    capability_demotion,
     fold_command_results,
     lifecycle_block,
-    plugin_demotion,
     read_runtime_state,
 )
 

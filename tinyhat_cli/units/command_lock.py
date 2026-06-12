@@ -44,6 +44,8 @@ from typing import Any, Callable
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "supervision"
+
 log = logging.getLogger("tinyhat-supervisor")
 
 COMMAND_LOCK_SCHEMA = "command_lock_v1"

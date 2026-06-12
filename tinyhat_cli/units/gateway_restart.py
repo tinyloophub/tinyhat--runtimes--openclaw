@@ -30,6 +30,8 @@ from typing import Any, Callable
 from tinyhat_cli._facade import supervisor_module as _sup
 from tinyhat_cli.units import command_lock, command_spool
 
+UNIT_CATEGORY = "supervision"
+
 log = logging.getLogger("tinyhat-supervisor")
 
 GATEWAY_RESTART_COMMAND = "gateway restart"

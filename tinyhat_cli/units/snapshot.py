@@ -14,6 +14,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "diagnostics"
+
 
 def _unit_state(unit: str) -> str:
     """``systemctl is-active`` value, or ``unavailable`` off-systemd."""
