@@ -40,12 +40,18 @@ from collections import deque
 from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
+from tinyhat_cli.units import command_spool
 
 log = logging.getLogger("tinyhat-supervisor")
 
 # 4 KiB headroom under the platform's 16,384-byte runtime-state ingest
 # limit, so additive fields and encoding drift never reach the cliff.
 RUNTIME_STATE_PLATFORM_POST_MAX_BYTES = 12288
+
+# The `commands` ring keeps the last N command-result summaries in the
+# mirrored payload. Small on purpose: the ring answers "what was the
+# last mutation and how did it end", not "give me an audit log".
+COMMANDS_RING_MAX = 5
 
 _runtime_state_platform_post_cache: dict[str, Any] = {"signature": None, "ts": 0.0}
 _runtime_state_identity_cache: dict[str, str] = {}
@@ -733,6 +739,79 @@ def _runtime_state_recent_log_excerpts() -> dict[str, list[dict[str, str]]]:
     }
 
 
+# ── the `commands` ring (spool fold) ─────────────────────────────────
+
+
+def _ring_entry(record: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    name = record.get("name")
+    outcome = record.get("outcome")
+    if not isinstance(name, str) or outcome not in ("succeeded", "failed", "timed_out"):
+        return None
+    entry: dict[str, Any] = {"name": name, "outcome": outcome}
+    command_class = record.get("class")
+    entry["class"] = command_class if command_class in ("diagnose", "operate") else "operate"
+    for key in ("started_at_unix", "finished_at_unix"):
+        value = record.get(key)
+        if isinstance(value, int):
+            entry[key] = value
+    for key in ("idempotency_key", "summary"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            entry[key] = value
+    for key in ("runner_lost", "stale_takeover"):
+        if record.get(key) is True:
+            entry[key] = True
+    return entry
+
+
+def fold_command_results(
+    existing_state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    """Merge the command-result spool into the ``commands`` ring.
+
+    Returns ``(ring, folded_paths, fresh_entries)``: the new
+    last-:data:`COMMANDS_RING_MAX` ring (existing state entries +
+    spooled records, oldest dropped), the spool paths now represented
+    in it, and the entries that were newly folded this call (so the
+    write path can mirror stale-takeover events). The daemon prunes the
+    paths only after its state write lands; ``tinyhat status`` calls
+    this read-only and prunes nothing (single-writer rule: the CLI
+    never mutates the daemon's transport).
+    """
+
+    def _key(entry: dict[str, Any]) -> tuple[str, Any, Any]:
+        return (
+            entry.get("idempotency_key") or entry["name"],
+            entry.get("finished_at_unix"),
+            entry["outcome"],
+        )
+
+    ring: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any, Any]] = set()
+    existing = existing_state.get("commands")
+    if isinstance(existing, list):
+        for record in existing:
+            entry = _ring_entry(record)
+            if entry is None or _key(entry) in seen:
+                continue
+            seen.add(_key(entry))
+            ring.append(entry)
+    folded_paths: list[str] = []
+    fresh_entries: list[dict[str, Any]] = []
+    for path, record in command_spool.read_results():
+        entry = _ring_entry(record)
+        folded_paths.append(path)
+        if entry is None or _key(entry) in seen:
+            continue
+        seen.add(_key(entry))
+        ring.append(entry)
+        fresh_entries.append(entry)
+    ring.sort(key=lambda item: item.get("finished_at_unix") or 0)
+    return ring[-COMMANDS_RING_MAX:], folded_paths, fresh_entries
+
+
 # ── moved: the daemon write path ─────────────────────────────────────
 
 
@@ -837,6 +916,21 @@ def _write_runtime_state(
         detail=event_detail or safe_detail,
         now=now,
     )
+    commands_ring, folded_spool_paths, fresh_command_entries = (
+        sup.fold_command_results(existing_state)
+    )
+    for entry in fresh_command_entries:
+        if entry.get("stale_takeover"):
+            sup._append_runtime_state_event(
+                runtime_events,
+                sup._runtime_state_event(
+                    "command_lock_stale_takeover",
+                    f"{entry.get('name')} normalized to {entry.get('outcome')} "
+                    "after its runner was lost",
+                    now=now,
+                ),
+            )
+    runtime_events = runtime_events[-sup.RUNTIME_STATE_MAX_EVENTS :]
     payload: dict[str, Any] = {
         "schema": sup.RUNTIME_STATE_SCHEMA,
         "schema_version": 1,
@@ -882,8 +976,14 @@ def _write_runtime_state(
         payload["runtime_events"] = runtime_events
     if gateway_recovery:
         payload["gateway_recovery"] = gateway_recovery
+    if commands_ring:
+        payload["commands"] = commands_ring
     lifecycle = sup.lifecycle_block(getattr(sup, "_lifecycle_marks", None))
     if lifecycle is not None:
         payload["lifecycle"] = lifecycle
     sup._atomic_write_json(path, payload, mode=0o600)
+    if folded_spool_paths:
+        # Folded results are represented in the just-written state (and
+        # every later write re-reads it), so the transport can drain.
+        command_spool.prune_folded(folded_spool_paths)
     sup._post_runtime_state_to_platform(payload)

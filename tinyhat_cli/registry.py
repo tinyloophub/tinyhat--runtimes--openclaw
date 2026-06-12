@@ -1,21 +1,23 @@
 """Static command registry + typed handler contract.
 
 Every ``tinyhat`` command is one :class:`CommandSpec`: a name, a
-command class (``diagnose`` now; ``operate`` arrives with the global
-command lock), a unit category from the closed mechanism set, a
-privilege declaration, a side-effect declaration, a handler and a
-human renderer. The registry is a static dict — no auto-discovery, no
-scanning, no plugins. Adding a command means adding a unit module and
-one entry here.
+command class (``diagnose`` or ``operate``), a unit category from the
+closed mechanism set, and the per-command declarations the runner
+enforces — privilege, side effect, risk tier, idempotency mode, and
+the operation timeout. The registry is a static dict — no
+auto-discovery, no scanning, no plugins. Adding a command means adding
+a unit module and one entry here.
 
 Handler contract::
 
     handler(ctx: CommandContext) -> dict      # the JSON `data` block
     render(data: dict) -> list[str]           # human output lines
 
-Handlers never mutate runtime state, never take locks, and never post
-to the platform (diagnose class). The entrypoint owns the envelope
-(freshness fields), output sanitization, and rendering.
+Diagnose handlers never mutate runtime state, never take locks, and
+never post to the platform. Operate handlers run under the global
+command lock (``units/command_lock``) and record results through the
+command spool. The entrypoint owns the envelope (freshness fields),
+output sanitization, and rendering.
 """
 
 from __future__ import annotations
@@ -39,6 +41,13 @@ ALLOWED_UNIT_CATEGORIES = frozenset(
 )
 
 COMMAND_CLASSES = frozenset({"diagnose", "operate"})
+RISK_TIERS = frozenset({"low", "moderate", "high"})
+IDEMPOTENCY_MODES = frozenset({"not-applicable", "explicit-replay"})
+
+# Mutating-command timeout default; specific commands declare tighter
+# bounds (gateway restart: 120 s ≥ the 90 s readiness bound + the
+# synchronous systemctl stop/start allowance — asserted in tests).
+DEFAULT_OPERATE_TIMEOUT_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,9 @@ class CommandSpec:
     summary: str
     handler: Callable[[CommandContext], dict[str, Any]]
     render: Callable[[dict[str, Any]], list[str]]
+    risk_tier: str = "low"
+    idempotency: str = "not-applicable"
+    timeout_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.category not in ALLOWED_UNIT_CATEGORIES:
@@ -71,17 +83,51 @@ class CommandSpec:
             raise ValueError(
                 f"command {self.name!r} declares class {self.command_class!r}"
             )
+        if self.risk_tier not in RISK_TIERS:
+            raise ValueError(
+                f"command {self.name!r} declares risk tier {self.risk_tier!r}"
+            )
+        if self.idempotency not in IDEMPOTENCY_MODES:
+            raise ValueError(
+                f"command {self.name!r} declares idempotency {self.idempotency!r}"
+            )
         if self.command_class == "diagnose" and self.side_effect:
             raise ValueError(
                 f"diagnose command {self.name!r} cannot declare side effects"
             )
+        if self.command_class == "operate":
+            if not self.side_effect:
+                raise ValueError(
+                    f"operate command {self.name!r} must declare its side effect"
+                )
+            if not isinstance(self.timeout_seconds, int) or self.timeout_seconds <= 0:
+                raise ValueError(
+                    f"operate command {self.name!r} must declare a positive "
+                    "timeout_seconds"
+                )
 
 
 def build_registry() -> dict[str, CommandSpec]:
     """The static registry. Import units lazily to keep startup cheap."""
-    from tinyhat_cli.units import health, manifest, status, whoami
+    from tinyhat_cli.units import gateway_restart, health, manifest, status, whoami
 
     return {
+        "gateway restart": CommandSpec(
+            name="gateway restart",
+            command_class="operate",
+            category="supervision",
+            privilege="root",
+            side_effect=True,
+            risk_tier="moderate",
+            idempotency="explicit-replay",
+            timeout_seconds=gateway_restart.GATEWAY_RESTART_TIMEOUT_SECONDS,
+            summary=(
+                "lock-held gateway restart, driven to a terminal "
+                "readiness verdict (succeeded/failed/timed_out)"
+            ),
+            handler=gateway_restart.run,
+            render=gateway_restart.render,
+        ),
         "status": CommandSpec(
             name="status",
             command_class="diagnose",

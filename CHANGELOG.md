@@ -7,6 +7,30 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Added
+
+- Global command lock for mutating commands: `flock(LOCK_EX)` on a stable
+  root-owned mutex fd, deliberately inherited by mutation subprocess trees
+  (own process group, recorded `child_pgid`), with a `command_lock_v1`
+  status record, typed busy answers, stale takeover + runner-lost
+  reconciliation, deadline enforcement (process-group SIGTERM→SIGKILL),
+  and a bounded idempotency results store (50 records / 24 h).
+- `tinyhat gateway restart` — the first operate-class CLI command: the
+  lock-held operation transaction (webhook delete when a bot token is
+  configured → `systemctl reset-failed` + `restart` → bounded readiness
+  wait) driven to a terminal `succeeded`/`failed`/`timed_out` verdict;
+  `--idempotency-key` replays a stored result without re-execution.
+- Command-result spool (`command_result_spool_v1`): pre-redacted,
+  atomically written result records (≤ 2 KiB each, ≤ 64 KiB / 50 records,
+  bounded quarantine) that the daemon folds into the new `commands` ring
+  (last 5) of `runtime_state_v1` on its next post; `tinyhat status` reads
+  the same spool so a support shell sees results while the daemon is down.
+- Daemon gateway restarts (recovery leg + component-update restart) now run
+  the same lock-held transaction (`holder: "daemon"`), deferring while a
+  human holds the lock instead of racing it.
+- `dev/systemd-proof/lock_proof.sh` — the seven live lock-concurrency
+  proof cases against real systemd.
+
 ### Fixed
 
 - Reattach the supervisor to an already healthy OpenClaw gateway when the

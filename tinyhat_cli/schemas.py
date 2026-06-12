@@ -60,6 +60,25 @@ _NULLABLE_STRING = {"type": ["string", "null"]}
 _NULLABLE_INT = {"type": ["integer", "null"]}
 _NULLABLE_BOOL = {"type": ["boolean", "null"]}
 
+# One `commands` ring summary (§ runtime_state_v1 contract): operate
+# results always, diagnose failures only; runner loss is metadata on a
+# normalized terminal outcome, never a fourth outcome.
+_COMMAND_RING_ITEM = {
+    "type": "object",
+    "required": ["name", "class", "outcome"],
+    "properties": {
+        "name": {"type": "string"},
+        "class": {"enum": ["diagnose", "operate"]},
+        "outcome": {"enum": ["succeeded", "failed", "timed_out"]},
+        "started_at_unix": _NULLABLE_INT,
+        "finished_at_unix": _NULLABLE_INT,
+        "idempotency_key": _NULLABLE_STRING,
+        "summary": _NULLABLE_STRING,
+        "runner_lost": _NULLABLE_BOOL,
+        "stale_takeover": _NULLABLE_BOOL,
+    },
+}
+
 _DESIRED_STALENESS = {
     "type": "object",
     "required": ["summary"],
@@ -107,6 +126,7 @@ DATA_SCHEMAS: dict[str, dict] = {
                 "required": ["unit", "live_unit_state"],
             },
             "recent_events": {"type": "array"},
+            "commands": {"type": "array", "items": _COMMAND_RING_ITEM},
         },
     },
     "health": {
@@ -194,6 +214,26 @@ DATA_SCHEMAS: dict[str, dict] = {
                 "required": ["bound"],
                 "properties": {"bound": {"type": "boolean"}},
             },
+        },
+    },
+    "gateway restart": {
+        "type": "object",
+        "required": ["outcome", "idempotency_key", "replayed"],
+        "properties": {
+            "name": _NULLABLE_STRING,
+            "class": {"enum": ["diagnose", "operate"]},
+            "outcome": {"enum": ["succeeded", "failed", "timed_out"]},
+            "detail": _NULLABLE_STRING,
+            "summary": _NULLABLE_STRING,
+            "phase_reached": _NULLABLE_STRING,
+            "started_at_unix": _NULLABLE_INT,
+            "finished_at_unix": _NULLABLE_INT,
+            "operation_marker_unix": _NULLABLE_INT,
+            "runner_lost": _NULLABLE_BOOL,
+            "idempotency_key": {"type": "string"},
+            "replayed": {"type": "boolean"},
+            "webhook_delete_skipped": _NULLABLE_STRING,
+            "spool_warning": _NULLABLE_STRING,
         },
     },
 }

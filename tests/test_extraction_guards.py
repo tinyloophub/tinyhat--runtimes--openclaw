@@ -230,19 +230,55 @@ class AdapterBoundaryGuardTests(unittest.TestCase):
 
 
 class RegistryContractGuardTests(unittest.TestCase):
-    def test_registry_is_static_diagnose_only_and_categorized(self) -> None:
+    def test_registry_is_static_root_only_and_categorized(self) -> None:
         from tinyhat_cli.registry import ALLOWED_UNIT_CATEGORIES, build_registry
 
         registry = build_registry()
         self.assertEqual(
             sorted(registry),
-            ["health", "manifest drift", "manifest show", "status", "whoami"],
+            [
+                "gateway restart",
+                "health",
+                "manifest drift",
+                "manifest show",
+                "status",
+                "whoami",
+            ],
         )
         for spec in registry.values():
-            self.assertEqual(spec.command_class, "diagnose")
             self.assertEqual(spec.privilege, "root")
-            self.assertFalse(spec.side_effect)
             self.assertIn(spec.category, ALLOWED_UNIT_CATEGORIES)
+            if spec.command_class == "diagnose":
+                self.assertFalse(spec.side_effect)
+            else:
+                self.assertEqual(spec.command_class, "operate")
+                self.assertTrue(spec.side_effect)
+                self.assertIsInstance(spec.timeout_seconds, int)
+
+    def test_gateway_restart_is_the_only_operate_command(self) -> None:
+        """The v0.12 release-blocking operate bar is exactly one command."""
+        from tinyhat_cli.registry import build_registry
+
+        operate = [
+            name
+            for name, spec in build_registry().items()
+            if spec.command_class == "operate"
+        ]
+        self.assertEqual(operate, ["gateway restart"])
+
+    def test_gateway_restart_deadline_covers_its_phases(self) -> None:
+        """Declared deadline ≥ readiness bound + the stop/start allowance."""
+        from tinyhat_cli.registry import build_registry
+
+        spec = build_registry()["gateway restart"]
+        readiness_bound = supervisor.OPENCLAW_GATEWAY_START_TIMEOUT_SECONDS
+        stop_start_allowance = supervisor.SYSTEMCTL_TIMEOUT_SECONDS
+        self.assertGreaterEqual(
+            spec.timeout_seconds,
+            readiness_bound + stop_start_allowance,
+            "a ratified gateway-restart deadline can never undercut the "
+            "readiness probe plus the synchronous systemctl allowance",
+        )
 
     def test_registry_rejects_product_category(self) -> None:
         from tinyhat_cli.registry import CommandSpec

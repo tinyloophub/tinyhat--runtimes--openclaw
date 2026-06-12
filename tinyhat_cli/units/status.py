@@ -63,6 +63,15 @@ def run(ctx) -> dict[str, Any]:
         "recent_events": events[-3:],
         "lifecycle": state.get("lifecycle"),
     }
+    # The same spool reader the daemon folds with: a support shell sees
+    # command results immediately, daemon up or down (read-only — the
+    # CLI never prunes the daemon's transport).
+    try:
+        commands_ring, _paths, _fresh = sup.fold_command_results(state)
+    except Exception:  # noqa: BLE001 - the ring is additive, never blocking
+        commands_ring = []
+    if commands_ring:
+        data["commands"] = commands_ring
     return data
 
 
@@ -126,4 +135,15 @@ def render(data: dict[str, Any]) -> list[str]:
             f"{name.replace('_seconds', '')}={value}s" for name, value in spans.items()
         )
         lines.append(f"lifecycle: {rendered}")
+    for entry in data.get("commands") or []:
+        flags = ""
+        if entry.get("runner_lost"):
+            flags += " runner-lost"
+        if entry.get("stale_takeover"):
+            flags += " stale-takeover"
+        summary = f" — {entry['summary']}" if entry.get("summary") else ""
+        lines.append(
+            f"command:   {entry.get('name', '?')} [{entry.get('class', '?')}] "
+            f"{entry.get('outcome', '?')}{flags}{summary}"
+        )
     return lines
