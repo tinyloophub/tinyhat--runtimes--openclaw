@@ -504,6 +504,56 @@ class ManifestUnitTests(unittest.TestCase):
         )
         self.assertFalse(manifest._refs_match("v0.2.2", "0.2.3"))
 
+    def test_full_ref_normalization(self) -> None:
+        # The installer accepts full tag refs; drift must not treat a
+        # tag-pinned box as divergent (PR #89 review P1).
+        self.assertTrue(manifest._refs_match("refs/tags/v0.5.0", "0.5.0"))
+        self.assertTrue(manifest._refs_match("refs/tags/v0.5.0", "v0.5.0"))
+        self.assertTrue(manifest._refs_match("0.5.0", "refs/tags/v0.5.0"))
+        self.assertTrue(manifest._refs_match("refs/heads/main", "main"))
+        self.assertFalse(manifest._refs_match("refs/tags/v0.5.0", "0.5.1"))
+
+    def test_tag_pinned_plugin_is_in_sync(self) -> None:
+        """Codex review repro: creation spec ``refs/tags/v0.5.0`` +
+        installed marker/version ``0.5.0`` must NOT report drift."""
+        running = {
+            "runtime": dict(_RUNNING_VERSIONS["runtime"]),
+            "framework": dict(_RUNNING_VERSIONS["framework"]),
+            "plugin": {"version": "0.5.0", "sha": "abc1234abc1234abc1234abc1234abc1234abc12"},
+        }
+        with _ManifestEnvironment() as env:
+            env.write_runtime_env(plugin_ref="refs/tags/v0.5.0")
+            env.write_plugin_marker(
+                version="0.5.0",
+                sha="abc1234abc1234abc1234abc1234abc1234abc12",
+                ref="refs/tags/v0.5.0",
+            )
+            with patch.object(
+                supervisor, "collect_component_versions", return_value=running
+            ):
+                drift = supervisor.manifest_drift()
+        self.assertEqual(drift["components"]["plugin"]["verdict"], "in_sync")
+        self.assertIsNot(drift["drift_detected"], True)
+
+    def test_marker_repo_ref_matches_branch_shaped_desired_ref(self) -> None:
+        """A desired ref that is neither version- nor sha-shaped still
+        matches when the install marker records that exact ref."""
+        running = {
+            "plugin": {"version": "0.5.0", "sha": "abc1234abc1234abc1234abc1234abc1234abc12"},
+        }
+        with _ManifestEnvironment() as env:
+            env.write_runtime_env(plugin_ref="pin-branch")
+            env.write_plugin_marker(
+                version="0.5.0",
+                sha="abc1234abc1234abc1234abc1234abc1234abc12",
+                ref="pin-branch",
+            )
+            with patch.object(
+                supervisor, "collect_component_versions", return_value=running
+            ):
+                drift = supervisor.manifest_drift()
+        self.assertEqual(drift["components"]["plugin"]["verdict"], "in_sync")
+
 
 # ── snapshot unit ────────────────────────────────────────────────────
 

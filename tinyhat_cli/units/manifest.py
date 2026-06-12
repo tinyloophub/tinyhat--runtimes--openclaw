@@ -306,13 +306,20 @@ def read_creation_specs() -> dict[str, Any]:
 
 
 def _normalize_ref(value: Any) -> str:
-    """Comparison form for refs/versions: strip whitespace + leading ``v``.
+    """Comparison form for refs/versions.
 
-    Components report bare versions (``0.2.2``) while desired refs are
-    often the v-tagged release name (``v0.2.2``); comparing without
-    normalization yields false drift.
+    Strips whitespace, a full-ref prefix (``refs/tags/`` /
+    ``refs/heads/``), and a leading ``v``. Components report bare
+    versions (``0.2.2``) while desired refs come in tag shapes the
+    installer accepts — ``v0.2.2`` or the full ``refs/tags/v0.2.2`` —
+    and comparing without normalization renders a correctly tag-pinned
+    Computer as drifted.
     """
     text = str(value or "").strip()
+    for prefix in ("refs/tags/", "refs/heads/"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
     if text.lower().startswith("v") and any(ch.isdigit() for ch in text[1:2]):
         return text[1:]
     return text
@@ -456,7 +463,17 @@ def _component_drift_row(
     desired_ref: str | None,
     desired_origin: str | None,
     note: str | None = None,
+    extra_candidates: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
+    """One component verdict.
+
+    ``extra_candidates`` carries additional running-side identities the
+    desired ref may legitimately equal — for the plugin, the install
+    marker's ``repo_ref`` (the exact ref the installer was given), so a
+    box installed from the very ref its desired record names is
+    ``in_sync`` even when the ref shape matches neither the bare
+    version nor the SHA.
+    """
     row: dict[str, Any] = {
         "running_version": (running.get(component) or {}).get("version"),
         "running_sha": (running.get(component) or {}).get("sha"),
@@ -474,7 +491,9 @@ def _component_drift_row(
         row["verdict"] = "unknown"
         row["note"] = note or "running version could not be resolved on-box"
         return row
-    if _refs_match(desired_ref, row["running_version"], row["running_sha"]):
+    if _refs_match(
+        desired_ref, row["running_version"], row["running_sha"], *extra_candidates
+    ):
         row["verdict"] = "in_sync"
     else:
         row["verdict"] = "divergent"
@@ -493,6 +512,10 @@ def manifest_drift(*, now: int | None = None) -> dict[str, Any]:
     plugin_source = show["active_plugin_source"]
 
     components: dict[str, Any] = {}
+    # The install marker records the exact ref the installer was given;
+    # a desired ref equal to it (tag, branch, or sha shape) is in_sync
+    # by construction even when it matches neither version nor SHA.
+    marker = _sup()._read_installed_plugin_marker()
     components["plugin"] = _component_drift_row(
         "plugin",
         running,
@@ -504,6 +527,7 @@ def manifest_drift(*, now: int | None = None) -> dict[str, Any]:
             or (running.get("plugin") or {}).get("sha")
             else "plugin not installed yet (installed on first agent bind)"
         ),
+        extra_candidates=(marker.get("repo_ref"),),
     )
     for component in ("runtime", "framework"):
         acked = applied.get(component) if isinstance(applied, dict) else None
