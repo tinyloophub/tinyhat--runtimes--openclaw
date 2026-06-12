@@ -4930,6 +4930,94 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         )
         self.assertEqual(bodies[0]["user_code"], "RETR-YOKAY")
 
+    def test_completion_marker_in_final_drain_posts_linked(self) -> None:
+        """#92: the CLI prints the completion marker and exits while the
+        worker is still inside the `pending` POST, so the marker is only
+        ever seen in the post-exit drain read. The worker must classify
+        on that drained output and post `linked` — not fall through to
+        the disk-profile probe and misreport `failed`.
+
+        Deterministic forcing: the fake CLI gates the completion marker
+        on a flag file the fake `pending` post writes (so the marker is
+        never in the worker's first chunk), confirms via a second flag
+        that it has printed the marker and is exiting, and the post
+        holds the worker a grace period past that — so the
+        same-iteration liveness check meets a dead child whose marker
+        is still unread. On Linux (where CI runs) this fails without
+        the drain re-scan with
+        `['pending', 'failed'] != ['pending', 'linked']`; Darwin's PTY
+        scheduling typically keeps the child reapable only after the
+        next select cycle, so the alive path wins there and the test
+        passes either way (green, never flaky, on dev machines).
+        """
+        import time as _time_module
+
+        calls: list[tuple[str, dict]] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            go_flag_path = os.path.join(tmpdir, "go-flag")
+            done_flag_path = os.path.join(tmpdir, "done-flag")
+            script_path = os.path.join(tmpdir, "fake-openclaw")
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "printf 'URL: https://auth.openai.com/codex/device\\n'\n"
+                    "printf 'Code: DRAI-NRACE\\n'\n"
+                    "while [ ! -f \"$GO_FLAG_PATH\" ]; do sleep 0.02; done\n"
+                    "printf 'OpenAI device code complete\\n'\n"
+                    "touch \"$DONE_FLAG_PATH\"\n"
+                )
+            os.chmod(script_path, 0o755)
+
+            def _gating_pending_post(path: str, body: dict) -> dict:
+                calls.append((path, body))
+                if body.get("status") == "pending":
+                    # Release the CLI's completion marker, wait for the
+                    # script to confirm it has printed it and is
+                    # exiting, then a grace so the exit is reapable —
+                    # the worker must resume to a DEAD child whose
+                    # marker is still unread in the PTY buffer.
+                    with open(go_flag_path, "w", encoding="utf-8") as flag:
+                        flag.write("go")
+                    deadline = _time_module.monotonic() + 5.0
+                    while (
+                        not os.path.exists(done_flag_path)
+                        and _time_module.monotonic() < deadline
+                    ):
+                        _time_module.sleep(0.02)
+                    _time_module.sleep(0.3)
+                return {}
+
+            with (
+                patch.object(
+                    supervisor, "post_json", side_effect=_gating_pending_post
+                ),
+                patch.object(
+                    supervisor,
+                    "ensure_chatgpt_subscription_provider_available",
+                    return_value=True,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "GO_FLAG_PATH": go_flag_path,
+                        "DONE_FLAG_PATH": done_flag_path,
+                    },
+                    clear=False,
+                ),
+            ):
+                supervisor._run_chatgpt_device_code_login_in_thread(
+                    session_id="drain-race-test",
+                    openclaw_bin=script_path,
+                    url_emit_timeout_s=2.0,
+                    url_emit_retry_delay_s=0.0,
+                    overall_timeout_s=5.0,
+                )
+
+        self.assertEqual(
+            [body["status"] for _, body in calls], ["pending", "linked"]
+        )
+
     def test_url_emit_timeout_retries_before_reporting_failure(self) -> None:
         calls: list[tuple[str, dict]] = []
         with tempfile.TemporaryDirectory() as tmpdir:

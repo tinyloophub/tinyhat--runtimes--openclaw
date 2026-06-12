@@ -4206,6 +4206,12 @@ def _run_chatgpt_device_code_login_in_thread(
         stripped = _strip_ansi_for_cli_capture(buffer)[-400:]
         return stripped or "(empty)"
 
+    def _buffer_shows_completion() -> bool:
+        return "OpenAI device code complete" in buffer or any(
+            f"Auth profile: {prefix}" in buffer
+            for prefix in CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES
+        )
+
     try:
         while True:
             elapsed = _time.monotonic() - started_at
@@ -4319,13 +4325,7 @@ def _run_chatgpt_device_code_login_in_thread(
                                 user_code=code_value,
                             )
                             pending_reported = True
-                    if not terminal_posted and (
-                        "OpenAI device code complete" in buffer
-                        or any(
-                            f"Auth profile: {prefix}" in buffer
-                            for prefix in CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES
-                        )
-                    ):
+                    if not terminal_posted and _buffer_shows_completion():
                         log.info(
                             "subscription-link: detected device-code complete for "
                             "session_id=%s; posting linked",
@@ -4349,6 +4349,20 @@ def _run_chatgpt_device_code_login_in_thread(
                 # If we already posted linked we're done. Otherwise
                 # decide based on whether URL/code ever made it out:
                 if terminal_posted:
+                    break
+                if _buffer_shows_completion():
+                    # The drained tail can itself carry the completion
+                    # marker: a fast-exiting CLI prints it and dies
+                    # while this loop is busy (e.g. inside the pending
+                    # POST), so the marker is only ever seen here.
+                    # Classify on the output before the disk probe, or
+                    # a successful login is misreported as failed (#92).
+                    log.info(
+                        "subscription-link: completion marker found in "
+                        "drained CLI output; posting linked session_id=%s",
+                        session_id,
+                    )
+                    _post_linked()
                     break
                 if pending_reported:
                     # CLI exited after issuing URL/code but before we
