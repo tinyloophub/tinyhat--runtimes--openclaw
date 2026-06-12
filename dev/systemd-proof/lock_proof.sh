@@ -43,7 +43,7 @@ clean_slate() {
 cmd_case1() {
   clean_slate
   say "C1 daemon-vs-human deferral"
-  helper hold --holder cli --seconds 6 --command "gateway restart" >/tmp/c1-holder.log 2>&1 &
+  "${HELPER[@]}" hold --holder cli --seconds 6 --command "gateway restart" >/tmp/c1-holder.log 2>&1 &
   local holder_pid=$!
   sleep 1
   local probe
@@ -103,7 +103,7 @@ cmd_case2() {
 cmd_case3() {
   clean_slate
   say "C3 deadline kill + timed_out + clean release"
-  helper run-op --child-sleep 300 --timeout 3 --command "gateway restart" >/tmp/c3-op.log 2>&1 &
+  "${HELPER[@]}" run-op --child-sleep 300 --timeout 3 --command "gateway restart" >/tmp/c3-op.log 2>&1 &
   local op_pid=$!
   sleep 1
   local probe child_pgid
@@ -143,7 +143,7 @@ cmd_case4() {
 cmd_case5() {
   clean_slate
   say "C5 hard-crash stale recovery"
-  helper hold --holder cli --seconds 300 --command "gateway restart" >/tmp/c5-holder.log 2>&1 &
+  "${HELPER[@]}" hold --holder cli --seconds 300 --command "gateway restart" >/tmp/c5-holder.log 2>&1 &
   local holder_pid=$!
   sleep 1.5
   kill -9 "${holder_pid}"; wait "${holder_pid}" 2>/dev/null || true
@@ -161,7 +161,7 @@ cmd_case5() {
 cmd_case6() {
   clean_slate
   say "C6 contender blocked while the mutation child outlives its runner"
-  helper hold --holder cli --seconds 300 --child-sleep 8 \
+  "${HELPER[@]}" hold --holder cli --seconds 300 --child-sleep 8 \
     --command "gateway restart" >/tmp/c6-holder.log 2>&1 &
   local holder_pid=$!
   sleep 1.5
@@ -195,7 +195,7 @@ cmd_case7() {
   rm -f "${READY_FILE}"
   systemctl reset-failed "${GW_UNIT}" 2>/dev/null || true
   systemctl restart "${GW_UNIT}"
-  helper gateway-restart --holder cli >/tmp/c7-victim.log 2>&1 &
+  "${HELPER[@]}" gateway-restart --holder cli >/tmp/c7-victim.log 2>&1 &
   local victim_pid=$!
   local phase=""
   for _ in $(seq 1 30); do
