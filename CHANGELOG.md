@@ -7,6 +7,15 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.3
+
+### Fixed
+
+- Repair the Tinyhat platform-plugin checkout ownership before the first
+  `git -C` update command. This prevents upgraded cloud Computers from
+  tripping Git's `safe.directory` guard on a root-owned checkout during
+  the post-subscription restart path.
+
 ## 0.12.2
 
 ### Fixed

@@ -1345,6 +1345,10 @@ def ensure_tinyhat_plugin_installed(
     repo_ref = (repo_ref or configured_ref).strip()
     plugin_dir = tinyhat_plugin_checkout_dir()
     _prepare_runtime_owned_dir(os.path.dirname(plugin_dir))
+    # Machines upgraded from pre-isolation builds can already have a
+    # root-owned checkout. Repair before the first `git -C` call so
+    # Git's safe.directory guard does not reject the repo.
+    _sync_tinyhat_plugin_runtime_ownership()
     if os.path.isdir(os.path.join(plugin_dir, ".git")):
         remote = subprocess.run(
             ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],

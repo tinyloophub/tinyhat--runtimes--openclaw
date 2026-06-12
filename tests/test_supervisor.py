@@ -7656,6 +7656,92 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                 repaired,
             )
 
+    def test_existing_checkout_repairs_ownership_before_git_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_url = "https://example.com/tinyhat.git"
+            repo_ref = "refs/tags/v0.5.0"
+            plugin_dir = os.path.join(tmpdir, "platform-plugins", "tinyhat")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            with open(
+                os.path.join(plugin_dir, "openclaw.plugin.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(plugin_dir, "package.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"version": "0.5.0"}, fh)
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+            }
+            chowned: list[tuple[str, int, int]] = []
+
+            def fake_chown(path, uid, gid):
+                chowned.append((path, uid, gid))
+
+            def chowned_paths() -> set[str]:
+                return {path for path, _uid, _gid in chowned}
+
+            def fake_run(cmd, **kwargs):
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "remote",
+                    "set-url",
+                    "origin",
+                    repo_url,
+                ]:
+                    self.assertIn(os.path.dirname(plugin_dir), chowned_paths())
+                    self.assertIn(os.path.join(plugin_dir, ".git"), chowned_paths())
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "fetch",
+                    "--tags",
+                    "--prune",
+                    "origin",
+                ]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0, stdout="abc123def4567890\n", stderr=""
+                    )
+                if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    ext_dir = os.path.join(tmpdir, "extensions", "tinyhat")
+                    os.makedirs(ext_dir, exist_ok=True)
+                    with open(
+                        os.path.join(ext_dir, "openclaw.plugin.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fh:
+                        json.dump({"id": "tinyhat"}, fh)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+                ),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "lchown", side_effect=fake_chown),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
     def test_no_runtime_user_keeps_current_behaviour(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             chowned: list[tuple[str, int, int]] = []
