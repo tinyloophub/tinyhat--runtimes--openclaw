@@ -7,6 +7,20 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.5
+
+### Changed
+
+- Change the supervisor's defensive OpenRouter fallback from Kimi K2.6 to
+  DeepSeek V4 Pro. New Computers normally receive an explicit platform model
+  package from the backend, but older or malformed bindings should fall back to
+  the same concrete agentic default instead of continuing on Kimi.
+- After a ChatGPT/Codex subscription config restart, run
+  `openclaw models status --json` and report the observed default model back to
+  Tinyhat. The platform now sends the final "ChatGPT/Codex is ready" message
+  only after that OpenClaw command proves the model resolved to
+  `openai/gpt-5.5`.
+
 ## 0.12.4
 
 ### Fixed
