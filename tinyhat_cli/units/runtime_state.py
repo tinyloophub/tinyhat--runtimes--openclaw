@@ -21,9 +21,14 @@ New in the extraction (v0.12.0 M1):
   lines first, then the ``commands`` ring tail, then
   ``capabilities.missing`` (setting ``missing_truncated``). The local
   state file keeps full fidelity; only the POST is budgeted.
-- :func:`plugin_demotion` — the healthy-demotion rule factored out so
-  the daemon's write path and ``tinyhat health``'s live re-check apply
-  the identical projection.
+- :func:`capability_demotion` — the healthy-demotion rule factored out
+  so the daemon's write path and ``tinyhat health``'s live re-check
+  apply the identical projection. v0.12.0 M3 extends it beyond the
+  load beacon: a declared-vs-registered capability shortfall or a
+  framework outside the plugin's declared supported range also demotes
+  ``healthy`` (``degraded_workload`` + ``plugin_not_loaded`` /
+  ``capability_shortfall``; framework violations report
+  ``unsupported_openclaw_version`` — no new primary enum value).
 - :func:`lifecycle_block` — coarse boot lifecycle spans (rider).
 """
 
@@ -41,6 +46,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 from tinyhat_cli.units import command_spool
+
+UNIT_CATEGORY = "diagnostics"
 
 log = logging.getLogger("tinyhat-supervisor")
 
@@ -563,21 +570,70 @@ def _runtime_state_last_error(
     }
 
 
-def plugin_demotion(
+def capability_demotion(
     runtime_health: str,
     plugin_check: dict[str, Any] | None,
-) -> bool:
+    capabilities: dict[str, Any] | None = None,
+    framework: dict[str, Any] | None = None,
+) -> tuple[str, str | None, str] | None:
     """The shared healthy-demotion rule (daemon write path + ``tinyhat health``).
 
-    An enabled plugin that never loaded must not let the runtime report
-    ``healthy``. Only ever demotes ``healthy`` — every other state
-    already carries a stronger signal.
+    An enabled plugin that never loaded, loaded short of its declared
+    manifest, or runs under a framework outside its declared supported
+    range must not let the runtime report ``healthy``. Only ever
+    demotes ``healthy`` — every other state already carries a stronger
+    signal. Returns ``(runtime_health, last_error_category, detail)``
+    or ``None``; no new primary enum value (v0.12.0 §7):
+
+    - framework out of declared range → ``unsupported_openclaw_version``
+      (the value finally means what it says; category matches);
+    - plugin not loaded (no fresh beacon) or declared capabilities not
+      registered at all → ``degraded_workload`` + ``plugin_not_loaded``;
+    - partial capability shortfall → ``degraded_workload`` +
+      ``capability_shortfall``.
     """
-    return (
-        runtime_health == "healthy"
-        and isinstance(plugin_check, dict)
-        and plugin_check.get("load_check") == "not_loaded"
-    )
+    if runtime_health != "healthy":
+        return None
+    if isinstance(framework, dict) and framework.get("framework_in_range") is False:
+        installed = framework.get("framework_installed") or "unknown"
+        minimum = framework.get("framework_minimum") or "?"
+        maximum = framework.get("framework_maximum")
+        bound = f">= {minimum}" + (f" <= {maximum}" if maximum else "")
+        return (
+            "unsupported_openclaw_version",
+            "unsupported_openclaw_version",
+            f"installed OpenClaw {installed} is outside the tinyhat plugin's "
+            f"declared supported range ({bound})",
+        )
+    if isinstance(plugin_check, dict) and plugin_check.get("load_check") == "not_loaded":
+        return (
+            "degraded_workload",
+            "plugin_not_loaded",
+            "tinyhat plugin enabled but not loaded (no fresh load beacon)",
+        )
+    if isinstance(capabilities, dict) and capabilities.get("status") == "shortfall":
+        declared = capabilities.get("declared_tools") or 0
+        registered = capabilities.get("registered_tools") or 0
+        missing = capabilities.get("missing") or []
+        skills_only = bool(missing) and all(
+            str(name).startswith("skill:") for name in missing
+        )
+        if declared > 0 and registered == 0 and not skills_only:
+            return (
+                "degraded_workload",
+                "plugin_not_loaded",
+                "tinyhat plugin declared capabilities are not registered "
+                f"(0 of {declared} tools)",
+            )
+        mounted = capabilities.get("mounted_skills") or 0
+        declared_skills = capabilities.get("declared_skills") or 0
+        return (
+            "degraded_workload",
+            "capability_shortfall",
+            "tinyhat plugin capabilities fall short of the declared manifest "
+            f"({registered}/{declared} tools, {mounted}/{declared_skills} skills)",
+        )
+    return None
 
 
 def lifecycle_block(marks: dict[str, int] | None) -> dict[str, Any] | None:
@@ -863,9 +919,11 @@ def _write_runtime_state(
             gateway_recovery,
             gateway_cgroup,
         )
-    # Plugin load detection: an enabled plugin that never loaded
-    # must not let the runtime report healthy. Only ever demotes
-    # `healthy` — every other state already carries a stronger signal.
+    # Capability contract: an enabled plugin that never loaded, loaded
+    # short of its declared manifest, or runs under an unsupported
+    # framework must not let the runtime report healthy. Only ever
+    # demotes `healthy` — every other state already carries a stronger
+    # signal.
     effective_gateway_active = gateway_active
     if effective_gateway_active is None:
         existing_gateway = existing_state.get("gateway")
@@ -879,14 +937,22 @@ def _write_runtime_state(
         gateway_active=effective_gateway_active,
         now=now,
     )
-    if sup.plugin_demotion(runtime_health, plugin_check):
-        runtime_health = "unsupported_openclaw_version"
-        safe_detail = sup._sanitize_runtime_state_text(
-            f"{detail}; tinyhat plugin enabled but not loaded "
-            "(no fresh load beacon)"
-        )
-        if not safe_last_error_category:
-            safe_last_error_category = "plugin_not_loaded"
+    capabilities, framework_compat = sup.capability_verification_cached(now=now)
+    demotion = sup.capability_demotion(
+        runtime_health,
+        plugin_check,
+        capabilities,
+        framework_compat,
+    )
+    if demotion is not None:
+        demoted_health, demoted_category, demotion_detail = demotion
+        runtime_health = demoted_health
+        safe_detail = sup._sanitize_runtime_state_text(f"{detail}; {demotion_detail}")
+        if not safe_last_error_category and demoted_category:
+            safe_last_error_category = sup._sanitize_runtime_state_text(
+                demoted_category,
+                limit=sup.RUNTIME_STATE_ERROR_CATEGORY_MAX_LENGTH,
+            )
     runtime_version = ""
     try:
         runtime_version = sup._read_runtime_repo_version()
@@ -967,7 +1033,11 @@ def _write_runtime_state(
     if openclaw_ready is not None:
         payload["openclaw"]["ready"] = bool(openclaw_ready)
     if plugin_check:
+        if framework_compat:
+            plugin_check = {**plugin_check, **framework_compat}
         payload["plugin"] = plugin_check
+    if capabilities:
+        payload["capabilities"] = capabilities
     if config_fingerprint:
         payload["config_fingerprint"] = dict(config_fingerprint)
     if safe_last_error_category:

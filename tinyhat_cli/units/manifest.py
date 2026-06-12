@@ -34,6 +34,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "release-update-lifecycle"
+
 log = logging.getLogger("tinyhat-supervisor")
 
 # Keys bootstrap.sh writes into /etc/tinyhat/runtime.env. Unknown keys

@@ -30,6 +30,8 @@ from typing import Any, Callable
 from tinyhat_cli._facade import supervisor_module as _sup
 from tinyhat_cli.units import command_lock, command_spool
 
+UNIT_CATEGORY = "supervision"
+
 log = logging.getLogger("tinyhat-supervisor")
 
 GATEWAY_RESTART_COMMAND = "gateway restart"
@@ -136,6 +138,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
             if ok:
                 log.info("OpenClaw gateway readiness probe succeeded")
                 sup._mark_lifecycle("gateway_ready_at_unix")
+                sup.note_gateway_ready()
                 return
             if sup._is_openclaw_gateway_startup_failure(detail):
                 raise RuntimeError("openclaw gateway failed to start: " + detail)
@@ -152,6 +155,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
         if ok:
             log.info("OpenClaw gateway readiness probe succeeded")
             sup._mark_lifecycle("gateway_ready_at_unix")
+            sup.note_gateway_ready()
             return
         if sup._is_openclaw_gateway_startup_failure(detail):
             raise RuntimeError("openclaw gateway failed to start: " + detail)

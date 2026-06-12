@@ -9,6 +9,32 @@ runtime's published `VERSION` on each new Computer row.
 
 ### Added
 
+- Declared-vs-registered capability verification: after gateway start the
+  runtime compares the installed plugin's declared manifest
+  (`contracts.tools` / `contracts.skills` / `contracts.framework`) against
+  the framework registry (`openclaw plugins inspect` — used only when it
+  exposes positive tool-level data; proven live on a bound canary, the
+  2026.6.6 CLI-side derived registry can omit a config-enabled,
+  gateway-loaded install-dir plugin entirely) or the plugin's load beacon
+  (`self_check`, never inventing missing names; plugin generations that
+  predate the beacon report `unverifiable` instead of false shortfalls). The verdict ships
+  as the additive `capabilities` block of `runtime_state_v1`
+  (`{declared_tools, registered_tools, declared_skills, mounted_skills,
+  missing: [<=10 names], missing_truncated, checked_at_unix, mechanism,
+  status: ok|shortfall|unverifiable}`), is re-checked after every gateway
+  start (TTL-cached on the daemon write path), and renders in
+  `tinyhat status` / `tinyhat health` (live re-check).
+- Framework supported-range check: a plugin-declared
+  `contracts.framework` range outside the installed OpenClaw version
+  demotes `healthy` to `unsupported_openclaw_version` — the value now
+  means what it says.
+- Unit-category allowlist guard: every module under `tinyhat_cli/units/`
+  declares `UNIT_CATEGORY` from the closed seven-category mechanism set
+  (identity / apply / supervision / recovery / framework-compatibility /
+  diagnostics / release-update-lifecycle); CI rejects uncategorized or
+  product-categorized units (with a deliberate red fixture proving the
+  guard can fail).
+
 - Global command lock for mutating commands: `flock(LOCK_EX)` on a stable
   root-owned mutex fd, deliberately inherited by mutation subprocess trees
   (own process group, recorded `child_pgid`), with a `command_lock_v1`
@@ -30,6 +56,16 @@ runtime's published `VERSION` on each new Computer row.
   human holds the lock instead of racing it.
 - `dev/systemd-proof/lock_proof.sh` — the seven live lock-concurrency
   proof cases against real systemd.
+
+### Changed
+
+- Plugin-not-loaded health mapping: an enabled plugin with no fresh load
+  beacon (and a plugin whose declared capabilities register as zero) now
+  demotes `healthy` to `degraded_workload` with
+  `last_error_category=plugin_not_loaded`; a partial shortfall reports
+  `capability_shortfall`. The previous demotion target
+  `unsupported_openclaw_version` was wrong copy and is reserved for true
+  framework-range violations.
 
 ### Fixed
 

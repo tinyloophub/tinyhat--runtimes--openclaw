@@ -15,6 +15,8 @@ from typing import Any
 
 from tinyhat_cli._facade import supervisor_module as _sup
 
+UNIT_CATEGORY = "diagnostics"
+
 
 def run(ctx) -> dict[str, Any]:
     sup = _sup()
@@ -40,8 +42,21 @@ def run(ctx) -> dict[str, Any]:
     except Exception:
         plugin_check = None
 
-    demoted = sup.plugin_demotion(base_health, plugin_check)
-    effective_health = "unsupported_openclaw_version" if demoted else base_health
+    try:
+        capabilities, framework_compat = sup.capability_verification(now=now)
+    except Exception:
+        capabilities, framework_compat = None, None
+
+    demotion = sup.capability_demotion(
+        base_health,
+        plugin_check,
+        capabilities,
+        framework_compat,
+    )
+    demoted = demotion is not None
+    effective_health = demotion[0] if demotion is not None else base_health
+    demotion_category = demotion[1] if demotion is not None else None
+    demotion_detail = demotion[2] if demotion is not None else None
 
     openclaw_state = state.get("openclaw") if isinstance(state.get("openclaw"), dict) else {}
     openclaw_ready = openclaw_state.get("ready")
@@ -70,9 +85,12 @@ def run(ctx) -> dict[str, Any]:
             openclaw_ready if isinstance(openclaw_ready, bool) else None
         ),
         "plugin_check": plugin_check,
+        "capabilities": capabilities,
+        "framework_compat": framework_compat,
+        "demotion_detail": demotion_detail,
         "last_error": state.get("last_error"),
         "last_error_category": state.get("last_error_category")
-        or ("plugin_not_loaded" if demoted else None),
+        or demotion_category,
         "manual_recovery_required": state.get("manual_recovery_required"),
         "gateway_recovery": {
             "failures_in_window": sup._gateway_restart_count_window(recovery, now=now),
@@ -90,8 +108,8 @@ def render(data: dict[str, Any]) -> list[str]:
     if data.get("demoted_by_live_check"):
         lines.append(
             "  (demoted live: state file said "
-            f"{data.get('runtime_health_from_state')!r} but the enabled plugin "
-            "has no fresh load beacon)"
+            f"{data.get('runtime_health_from_state')!r} — "
+            f"{data.get('demotion_detail') or 'capability check failed'})"
         )
     elif data.get("runtime_health_from_state") not in (None, health):
         lines.append(f"  (state file said: {data.get('runtime_health_from_state')})")
@@ -115,6 +133,31 @@ def render(data: dict[str, Any]) -> list[str]:
         )
     else:
         lines.append("plugin:          (not installed — nothing to check)")
+    capabilities = data.get("capabilities") or {}
+    if capabilities:
+        lines.append(
+            f"capabilities:    {capabilities.get('status')} "
+            f"[{capabilities.get('mechanism')}] "
+            f"tools {capabilities.get('registered_tools')}/{capabilities.get('declared_tools')} "
+            f"skills {capabilities.get('mounted_skills')}/{capabilities.get('declared_skills')}"
+            " (live check)"
+        )
+        missing = capabilities.get("missing") or []
+        if missing:
+            suffix = " …" if capabilities.get("missing_truncated") else ""
+            lines.append(f"  missing:       {', '.join(missing)}{suffix}")
+    framework_compat = data.get("framework_compat") or {}
+    if framework_compat.get("framework_in_range") is False:
+        lines.append(
+            f"framework:       {framework_compat.get('framework_installed')} is OUTSIDE "
+            f"the plugin's supported range (>= {framework_compat.get('framework_minimum')}"
+            + (
+                f" <= {framework_compat.get('framework_maximum')}"
+                if framework_compat.get("framework_maximum")
+                else ""
+            )
+            + ")"
+        )
     recovery = data.get("gateway_recovery") or {}
     lines.append(
         f"recovery:        failures-in-window={recovery.get('failures_in_window')} "

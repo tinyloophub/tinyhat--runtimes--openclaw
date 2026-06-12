@@ -79,6 +79,44 @@ def _openclaw_plugin_from_inspect_payload(plugin_id: str, payload) -> dict | Non
     return plugin
 
 
+def openclaw_plugin_registry_entry(plugin_id: str) -> tuple[dict | None, str | None]:
+    """The framework registry's view of one plugin, with an honest miss reason.
+
+    Unlike :func:`_inspect_openclaw_plugin` (the install-time gate, which
+    collapses every failure to ``None``), the capability verification must
+    distinguish *the registry answered "not registered"* (a real shortfall
+    signal) from *the registry could not be asked* (fall back to the
+    self-check mechanism instead of inventing a verdict).
+
+    Returns ``(entry, None)`` on success, ``(None, "not_registered")``
+    when OpenClaw answers but the plugin is absent/unparseable, and
+    ``(None, "cli_unavailable")`` when the CLI cannot be executed.
+    """
+    sup = _sup()
+    try:
+        result = subprocess.run(
+            ["openclaw", "plugins", "inspect", plugin_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=sup._openclaw_cli_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("openclaw registry inspect unavailable for %s: %s", plugin_id, exc)
+        return None, "cli_unavailable"
+    if result.returncode != 0:
+        return None, "not_registered"
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None, "not_registered"
+    plugin = sup._openclaw_plugin_from_inspect_payload(plugin_id, payload)
+    if plugin is None:
+        return None, "not_registered"
+    return plugin, None
+
+
 def _inspect_openclaw_plugin(plugin_id: str) -> dict | None:
     """Return OpenClaw's plugin-registry entry, or None when missing/broken."""
     sup = _sup()

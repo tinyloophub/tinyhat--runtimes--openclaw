@@ -33,6 +33,8 @@ from typing import Any
 from tinyhat_cli._facade import supervisor_module as _sup
 from tinyhat_cli.units.redaction import sanitize_json_tree
 
+UNIT_CATEGORY = "diagnostics"
+
 log = logging.getLogger("tinyhat-supervisor")
 
 COMMAND_SPOOL_SCHEMA = "command_result_spool_v1"
