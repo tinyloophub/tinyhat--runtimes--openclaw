@@ -7,6 +7,70 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.5
+
+### Changed
+
+- Change the supervisor's defensive OpenRouter fallback from Kimi K2.6 to
+  DeepSeek V4 Pro. New Computers normally receive an explicit platform model
+  package from the backend, but older or malformed bindings should fall back to
+  the same concrete agentic default instead of continuing on Kimi.
+- After a ChatGPT/Codex subscription config restart, run
+  `openclaw models status --json` and report the observed default model back to
+  Tinyhat. The platform now sends the final "ChatGPT/Codex is ready" message
+  only after that OpenClaw command proves the model resolved to
+  `openai/gpt-5.5`.
+
+## 0.12.4
+
+### Fixed
+
+- Run Tinyhat platform-plugin Git/update/install subprocesses as the
+  OpenClaw runtime user after repairing checkout ownership. This fixes
+  upgraded cloud Computers where the post-subscription restart still
+  tripped Git's `safe.directory` guard because root was running `git -C`
+  against a checkout already handed to the gateway user.
+
+## 0.12.3
+
+### Fixed
+
+- Repair the Tinyhat platform-plugin checkout ownership before the first
+  `git -C` update command. This prevents upgraded cloud Computers from
+  tripping Git's `safe.directory` guard on a root-owned checkout during
+  the post-subscription restart path.
+
+## 0.12.2
+
+### Fixed
+
+- Run the ChatGPT/Codex device-code auth CLI as the same unprivileged
+  runtime user as the OpenClaw gateway, and repair the per-agent auth
+  store ownership before auth/config reads. This fixes cloud Computers
+  where OAuth completed but the restarted gateway could not open
+  `openclaw-agent.sqlite` because the supervisor-created SQLite store
+  was root-owned.
+
+## 0.12.1
+
+### Fixed
+
+- Read and wipe ChatGPT/Codex subscription auth profiles from OpenClaw
+  2026.6.6's SQLite auth store in addition to the legacy
+  `auth-profiles.json` store. This fixes completed subscription links
+  that reported success but kept the Computer on the OpenRouter/Kimi
+  platform-credit route because the supervisor could not see the new
+  SQLite profile.
+- Use Kimi K2.6 as the supervisor's defensive OpenRouter default when a
+  keyed binding omits the explicit model field.
+
+## 0.12.0
+
+This release is the first public stable-runtime artifact for Tinyhat's
+verified v0.11.0 runtime work and the v0.12.0 on-box `tinyhat` CLI +
+capability-contract release. It pairs with Tinyhat plugin `v0.5.0` and the
+Tinyloop monorepo `v0.12.0` release cut.
+
 ### Added
 
 - Declared-vs-registered capability verification: after gateway start the

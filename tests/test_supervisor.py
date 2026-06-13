@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -253,6 +254,22 @@ class OpenRouterModelPackageTests(unittest.TestCase):
         self.assertEqual(
             config["agents"]["defaults"]["compaction"],
             {"reserveTokensFloor": 20000},
+        )
+
+    def test_missing_binding_model_uses_agentic_openrouter_default(self) -> None:
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_token": "123456:ABC",
+            "telegram_bot_username": "Tinychattestbot",
+            "openrouter_api_key": "sk-or-v1-child",
+            "openrouter_base_url": "https://openrouter.ai/api/v1",
+        }
+
+        config = _write_config_in_temp_runtime(binding)
+
+        self.assertEqual(
+            config["agents"]["defaults"]["model"],
+            {"primary": "openrouter/deepseek/deepseek-v4-pro"},
         )
 
     def test_no_credit_package_stays_on_free_demo_model(self) -> None:
@@ -3610,6 +3627,105 @@ class RuntimeOwnershipTests(unittest.TestCase):
             chown.assert_not_called()
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
+    def test_auth_store_ownership_repairs_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"TINYHAT_DEV_RUNTIME": "1", "TINYHAT_RUNTIME_HOME": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                auth_dir = supervisor.openclaw_agent_state_dir()
+                os.makedirs(auth_dir, exist_ok=True)
+                sqlite_path = supervisor.openclaw_auth_sqlite_path()
+                touched = [
+                    sqlite_path,
+                    f"{sqlite_path}-wal",
+                    f"{sqlite_path}-shm",
+                    supervisor.openclaw_auth_profiles_path(),
+                ]
+                for path in touched:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write("{}")
+
+                chowned_dirs: list[tuple[str, int, int]] = []
+                lchowned_files: list[tuple[str, int, int]] = []
+
+                with (
+                    patch.object(
+                        supervisor,
+                        "_runtime_ownership_ids",
+                        return_value=(123, 456),
+                    ),
+                    patch.object(
+                        supervisor.os,
+                        "chown",
+                        side_effect=lambda p, u, g: chowned_dirs.append((p, u, g)),
+                    ),
+                    patch.object(
+                        supervisor.os,
+                        "lchown",
+                        side_effect=lambda p, u, g: lchowned_files.append(
+                            (p, u, g)
+                        ),
+                    ),
+                ):
+                    supervisor._prepare_openclaw_agent_auth_store_ownership()
+
+                self.assertIn((tmpdir, 123, 456), chowned_dirs)
+                self.assertIn((os.path.join(tmpdir, "agents"), 123, 456), chowned_dirs)
+                self.assertIn(
+                    (os.path.join(tmpdir, "agents", "main"), 123, 456),
+                    chowned_dirs,
+                )
+                self.assertIn((auth_dir, 123, 456), chowned_dirs)
+                for path in touched:
+                    self.assertIn((path, 123, 456), lchowned_files)
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_drop_to_runtime_user_for_exec_uses_gateway_uid_gid(self) -> None:
+        calls: list[tuple[str, object]] = []
+        with (
+            patch.object(
+                supervisor,
+                "_runtime_ownership_ids",
+                return_value=(123, 456),
+            ),
+            patch.object(
+                supervisor.os,
+                "setgroups",
+                side_effect=lambda groups: calls.append(("setgroups", groups)),
+                create=True,
+            ),
+            patch.object(
+                supervisor.os,
+                "setgid",
+                side_effect=lambda gid: calls.append(("setgid", gid)),
+            ),
+            patch.object(
+                supervisor.os,
+                "setuid",
+                side_effect=lambda uid: calls.append(("setuid", uid)),
+            ),
+        ):
+            supervisor._drop_to_runtime_user_for_exec()
+
+        self.assertEqual(
+            calls,
+            [
+                ("setgroups", []),
+                ("setgid", 456),
+                ("setuid", 123),
+            ],
+        )
+
+    def test_drop_to_runtime_user_for_exec_noops_without_runtime_user(self) -> None:
+        with (
+            patch.object(supervisor, "_runtime_ownership_ids", return_value=None),
+            patch.object(supervisor.os, "setgid") as setgid,
+            patch.object(supervisor.os, "setuid") as setuid,
+        ):
+            supervisor._drop_to_runtime_user_for_exec()
+
+        setgid.assert_not_called()
+        setuid.assert_not_called()
+
 
 def _subscription_binding(*, with_openrouter: bool) -> dict:
     """Binding for a Computer opted into the ChatGPT BYO subscription."""
@@ -3654,6 +3770,76 @@ def _seed_auth_profile(state_dir: str) -> None:
             },
             fh,
         )
+
+
+def _seed_sqlite_auth_profile(state_dir: str) -> None:
+    """Drop an OpenClaw 2026.6.6 SQLite subscription profile."""
+    path = os.path.join(
+        state_dir, "agents", "main", "agent", "openclaw-agent.sqlite"
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    profiles = {
+        "openai:owner@example.com": {
+            "type": "oauth",
+            "provider": "openai",
+            "access": "redacted-access",
+            "refresh": "redacted-refresh",
+            "expires": 9999999999999,
+            "email": "owner@example.com",
+            "accountId": "acct-redacted",
+        }
+    }
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE auth_profile_store (
+              store_key TEXT NOT NULL PRIMARY KEY,
+              store_json TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE auth_profile_state (
+              state_key TEXT NOT NULL PRIMARY KEY,
+              state_json TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO auth_profile_store (store_key, store_json, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "primary",
+                json.dumps({"version": 1, "profiles": profiles}),
+                0,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_sqlite_auth_profiles(state_dir: str) -> dict:
+    path = os.path.join(
+        state_dir, "agents", "main", "agent", "openclaw-agent.sqlite"
+    )
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    store = json.loads(row[0])
+    return store["profiles"]
 
 
 def _seed_legacy_auth_profile(state_dir: str) -> None:
@@ -4025,6 +4211,88 @@ class BindingCycleManualRecoveryTests(unittest.TestCase):
 class ChatgptSubscriptionBranchTests(unittest.TestCase):
     """Issue #23 — supervisor branches on auth-profile presence."""
 
+    def test_subscription_runtime_verification_reports_openai_model(self) -> None:
+        posts: list[tuple[str, dict]] = []
+
+        def fake_run(cmd, **kwargs):
+            self.assertEqual(cmd, ["openclaw", "models", "status", "--json"])
+            self.assertIn("OPENCLAW_CONFIG_PATH", kwargs["env"])
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "defaultModel": "openai/gpt-5.5",
+                        "resolvedDefault": "openai/gpt-5.5",
+                    }
+                ),
+                stderr="",
+            )
+
+        def fake_post(path: str, body: dict) -> dict:
+            posts.append((path, body))
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(supervisor, "post_json", side_effect=fake_post),
+            ):
+                supervisor._report_subscription_runtime_verification(
+                    {
+                        "llm_auth_mode": "chatgpt_subscription",
+                        "llm_model_ref": "openai/gpt-5.5",
+                    }
+                )
+
+        self.assertEqual(
+            posts,
+            [
+                (
+                    "/hapi/v1/computers/me/subscription-link/runtime-verification",
+                    {
+                        "expected_model_ref": "openai/gpt-5.5",
+                        "observed_model_ref": "openai/gpt-5.5",
+                        "command": "openclaw models status --json",
+                        "verified": True,
+                    },
+                )
+            ],
+        )
+
+    def test_subscription_runtime_verification_reports_model_mismatch(self) -> None:
+        posts: list[tuple[str, dict]] = []
+
+        def fake_run(cmd, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"resolvedDefault": "openrouter/deepseek/v4"}),
+                stderr="",
+            )
+
+        with (
+            patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda p, b: posts.append((p, b)) or {},
+            ),
+        ):
+            supervisor._report_subscription_runtime_verification(
+                {
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                }
+            )
+
+        self.assertEqual(len(posts), 1)
+        self.assertFalse(posts[0][1]["verified"])
+        self.assertEqual(posts[0][1]["observed_model_ref"], "openrouter/deepseek/v4")
+
     def test_opted_in_with_profile_writes_subscription_config(self) -> None:
         """auth-profile present + llm_auth_mode=chatgpt_subscription on
         binding → openai/gpt-5.5, no provider runtime pin for OpenAI,
@@ -4159,6 +4427,54 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 "openai": "openai:owner@example.com",
                 "provider": "openai",
                 "profileId": "openai:owner@example.com",
+            },
+        )
+
+    def test_sqlite_profile_writes_subscription_config(self) -> None:
+        """OpenClaw 2026.6.6 stores device-code auth in SQLite.
+
+        A completed link must flip the Computer away from the OpenRouter
+        default; otherwise the user sees "ChatGPT/Codex sign-in is complete"
+        while the runtime keeps serving platform credits.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
+                self.assertEqual(
+                    supervisor.read_chatgpt_subscription_profile()[
+                        "__profile_id"
+                    ],
+                    "openai:owner@example.com",
+                )
+                supervisor.write_openclaw_config(
+                    _subscription_binding(with_openrouter=True),
+                )
+                config_path = supervisor.openclaw_config_path()
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        defaults = config["agents"]["defaults"]
+        self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
+        self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
+        self.assertEqual(
+            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
+        )
+        self.assertEqual(
+            config["auth"],
+            {
+                "profiles": {
+                    "openai:owner@example.com": {
+                        "provider": "openai",
+                        "mode": "oauth",
+                        "email": "owner@example.com",
+                    },
+                },
+                "order": {"openai": ["openai:owner@example.com"]},
             },
         )
 
@@ -4367,6 +4683,48 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
 
 class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
     """Issue #23 — admin-driven wipe of the per-agent OAuth credential."""
+
+    def test_wipe_removes_sqlite_openai_profile_and_preserves_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                state_dir = supervisor.openclaw_state_dir()
+                _seed_sqlite_auth_profile(state_dir)
+                profiles = _read_sqlite_auth_profiles(state_dir)
+                profiles["xai:other@example.com"] = {
+                    "type": "oauth",
+                    "provider": "xai",
+                    "access": "x-redacted",
+                }
+                path = supervisor.openclaw_auth_sqlite_path()
+                conn = sqlite3.connect(path)
+                try:
+                    conn.execute(
+                        """
+                        UPDATE auth_profile_store
+                        SET store_json = ?, updated_at = ?
+                        WHERE store_key = ?
+                        """,
+                        (
+                            json.dumps({"version": 1, "profiles": profiles}),
+                            1,
+                            "primary",
+                        ),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                removed = supervisor.wipe_chatgpt_subscription_profile()
+                self.assertEqual(removed, ["openai:owner@example.com"])
+
+                after = _read_sqlite_auth_profiles(state_dir)
+                self.assertNotIn("openai:owner@example.com", after)
+                self.assertIn("xai:other@example.com", after)
+                self.assertEqual(supervisor.wipe_chatgpt_subscription_profile(), [])
 
     def test_wipe_removes_current_openai_profile_and_preserves_others(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5105,6 +5463,38 @@ class DeviceCodeWorkerQuickExitTests(unittest.TestCase):
         path, body = calls[0]
         self.assertEqual(body["status"], "failed")
         self.assertIn("pseudo-terminal", body["error"])
+
+    def test_pty_child_drops_to_runtime_user_before_exec(self) -> None:
+        import pty as pty_mod
+
+        with (
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                return_value=True,
+            ),
+            patch.object(
+                supervisor,
+                "_prepare_openclaw_agent_auth_store_ownership",
+            ),
+            patch.object(pty_mod, "fork", return_value=(0, 99)),
+            patch.object(supervisor, "_drop_to_runtime_user_for_exec") as drop_user,
+            patch.object(
+                supervisor.os,
+                "execvpe",
+                side_effect=OSError("exec failed after drop"),
+            ) as execvpe,
+            patch.object(supervisor.os, "_exit", side_effect=SystemExit) as exit_,
+        ):
+            with self.assertRaises(SystemExit):
+                supervisor._run_chatgpt_device_code_login_in_thread(
+                    session_id="drop-before-exec-test",
+                    openclaw_bin="/bin/false",
+                )
+
+        drop_user.assert_called_once_with()
+        execvpe.assert_called_once()
+        exit_.assert_called_once_with(127)
 
     def test_provider_check_failure_posts_terminal_failed(self) -> None:
         calls: list[tuple[str, dict]] = []
@@ -7347,6 +7737,100 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                 os.path.join(tmpdir, "extensions", "tinyhat", "openclaw.plugin.json"),
                 repaired,
             )
+
+    def test_existing_checkout_repairs_ownership_before_git_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_url = "https://example.com/tinyhat.git"
+            repo_ref = "refs/tags/v0.5.0"
+            plugin_dir = os.path.join(tmpdir, "platform-plugins", "tinyhat")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            with open(
+                os.path.join(plugin_dir, "openclaw.plugin.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(plugin_dir, "package.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"version": "0.5.0"}, fh)
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+            }
+            chowned: list[tuple[str, int, int]] = []
+
+            def fake_chown(path, uid, gid):
+                chowned.append((path, uid, gid))
+
+            def chowned_paths() -> set[str]:
+                return {path for path, _uid, _gid in chowned}
+
+            def fake_run(cmd, **kwargs):
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "remote",
+                    "set-url",
+                    "origin",
+                    repo_url,
+                ]:
+                    self.assertIn(os.path.dirname(plugin_dir), chowned_paths())
+                    self.assertIn(os.path.join(plugin_dir, ".git"), chowned_paths())
+                    self.assertIs(
+                        kwargs.get("preexec_fn"),
+                        supervisor._drop_to_runtime_user_for_exec,
+                    )
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == [
+                    "git",
+                    "-C",
+                    plugin_dir,
+                    "fetch",
+                    "--tags",
+                    "--prune",
+                    "origin",
+                ]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "checkout", repo_ref]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0, stdout="abc123def4567890\n", stderr=""
+                    )
+                if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    self.assertIs(
+                        kwargs.get("preexec_fn"),
+                        supervisor._drop_to_runtime_user_for_exec,
+                    )
+                    ext_dir = os.path.join(tmpdir, "extensions", "tinyhat")
+                    os.makedirs(ext_dir, exist_ok=True)
+                    with open(
+                        os.path.join(ext_dir, "openclaw.plugin.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fh:
+                        json.dump({"id": "tinyhat"}, fh)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor, "_runtime_ownership_ids", return_value=(4242, 4243)
+                ),
+                patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                patch.object(supervisor.os, "lchown", side_effect=fake_chown),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
 
     def test_no_runtime_user_keeps_current_behaviour(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
