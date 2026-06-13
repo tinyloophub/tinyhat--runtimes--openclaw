@@ -7,6 +7,15 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.12.6
+
+### Changed
+
+- Publish a version-alignment release for the Tinyloop `v0.12.6` train. The
+  runtime code and behavior are unchanged from `v0.12.5`; this release keeps
+  the public runtime version in lockstep with the monorepo release that pins
+  the latest Tinyhat plugin.
+
 ## 0.12.5
 
 ### Changed
