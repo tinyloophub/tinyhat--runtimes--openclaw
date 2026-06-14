@@ -4128,6 +4128,226 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             ],
         )
 
+    def test_binding_cycle_uses_long_poll_and_reports_phase_timings(self) -> None:
+        import threading as threading_mod
+
+        binding = _subscription_binding(with_openrouter=True)
+        get_calls: list[tuple[str, dict]] = []
+        runtime_state_posts: list[dict] = []
+
+        class _NoopThread:
+            def __init__(self, target, daemon):
+                self._target = target
+                self.daemon = daemon
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def fake_get_json(path: str, **kwargs) -> dict:
+            get_calls.append((path, dict(kwargs)))
+            return {"assigned": True, "binding": binding}
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            if path == "/hapi/v1/computers/me/runtime-state":
+                runtime_state_posts.append(dict(body))
+            return {}
+
+        def fake_gateway_active() -> bool:
+            supervisor._stop_holder["stop"] = True
+            return True
+
+        config_fingerprint = {
+            "algorithm": "sha256",
+            "source": "openclaw_config",
+            "path": "/etc/openclaw/openclaw.json",
+            "value": "test",
+        }
+        monotonic_ticks = [
+            100.0,
+            101.0,
+            109.0,
+            109.1,
+            109.2,
+            109.2,
+            109.4,
+            109.4,
+            109.5,
+        ]
+        old_plugin_result = supervisor._tinyhat_plugin_install_result()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            supervisor._set_tinyhat_plugin_install_result(status="marker_match")
+            try:
+                with (
+                    patch.dict(os.environ, env, clear=False),
+                    patch.object(supervisor, "post_json", side_effect=fake_post_json),
+                    patch.object(supervisor, "get_json", side_effect=fake_get_json),
+                    patch.object(
+                        supervisor,
+                        "try_install_codex_subscription_plugin",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        supervisor,
+                        "try_check_chatgpt_subscription_provider",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        supervisor,
+                        "try_install_tinyhat_plugin",
+                        return_value=True,
+                    ),
+                    patch.object(supervisor, "write_openclaw_config"),
+                    patch.object(
+                        supervisor,
+                        "_openclaw_config_fingerprint",
+                        return_value=config_fingerprint,
+                    ),
+                    patch.object(
+                        supervisor,
+                        "ensure_openclaw_gateway_ready",
+                        return_value={
+                            "action": "started",
+                            "started_at": 123.0,
+                            "detail": "openclaw gateway started",
+                        },
+                    ),
+                    patch.object(supervisor, "_report_subscription_runtime_verification"),
+                    patch.object(
+                        supervisor,
+                        "is_openclaw_gateway_active",
+                        side_effect=fake_gateway_active,
+                    ),
+                    patch.object(supervisor, "stop_openclaw_gateway"),
+                    patch.object(
+                        supervisor.time,
+                        "monotonic",
+                        side_effect=monotonic_ticks,
+                    ),
+                    patch.object(supervisor.time, "sleep"),
+                    patch.object(threading_mod, "Thread", _NoopThread),
+                ):
+                    self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+            finally:
+                supervisor._set_tinyhat_plugin_install_result(**old_plugin_result)
+
+        self.assertEqual(
+            get_calls[0][0],
+            "/hapi/v1/computers/me/binding?wait_seconds=8",
+        )
+        self.assertEqual(
+            get_calls[0][1]["timeout"],
+            supervisor.BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+        )
+        timing_posts = [
+            body for body in runtime_state_posts if body.get("startup_timings")
+        ]
+        self.assertEqual(len(timing_posts), 1)
+        sample = timing_posts[0]["startup_timings"][0]
+        self.assertEqual(sample["metric_name"], "assignment_to_serving_ms")
+        self.assertEqual(sample["duration_ms"], 500)
+        self.assertEqual(
+            [span["phase"] for span in sample["phase_spans"]],
+            [
+                "long_poll_receive",
+                "binding_config_apply",
+                "bot_ready",
+                "binding_ack",
+            ],
+        )
+        self.assertEqual(sample["phase_spans"][0]["duration_ms"], 8000)
+        self.assertEqual(
+            sample["sample_metadata"]["tinyhat_plugin_install"]["status"],
+            "marker_match",
+        )
+
+    def test_binding_get_failures_use_error_backoff(self) -> None:
+        get_calls: list[tuple[str, dict]] = []
+        sleeps: list[float] = []
+
+        def fake_get_json(path: str, **kwargs) -> dict:
+            get_calls.append((path, dict(kwargs)))
+            raise RuntimeError("platform down")
+
+        def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", return_value={}),
+                patch.object(supervisor, "get_json", side_effect=fake_get_json),
+                patch.object(
+                    supervisor,
+                    "checkpoint_supervisor_progress",
+                ),
+                patch.object(
+                    supervisor,
+                    "_interruptible_sleep",
+                    side_effect=record_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(len(get_calls), 2)
+        self.assertEqual(
+            [call[0] for call in get_calls],
+            [
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+            ],
+        )
+        self.assertEqual(
+            [call[1]["timeout"] for call in get_calls],
+            [
+                supervisor.BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+                supervisor.BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+            ],
+        )
+        self.assertEqual(
+            sleeps,
+            [
+                supervisor.BINDING_POLL_ERROR_BASE_SECONDS,
+                min(
+                    supervisor.BINDING_POLL_ERROR_BASE_SECONDS * 2,
+                    supervisor.BINDING_POLL_ERROR_CAP_SECONDS,
+                ),
+            ],
+        )
+        self.assertTrue(
+            all(
+                sleep > supervisor.BINDING_POLL_IDLE_CAP_SECONDS
+                for sleep in sleeps
+            )
+        )
+
+    def test_binding_poll_path_keeps_watchdog_immediate(self) -> None:
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=0),
+            "/hapi/v1/computers/me/binding",
+        )
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=8),
+            "/hapi/v1/computers/me/binding?wait_seconds=8",
+        )
+
 
 class BindingCycleManualRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:

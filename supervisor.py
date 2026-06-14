@@ -230,8 +230,11 @@ METADATA_AUDIENCE_KEY = "tinyhat-backend-audience"
 METADATA_COMPUTER_ID_KEY = "tinyhat-computer-id"
 METADATA_TTL_SECONDS = 30
 
-BINDING_POLL_BASE_SECONDS = 3
-BINDING_POLL_IDLE_CAP_SECONDS = 10
+BINDING_LONG_POLL_WAIT_SECONDS = 8
+BINDING_POLL_BASE_SECONDS = 0.1
+BINDING_POLL_IDLE_CAP_SECONDS = 0.5
+BINDING_POLL_ERROR_BASE_SECONDS = 3
+BINDING_POLL_ERROR_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
 GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS = 10 * 60
@@ -245,6 +248,9 @@ GATEWAY_RECOVERY_HEALTHY_RESET_SECONDS = 30 * 60
 GATEWAY_RECOVERY_MAX_HOLD_DOWN_CYCLES = 2
 GCE_IDENTITY_TOKEN_TIMEOUT_SECONDS = 5
 PLATFORM_REQUEST_TIMEOUT_SECONDS = 10
+BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS = (
+    PLATFORM_REQUEST_TIMEOUT_SECONDS + BINDING_LONG_POLL_WAIT_SECONDS + 2
+)
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5
 SYSTEMCTL_TIMEOUT_SECONDS = 20
 GATEWAY_CHILD_WAIT_TIMEOUT_SECONDS = 30
@@ -681,7 +687,7 @@ def post_json(path: str, body: dict) -> dict:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def get_json(path: str) -> dict:
+def get_json(path: str, *, timeout: float = PLATFORM_REQUEST_TIMEOUT_SECONDS) -> dict:
     token = fetch_identity_token()
     base = get_backend_base_url()
     req = urllib.request.Request(
@@ -691,9 +697,36 @@ def get_json(path: str) -> dict:
     )
     with urllib.request.urlopen(
         req,
-        timeout=PLATFORM_REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     ) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _binding_poll_path(*, wait_seconds: float = 0.0) -> str:
+    if wait_seconds <= 0:
+        return "/hapi/v1/computers/me/binding"
+    return f"/hapi/v1/computers/me/binding?wait_seconds={wait_seconds:g}"
+
+
+def _elapsed_ms(start_monotonic: float, end_monotonic: float | None = None) -> int:
+    end = time.monotonic() if end_monotonic is None else end_monotonic
+    return max(0, int(round((end - start_monotonic) * 1000)))
+
+
+def _phase_span(
+    phase: str,
+    label: str,
+    start_monotonic: float,
+    end_monotonic: float,
+    *,
+    status: str = "ok",
+) -> dict[str, object]:
+    return {
+        "phase": phase,
+        "label": label,
+        "duration_ms": _elapsed_ms(start_monotonic, end_monotonic),
+        "status": status,
+    }
 
 
 def _sd_notify(message: str) -> bool:
@@ -1448,8 +1481,17 @@ def ensure_tinyhat_plugin_installed(
             plugin_sha[:12],
             version,
         )
+        _set_tinyhat_plugin_install_result(
+            status="marker_match",
+            repo_ref=repo_ref,
+            resolved_commit_sha=plugin_sha,
+            version=version,
+        )
         return True
 
+    install_status = "installed"
+    if marker_json:
+        install_status = "marker_mismatch_reinstalled"
     cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
     result = subprocess.run(
         cmd,
@@ -1477,6 +1519,12 @@ def ensure_tinyhat_plugin_installed(
         plugin_sha[:12],
         version,
     )
+    _set_tinyhat_plugin_install_result(
+        status=install_status,
+        repo_ref=repo_ref,
+        resolved_commit_sha=plugin_sha,
+        version=version,
+    )
     return True
 
 
@@ -1494,6 +1542,10 @@ def try_install_tinyhat_plugin() -> bool:
             "Tinyhat plugin unavailable; continuing without "
             "credential tools: %s",
             exc,
+        )
+        _set_tinyhat_plugin_install_result(
+            status="failed",
+            diagnostic=_sanitize_runtime_state_text(str(exc), limit=255),
         )
         return False
 
@@ -1731,6 +1783,64 @@ def report_ready_runtime_state() -> None:
         )
     except Exception as exc:  # noqa: BLE001 - startup state must keep moving
         log.warning("runtime_state ready mirror failed: %s", exc)
+
+
+def _post_startup_timing_sample(sample: dict[str, object]) -> None:
+    """Attach one startup benchmark sample to the current runtime-state."""
+    payload = dict(read_runtime_state() or {})
+    now = int(time.time())
+    payload.setdefault("schema", RUNTIME_STATE_SCHEMA)
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("observed_at", _runtime_state_observed_at(now))
+    payload.setdefault("runtime_health", "healthy")
+    payload.setdefault("runtime_state", payload["runtime_health"])
+    payload.setdefault("state", payload["runtime_health"])
+    payload.setdefault("detail", "startup timing sample")
+    payload["startup_timings"] = [sample]
+    post_json("/hapi/v1/computers/me/runtime-state", payload)
+
+
+def _runtime_startup_source_ref(binding: dict, started_wall: float) -> str:
+    bot_id = str(binding.get("telegram_bot_user_id") or "").strip()
+    bot_username = str(binding.get("telegram_bot_username") or "").strip()
+    identity = bot_id or bot_username or "unknown"
+    return f"runtime-binding-cycle:{identity}:{int(started_wall * 1000)}"
+
+
+def report_binding_cycle_startup_timing(
+    *,
+    binding: dict,
+    started_wall: float,
+    binding_received_monotonic: float,
+    active_ack_monotonic: float,
+    phase_spans: list[dict[str, object]],
+    gateway_result: dict,
+) -> None:
+    duration_ms = max(
+        1,
+        _elapsed_ms(binding_received_monotonic, active_ack_monotonic),
+    )
+    sample = {
+        "metric_name": "assignment_to_serving_ms",
+        "candidate_label": "runtime final binding receive to active ack",
+        "source_kind": "runtime_report",
+        "capacity_path": "hot_pool_running",
+        "image_label": "not_applicable",
+        "duration_ms": duration_ms,
+        "observed_at": _runtime_state_observed_at(int(time.time())),
+        "source_ref": _runtime_startup_source_ref(binding, started_wall),
+        "phase_spans": phase_spans,
+        "sample_metadata": {
+            "duration_anchor": "final_binding_receive_to_active_ack",
+            "binding_wait_seconds": BINDING_LONG_POLL_WAIT_SECONDS,
+            "gateway_action": gateway_result.get("action"),
+            "tinyhat_plugin_install": _tinyhat_plugin_install_result(),
+        },
+    }
+    try:
+        _post_startup_timing_sample(sample)
+    except Exception as exc:  # noqa: BLE001 - timing should never block startup
+        log.warning("startup timing runtime-state POST failed: %s", exc)
 
 
 def _gateway_cgroup_event(snapshot: dict[str, Any] | None, key: str) -> int | None:
@@ -3883,6 +3993,16 @@ _config_apply_state = {
     "failed_diagnostic": None,
     "failed_reported": False,
 }
+_last_tinyhat_plugin_install_result: dict[str, object] = {"status": "not_attempted"}
+
+
+def _set_tinyhat_plugin_install_result(**values: object) -> None:
+    _last_tinyhat_plugin_install_result.clear()
+    _last_tinyhat_plugin_install_result.update(values)
+
+
+def _tinyhat_plugin_install_result() -> dict[str, object]:
+    return dict(_last_tinyhat_plugin_install_result)
 
 
 def _binding_model_auth_signature(binding: dict) -> tuple[str, str]:
@@ -5963,7 +6083,11 @@ def _run_one_binding_cycle() -> int:
     # Phase B: poll for binding
     poll = BINDING_POLL_BASE_SECONDS
     empty_count = 0
+    binding_get_failure_count = 0
     binding = None
+    binding_cycle_started_wall = time.time()
+    binding_cycle_started_monotonic = time.monotonic()
+    binding_received_monotonic = binding_cycle_started_monotonic
     # PR #24 review at 01:19Z — cold-start guard: a profile on disk
     # without a current owner is orphaned by definition. Wipe at most
     # once per Phase B entry to avoid pummeling the filesystem on
@@ -5971,11 +6095,24 @@ def _run_one_binding_cycle() -> int:
     cold_start_wipe_attempted = False
     while binding is None and not _stop_holder["stop"]:
         try:
-            resp = get_json("/hapi/v1/computers/me/binding")
+            binding_cycle_started_wall = time.time()
+            binding_cycle_started_monotonic = time.monotonic()
+            resp = get_json(
+                _binding_poll_path(wait_seconds=BINDING_LONG_POLL_WAIT_SECONDS),
+                timeout=BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+            )
+            binding_get_failure_count = 0
+            binding_received_monotonic = time.monotonic()
         except Exception as exc:
             log.warning("/me/binding GET failed: %s", exc)
             checkpoint_supervisor_progress("phase-b-binding-get-failed")
-            _interruptible_sleep(poll)
+            failure_poll = min(
+                BINDING_POLL_ERROR_BASE_SECONDS
+                * (2 ** min(binding_get_failure_count, 8)),
+                BINDING_POLL_ERROR_CAP_SECONDS,
+            )
+            binding_get_failure_count += 1
+            _interruptible_sleep(failure_poll)
             continue
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]
@@ -6028,7 +6165,16 @@ def _run_one_binding_cycle() -> int:
         return 0
 
     # Phase C: persist binding + start OpenClaw + report active
+    phase_spans = [
+        _phase_span(
+            "long_poll_receive",
+            "long-poll receive",
+            binding_cycle_started_monotonic,
+            binding_received_monotonic,
+        )
+    ]
     try:
+        config_apply_started_monotonic = time.monotonic()
         codex_subscription_plugin_installed = (
             try_install_codex_subscription_plugin()
         )
@@ -6042,9 +6188,28 @@ def _run_one_binding_cycle() -> int:
             enable_chatgpt_subscription_provider=chatgpt_subscription_provider_available,
             enable_codex_subscription_plugins=codex_subscription_plugin_installed,
         )
+        config_apply_done_monotonic = time.monotonic()
+        phase_spans.append(
+            _phase_span(
+                "binding_config_apply",
+                "binding/config apply",
+                config_apply_started_monotonic,
+                config_apply_done_monotonic,
+            )
+        )
+        bot_ready_started_monotonic = time.monotonic()
         gateway_result = ensure_openclaw_gateway_ready(
             binding,
             _openclaw_config_fingerprint(),
+        )
+        bot_ready_done_monotonic = time.monotonic()
+        phase_spans.append(
+            _phase_span(
+                "bot_ready",
+                "bot-ready",
+                bot_ready_started_monotonic,
+                bot_ready_done_monotonic,
+            )
         )
         checkpoint_supervisor_progress(
             (
@@ -6076,14 +6241,32 @@ def _run_one_binding_cycle() -> int:
         return 1
 
     try:
+        binding_ack_started_monotonic = time.monotonic()
         post_json(
             "/hapi/v1/computers/me/state",
             {"state": "active", "detail": gateway_result["detail"]},
+        )
+        binding_ack_done_monotonic = time.monotonic()
+        phase_spans.append(
+            _phase_span(
+                "binding_ack",
+                "binding ack",
+                binding_ack_started_monotonic,
+                binding_ack_done_monotonic,
+            )
         )
         log.info("reported state=active")
         checkpoint_supervisor_progress(
             "phase-c-active-post",
             inspect_gateway=True,
+        )
+        report_binding_cycle_startup_timing(
+            binding=binding,
+            started_wall=binding_cycle_started_wall,
+            binding_received_monotonic=binding_received_monotonic,
+            active_ack_monotonic=binding_ack_done_monotonic,
+            phase_spans=phase_spans,
+            gateway_result=gateway_result,
         )
     except Exception as exc:
         log.exception("active /me/state POST failed: %s", exc)
@@ -6185,7 +6368,7 @@ def _run_one_binding_cycle() -> int:
             # so it works in every state the heartbeat could find us
             # in.
             try:
-                resp = get_json("/hapi/v1/computers/me/binding")
+                resp = get_json(_binding_poll_path(wait_seconds=0))
                 binding_status = "ok"
                 if resp.get("assigned") is False:
                     log.info(
