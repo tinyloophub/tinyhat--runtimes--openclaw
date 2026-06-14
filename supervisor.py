@@ -233,6 +233,8 @@ METADATA_TTL_SECONDS = 30
 BINDING_LONG_POLL_WAIT_SECONDS = 8
 BINDING_POLL_BASE_SECONDS = 0.1
 BINDING_POLL_IDLE_CAP_SECONDS = 0.5
+BINDING_POLL_ERROR_BASE_SECONDS = 3
+BINDING_POLL_ERROR_CAP_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
 GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS = 10 * 60
@@ -6081,6 +6083,7 @@ def _run_one_binding_cycle() -> int:
     # Phase B: poll for binding
     poll = BINDING_POLL_BASE_SECONDS
     empty_count = 0
+    binding_get_failure_count = 0
     binding = None
     binding_cycle_started_wall = time.time()
     binding_cycle_started_monotonic = time.monotonic()
@@ -6098,11 +6101,18 @@ def _run_one_binding_cycle() -> int:
                 _binding_poll_path(wait_seconds=BINDING_LONG_POLL_WAIT_SECONDS),
                 timeout=BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
             )
+            binding_get_failure_count = 0
             binding_received_monotonic = time.monotonic()
         except Exception as exc:
             log.warning("/me/binding GET failed: %s", exc)
             checkpoint_supervisor_progress("phase-b-binding-get-failed")
-            _interruptible_sleep(poll)
+            failure_poll = min(
+                BINDING_POLL_ERROR_BASE_SECONDS
+                * (2 ** min(binding_get_failure_count, 8)),
+                BINDING_POLL_ERROR_CAP_SECONDS,
+            )
+            binding_get_failure_count += 1
+            _interruptible_sleep(failure_poll)
             continue
         if resp.get("assigned") is True and resp.get("binding"):
             binding = resp["binding"]

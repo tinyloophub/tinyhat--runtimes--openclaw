@@ -4270,6 +4270,74 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             "marker_match",
         )
 
+    def test_binding_get_failures_use_error_backoff(self) -> None:
+        get_calls: list[tuple[str, dict]] = []
+        sleeps: list[float] = []
+
+        def fake_get_json(path: str, **kwargs) -> dict:
+            get_calls.append((path, dict(kwargs)))
+            raise RuntimeError("platform down")
+
+        def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", return_value={}),
+                patch.object(supervisor, "get_json", side_effect=fake_get_json),
+                patch.object(
+                    supervisor,
+                    "checkpoint_supervisor_progress",
+                ),
+                patch.object(
+                    supervisor,
+                    "_interruptible_sleep",
+                    side_effect=record_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(len(get_calls), 2)
+        self.assertEqual(
+            [call[0] for call in get_calls],
+            [
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+            ],
+        )
+        self.assertEqual(
+            [call[1]["timeout"] for call in get_calls],
+            [
+                supervisor.BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+                supervisor.BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+            ],
+        )
+        self.assertEqual(
+            sleeps,
+            [
+                supervisor.BINDING_POLL_ERROR_BASE_SECONDS,
+                min(
+                    supervisor.BINDING_POLL_ERROR_BASE_SECONDS * 2,
+                    supervisor.BINDING_POLL_ERROR_CAP_SECONDS,
+                ),
+            ],
+        )
+        self.assertTrue(
+            all(
+                sleep > supervisor.BINDING_POLL_IDLE_CAP_SECONDS
+                for sleep in sleeps
+            )
+        )
+
     def test_binding_poll_path_keeps_watchdog_immediate(self) -> None:
         self.assertEqual(
             supervisor._binding_poll_path(wait_seconds=0),
