@@ -4165,6 +4165,17 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             "path": "/etc/openclaw/openclaw.json",
             "value": "test",
         }
+        monotonic_ticks = [
+            100.0,
+            101.0,
+            109.0,
+            109.1,
+            109.2,
+            109.2,
+            109.4,
+            109.4,
+            109.5,
+        ]
         old_plugin_result = supervisor._tinyhat_plugin_install_result()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4217,6 +4228,11 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                         side_effect=fake_gateway_active,
                     ),
                     patch.object(supervisor, "stop_openclaw_gateway"),
+                    patch.object(
+                        supervisor.time,
+                        "monotonic",
+                        side_effect=monotonic_ticks,
+                    ),
                     patch.object(supervisor.time, "sleep"),
                     patch.object(threading_mod, "Thread", _NoopThread),
                 ):
@@ -4238,6 +4254,7 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         self.assertEqual(len(timing_posts), 1)
         sample = timing_posts[0]["startup_timings"][0]
         self.assertEqual(sample["metric_name"], "assignment_to_serving_ms")
+        self.assertEqual(sample["duration_ms"], 500)
         self.assertEqual(
             [span["phase"] for span in sample["phase_spans"]],
             [
@@ -4247,6 +4264,7 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                 "binding_ack",
             ],
         )
+        self.assertEqual(sample["phase_spans"][0]["duration_ms"], 8000)
         self.assertEqual(
             sample["sample_metadata"]["tinyhat_plugin_install"]["status"],
             "marker_match",

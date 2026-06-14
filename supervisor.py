@@ -1809,12 +1809,15 @@ def report_binding_cycle_startup_timing(
     *,
     binding: dict,
     started_wall: float,
-    started_monotonic: float,
+    binding_received_monotonic: float,
     active_ack_monotonic: float,
     phase_spans: list[dict[str, object]],
     gateway_result: dict,
 ) -> None:
-    duration_ms = max(1, _elapsed_ms(started_monotonic, active_ack_monotonic))
+    duration_ms = max(
+        1,
+        _elapsed_ms(binding_received_monotonic, active_ack_monotonic),
+    )
     sample = {
         "metric_name": "assignment_to_serving_ms",
         "candidate_label": "runtime final binding receive to active ack",
@@ -6250,7 +6253,7 @@ def _run_one_binding_cycle() -> int:
         report_binding_cycle_startup_timing(
             binding=binding,
             started_wall=binding_cycle_started_wall,
-            started_monotonic=binding_cycle_started_monotonic,
+            binding_received_monotonic=binding_received_monotonic,
             active_ack_monotonic=binding_ack_done_monotonic,
             phase_spans=phase_spans,
             gateway_result=gateway_result,
