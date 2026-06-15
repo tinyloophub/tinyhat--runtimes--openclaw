@@ -1151,13 +1151,14 @@ def _public_runtime_cache_plugin_hit(
     expected_sha = (status.get("plugin_expected_sha") or "").strip()
     if not expected_sha:
         return None
-    if status.get("plugin_target_dir") and os.path.abspath(
-        status["plugin_target_dir"]
-    ) != os.path.abspath(plugin_dir):
+    status_target_dir = (status.get("plugin_target_dir") or "").strip()
+    if not status_target_dir:
         return None
-    if status.get("plugin_repo_url") and status["plugin_repo_url"] != expected_repo_url:
+    if os.path.abspath(status_target_dir) != os.path.abspath(plugin_dir):
         return None
-    if status.get("plugin_ref") and status["plugin_ref"] != expected_repo_ref:
+    if status.get("plugin_repo_url") != expected_repo_url:
+        return None
+    if status.get("plugin_ref") != expected_repo_ref:
         return None
     if not os.path.isdir(os.path.join(plugin_dir, ".git")):
         return None

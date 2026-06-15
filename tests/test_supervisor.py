@@ -2731,6 +2731,62 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 ],
             )
 
+    def test_public_runtime_cache_hit_requires_plugin_identity_fields(self) -> None:
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "refs/tags/v0.5.0"
+        plugin_sha = "1234567890abcdef"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = os.path.join(tmpdir, "platform-plugins", "tinyhat")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            cache_status_path = os.path.join(tmpdir, "public-runtime-cache.env")
+            base_status = {
+                "mode": "full_public_runtime_cache",
+                "status": "hit",
+                "plugin_repo_url": repo_url,
+                "plugin_ref": repo_ref,
+                "plugin_target_dir": plugin_dir,
+                "plugin_expected_sha": plugin_sha,
+            }
+            cases = {
+                "missing repo url": {"plugin_repo_url": None},
+                "missing ref": {"plugin_ref": None},
+                "missing target dir": {"plugin_target_dir": None},
+                "mismatched repo url": {
+                    "plugin_repo_url": "https://example.com/other.git",
+                },
+                "mismatched ref": {"plugin_ref": "refs/tags/v0.4.0"},
+                "mismatched target dir": {
+                    "plugin_target_dir": os.path.join(tmpdir, "other-plugin"),
+                },
+            }
+
+            for label, overrides in cases.items():
+                status = {**base_status, **overrides}
+                with open(cache_status_path, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "\n".join(
+                            f"{key}={value}"
+                            for key, value in status.items()
+                            if value is not None
+                        )
+                    )
+                env = {
+                    "TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH": cache_status_path,
+                }
+                with self.subTest(label=label), patch.dict(
+                    os.environ, env, clear=False
+                ), patch.object(supervisor.subprocess, "run") as run:
+                    result = supervisor._public_runtime_cache_plugin_hit(
+                        plugin_dir=plugin_dir,
+                        expected_repo_url=repo_url,
+                        expected_repo_ref=repo_ref,
+                        subprocess_kwargs={},
+                    )
+
+                self.assertIsNone(result)
+                run.assert_not_called()
+
     def test_public_runtime_cache_hit_skips_plugin_git_network(self) -> None:
         repo_url = "https://example.com/tinyhat.git"
         repo_ref = "refs/tags/v0.5.0"
