@@ -7,6 +7,27 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.14.0
+
+This release aligns the public OpenClaw runtime with the Tinyloop `v0.14.0`
+startup-speed train. It includes the runtime companions needed for hot-pool
+assignment measurement, public runtime cache images, and the final hot-ready
+freshness gate.
+
+### Added
+
+- Report binding long-poll timing and phase evidence so Tinyloop can separate
+  admin assignment response, runtime config apply, bot process readiness, and
+  active-state acknowledgement.
+- Trust verified public runtime cache checkouts when the producer records the
+  expected repository and commit SHA, while preserving mismatch fallback.
+
+### Fixed
+
+- Continue refreshing runtime state while a Computer is hot-ready but unbound,
+  so Tinyloop can reject stale ready rows before enabling the hot-ready claim
+  gate.
+
 ## 0.12.6
 
 ### Changed
