@@ -1156,9 +1156,11 @@ def _public_runtime_cache_plugin_hit(
         return None
     if os.path.abspath(status_target_dir) != os.path.abspath(plugin_dir):
         return None
-    if status.get("plugin_repo_url") != expected_repo_url:
+    status_repo_url = (status.get("plugin_repo_url") or "").strip()
+    if status_repo_url != expected_repo_url:
         return None
-    if status.get("plugin_ref") != expected_repo_ref:
+    status_repo_ref = (status.get("plugin_ref") or "").strip()
+    if status_repo_ref != expected_repo_ref:
         return None
     if not os.path.isdir(os.path.join(plugin_dir, ".git")):
         return None
