@@ -693,6 +693,83 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(posted[0][1], payload)
             self.assertEqual(posted[0][1]["runtime_health"], "healthy")
 
+    def test_ready_runtime_state_refresh_contract_fits_platform_stale_window(
+        self,
+    ) -> None:
+        self.assertLess(
+            supervisor.READY_RUNTIME_STATE_REFRESH_SECONDS,
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS,
+        )
+        self.assertLess(
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+        worst_case_idle_post_seconds = (
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
+            + supervisor.BINDING_LONG_POLL_WAIT_SECONDS
+            + supervisor.BINDING_POLL_IDLE_CAP_SECONDS
+        )
+        self.assertLess(
+            worst_case_idle_post_seconds,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+
+    def test_ready_runtime_state_posts_again_before_platform_stale_window(
+        self,
+    ) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        platform_post_times: list[str] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            self.assertEqual(path, "/hapi/v1/computers/me/runtime-state")
+            platform_post_times.append(body["observed_at"])
+            return {"ok": True}
+
+        base_time = 1_760_000_000
+        post_floor = supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                with patch.object(supervisor.time, "time", return_value=base_time):
+                    supervisor.report_ready_runtime_state()
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base_time + post_floor - 1,
+                ):
+                    supervisor.report_ready_runtime_state()
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base_time + post_floor + 1,
+                ):
+                    supervisor.report_ready_runtime_state()
+
+        self.assertEqual(len(platform_post_times), 2)
+        self.assertLess(
+            post_floor + 1,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+
     def test_ready_runtime_state_mirror_is_best_effort(self) -> None:
         with (
             patch.object(

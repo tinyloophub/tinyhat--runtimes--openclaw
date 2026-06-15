@@ -238,7 +238,14 @@ BINDING_POLL_BASE_SECONDS = 0.1
 BINDING_POLL_IDLE_CAP_SECONDS = 0.5
 BINDING_POLL_ERROR_BASE_SECONDS = 3
 BINDING_POLL_ERROR_CAP_SECONDS = 10
+# The platform hot-ready claim gate treats an unchanged ready runtime-state
+# mirror as stale after 90s. The ready refresh attempt interval is 15s, but
+# identical runtime-state posts are intentionally deduped by
+# RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS (60s). Keep the whole chain
+# in this order so an idle, unbound Computer stays claimable before the
+# platform stale window expires.
 READY_RUNTIME_STATE_REFRESH_SECONDS = 15
+READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS = 90
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
 GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS = 10 * 60
