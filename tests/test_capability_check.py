@@ -763,6 +763,68 @@ class WriteRuntimeStateCapabilitiesTests(unittest.TestCase):
             self.assertEqual(payload["capabilities"]["status"], "ok")
             self.assertIsNone(payload["last_error"])
 
+    def test_write_path_includes_public_runtime_cache_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_manifest(
+                os.path.join(tmpdir, "extensions", "tinyhat"),
+                tools=DECLARED_TOOLS,
+                skills=[],
+                framework={"name": "openclaw", "minimum": "2026.6.1"},
+            )
+            cache_status_path = os.path.join(tmpdir, "public-runtime-cache.env")
+            with open(cache_status_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "mode=full_public_runtime_cache\n"
+                    "status=hit\n"
+                    "runtime_expected_sha=aaaaaaaa\n"
+                    "runtime_observed_sha=aaaaaaaa\n"
+                    "plugin_expected_sha=bbbbbbbb\n"
+                    "plugin_observed_sha=bbbbbbbb\n"
+                )
+            env = {
+                **self._env(tmpdir),
+                supervisor.TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH_ENV: (
+                    cache_status_path
+                ),
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "get_backend_base_url", return_value=""),
+                patch.object(
+                    supervisor, "openclaw_state_dir", return_value=tmpdir
+                ),
+                patch.object(
+                    supervisor, "_read_runtime_repo_version", return_value="0.12.0"
+                ),
+                patch.object(
+                    supervisor, "_read_runtime_git_sha", return_value="c" * 40
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_openclaw_framework_version",
+                    return_value="2026.6.5",
+                ),
+                patch.object(
+                    supervisor,
+                    "openclaw_plugin_registry_entry",
+                    return_value=(_registry_entry(DECLARED_TOOLS), None),
+                ),
+            ):
+                supervisor._write_runtime_state("healthy", "ok", gateway_active=True)
+                payload = supervisor.read_runtime_state()
+
+            self.assertEqual(
+                payload["public_runtime_cache"],
+                {
+                    "mode": "full_public_runtime_cache",
+                    "status": "hit",
+                    "runtime_expected_sha": "aaaaaaaa",
+                    "runtime_observed_sha": "aaaaaaaa",
+                    "plugin_expected_sha": "bbbbbbbb",
+                    "plugin_observed_sha": "bbbbbbbb",
+                },
+            )
+
 
 class UnitCategoryAllowlistTests(unittest.TestCase):
     """Every unit module declares one of the seven mechanism categories.

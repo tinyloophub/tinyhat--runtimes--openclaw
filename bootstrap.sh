@@ -18,6 +18,7 @@
 #   TINYHAT_FRAMEWORK_INSTALL_SPEC — npm package spec, e.g. openclaw@2026.5.19
 #   TINYHAT_PLATFORM_PLUGIN_REPO_URL — public Tinyhat OpenClaw plugin repo
 #   TINYHAT_PLATFORM_PLUGIN_REPO_REF — public Tinyhat plugin ref/SHA to install
+#   TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH — public cache hit/miss status file
 #
 # Optional private-access material is passed by the platform startup
 # script through env and consumed here:
@@ -217,6 +218,7 @@ echo "[tinyhat-runtime] installed tinyhat CLI wrapper at ${TINYHAT_CLI_WRAPPER}"
   echo "TINYHAT_PLATFORM_BASE_URL=${TINYHAT_PLATFORM_BASE_URL:-}"
   echo "TINYHAT_PLATFORM_PLUGIN_REPO_URL=${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}"
   echo "TINYHAT_PLATFORM_PLUGIN_REPO_REF=${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}"
+  echo "TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH=${TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH:-}"
   echo "TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}"
   echo "TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}"
 } > "${RUNTIME_ENV_FILE}"
