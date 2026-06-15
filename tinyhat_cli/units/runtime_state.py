@@ -1036,6 +1036,9 @@ def _write_runtime_state(
         if framework_compat:
             plugin_check = {**plugin_check, **framework_compat}
         payload["plugin"] = plugin_check
+    public_cache = sup._read_public_runtime_cache_status()
+    if public_cache:
+        payload["public_runtime_cache"] = public_cache
     if capabilities:
         payload["capabilities"] = capabilities
     if config_fingerprint:

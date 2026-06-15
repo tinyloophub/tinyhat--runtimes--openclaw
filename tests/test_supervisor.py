@@ -2731,6 +2731,79 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 ],
             )
 
+    def test_public_runtime_cache_hit_skips_plugin_git_network(self) -> None:
+        repo_url = "https://example.com/tinyhat.git"
+        repo_ref = "refs/tags/v0.5.0"
+        plugin_sha = "1234567890abcdef"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = os.path.join(tmpdir, "platform-plugins", "tinyhat")
+            os.makedirs(os.path.join(plugin_dir, ".git"))
+            with open(
+                os.path.join(plugin_dir, "openclaw.plugin.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"id": "tinyhat"}, fh)
+            with open(
+                os.path.join(plugin_dir, "package.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"version": "0.5.0"}, fh)
+            cache_status_path = os.path.join(tmpdir, "public-runtime-cache.env")
+            with open(cache_status_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "\n".join(
+                        [
+                            "mode=full_public_runtime_cache",
+                            "status=hit",
+                            f"plugin_repo_url={repo_url}",
+                            f"plugin_ref={repo_ref}",
+                            f"plugin_target_dir={plugin_dir}",
+                            f"plugin_expected_sha={plugin_sha}",
+                            f"plugin_observed_sha={plugin_sha}",
+                        ]
+                    )
+                )
+
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_PLUGIN_CHECKOUT_DIR": plugin_dir,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_URL": repo_url,
+                "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
+                "TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH": cache_status_path,
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if cmd == ["git", "-C", plugin_dir, "rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f"{plugin_sha}\n",
+                        stderr="",
+                    )
+                if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                self.fail(f"unexpected command: {cmd}")
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
+
+            self.assertEqual(
+                calls,
+                [
+                    ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+                    ["openclaw", "plugins", "install", plugin_dir, "--force"],
+                ],
+            )
+
     def test_stale_marker_reinstalls_when_openclaw_registry_is_missing_plugin(
         self,
     ) -> None:

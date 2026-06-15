@@ -208,6 +208,9 @@ TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH"
 TINYHAT_PACKAGE_APPLY_STATE_PATH_ENV = "TINYHAT_PACKAGE_APPLY_STATE_PATH"
 TINYHAT_RUNTIME_STATE_PATH_ENV = "TINYHAT_RUNTIME_STATE_PATH"
 TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH_ENV = "TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH"
+TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH_ENV = (
+    "TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH"
+)
 TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH_ENV = (
     "TINYHAT_RUNTIME_STATE_MANUAL_MARKER_PATH"
 )
@@ -343,6 +346,50 @@ def runtime_bootstrap_log_path() -> str:
         os.environ.get(TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH_ENV)
         or _DEFAULT_RUNTIME_BOOTSTRAP_LOG_PATH
     ).strip()
+
+
+def public_runtime_cache_status_path() -> str:
+    return (
+        os.environ.get(TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH_ENV)
+        or "/var/lib/tinyhat-openclaw/public-runtime-cache.env"
+    ).strip()
+
+
+def _read_public_runtime_cache_status(*, sanitize: bool = True) -> dict[str, str] | None:
+    path = public_runtime_cache_status_path()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    allowed = {
+        "mode",
+        "status",
+        "miss_reason",
+        "marker_path",
+        "runtime_cache_dir",
+        "runtime_repo_url",
+        "runtime_ref",
+        "runtime_expected_sha",
+        "runtime_observed_sha",
+        "plugin_cache_dir",
+        "plugin_target_dir",
+        "plugin_repo_url",
+        "plugin_ref",
+        "plugin_expected_sha",
+        "plugin_observed_sha",
+    }
+    out: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep != "=" or key not in allowed:
+            continue
+        out[key] = (
+            _sanitize_runtime_state_text(value, limit=512) if sanitize else value[:512]
+        )
+    return out or None
 
 
 def runtime_state_manual_marker_path() -> str:
@@ -1089,6 +1136,54 @@ def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
     return repo_url, repo_ref
 
 
+def _public_runtime_cache_plugin_hit(
+    *,
+    plugin_dir: str,
+    expected_repo_url: str,
+    expected_repo_ref: str,
+    subprocess_kwargs: dict[str, object],
+) -> str | None:
+    status = _read_public_runtime_cache_status(sanitize=False)
+    if not status or status.get("status") != "hit":
+        return None
+    if status.get("mode") != "full_public_runtime_cache":
+        return None
+    expected_sha = (status.get("plugin_expected_sha") or "").strip()
+    if not expected_sha:
+        return None
+    if status.get("plugin_target_dir") and os.path.abspath(
+        status["plugin_target_dir"]
+    ) != os.path.abspath(plugin_dir):
+        return None
+    if status.get("plugin_repo_url") and status["plugin_repo_url"] != expected_repo_url:
+        return None
+    if status.get("plugin_ref") and status["plugin_ref"] != expected_repo_ref:
+        return None
+    if not os.path.isdir(os.path.join(plugin_dir, ".git")):
+        return None
+    rev_parse = subprocess.run(
+        ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        **subprocess_kwargs,
+    )
+    if rev_parse.returncode != 0:
+        return None
+    plugin_sha = (rev_parse.stdout or "").strip()
+    if plugin_sha != expected_sha:
+        return None
+    if status.get("plugin_observed_sha") and status["plugin_observed_sha"] != plugin_sha:
+        return None
+    log.info(
+        "Tinyhat plugin cache checkout verified (ref=%s sha=%s cache=%s)",
+        expected_repo_ref,
+        plugin_sha[:12],
+        status.get("plugin_cache_dir") or "",
+    )
+    return plugin_sha
+
+
 def _write_tinyhat_plugin_source_override(
     *,
     repo_url: str,
@@ -1386,7 +1481,16 @@ def ensure_tinyhat_plugin_installed(
     # Git's safe.directory guard does not reject the repo.
     _sync_tinyhat_plugin_runtime_ownership()
     runtime_subprocess_kwargs = _runtime_user_subprocess_kwargs()
-    if os.path.isdir(os.path.join(plugin_dir, ".git")):
+    install_status = "installed"
+    plugin_sha = _public_runtime_cache_plugin_hit(
+        plugin_dir=plugin_dir,
+        expected_repo_url=repo_url,
+        expected_repo_ref=repo_ref,
+        subprocess_kwargs=runtime_subprocess_kwargs,
+    )
+    if plugin_sha is not None:
+        install_status = "cache_checkout_match"
+    elif os.path.isdir(os.path.join(plugin_dir, ".git")):
         remote = subprocess.run(
             ["git", "-C", plugin_dir, "remote", "set-url", "origin", repo_url],
             capture_output=True,
@@ -1421,28 +1525,29 @@ def ensure_tinyhat_plugin_installed(
             detail = (clone.stderr or clone.stdout or "").strip()
             raise RuntimeError(f"Tinyhat plugin git clone failed: {detail}")
 
-    checkout = subprocess.run(
-        ["git", "-C", plugin_dir, "checkout", repo_ref],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        **runtime_subprocess_kwargs,
-    )
-    if checkout.returncode != 0:
-        detail = (checkout.stderr or checkout.stdout or "").strip()
-        raise RuntimeError(f"Tinyhat plugin git checkout failed: {detail}")
+    if plugin_sha is None:
+        checkout = subprocess.run(
+            ["git", "-C", plugin_dir, "checkout", repo_ref],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            **runtime_subprocess_kwargs,
+        )
+        if checkout.returncode != 0:
+            detail = (checkout.stderr or checkout.stdout or "").strip()
+            raise RuntimeError(f"Tinyhat plugin git checkout failed: {detail}")
 
-    rev_parse = subprocess.run(
-        ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        **runtime_subprocess_kwargs,
-    )
-    if rev_parse.returncode != 0:
-        detail = (rev_parse.stderr or rev_parse.stdout or "").strip()
-        raise RuntimeError(f"Tinyhat plugin revision lookup failed: {detail}")
-    plugin_sha = (rev_parse.stdout or "").strip()
+        rev_parse = subprocess.run(
+            ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            **runtime_subprocess_kwargs,
+        )
+        if rev_parse.returncode != 0:
+            detail = (rev_parse.stderr or rev_parse.stdout or "").strip()
+            raise RuntimeError(f"Tinyhat plugin revision lookup failed: {detail}")
+        plugin_sha = (rev_parse.stdout or "").strip()
     manifest_path = os.path.join(plugin_dir, "openclaw.plugin.json")
     if not os.path.exists(manifest_path):
         raise RuntimeError(f"Tinyhat plugin manifest is missing at {manifest_path}")
@@ -1489,8 +1594,7 @@ def ensure_tinyhat_plugin_installed(
         )
         return True
 
-    install_status = "installed"
-    if marker_json:
+    if marker_json and install_status != "cache_checkout_match":
         install_status = "marker_mismatch_reinstalled"
     cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
     result = subprocess.run(
