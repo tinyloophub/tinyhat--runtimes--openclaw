@@ -238,6 +238,14 @@ BINDING_POLL_BASE_SECONDS = 0.1
 BINDING_POLL_IDLE_CAP_SECONDS = 0.5
 BINDING_POLL_ERROR_BASE_SECONDS = 3
 BINDING_POLL_ERROR_CAP_SECONDS = 10
+# The platform hot-ready claim gate treats an unchanged ready runtime-state
+# mirror as stale after 90s. The ready refresh attempt interval is 15s, but
+# identical runtime-state posts are intentionally deduped by
+# RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS (60s). Keep the whole chain
+# in this order so an idle, unbound Computer stays claimable before the
+# platform stale window expires.
+READY_RUNTIME_STATE_REFRESH_SECONDS = 15
+READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS = 90
 HEARTBEAT_INTERVAL_SECONDS = 30
 GATEWAY_INACTIVE_GRACE_SECONDS = 30
 GATEWAY_RECOVERY_FAILURE_WINDOW_SECONDS = 10 * 60
@@ -6195,6 +6203,8 @@ def _run_one_binding_cycle() -> int:
     binding_cycle_started_wall = time.time()
     binding_cycle_started_monotonic = time.monotonic()
     binding_received_monotonic = binding_cycle_started_monotonic
+    last_ready_runtime_report_monotonic = binding_cycle_started_monotonic
+    report_ready_runtime_state()
     # PR #24 review at 01:19Z — cold-start guard: a profile on disk
     # without a current owner is orphaned by definition. Wipe at most
     # once per Phase B entry to avoid pummeling the filesystem on
@@ -6252,6 +6262,7 @@ def _run_one_binding_cycle() -> int:
         if not cold_start_wipe_attempted:
             cold_start_wipe_attempted = True
             report_ready_runtime_state()
+            last_ready_runtime_report_monotonic = binding_received_monotonic
             try:
                 log.info(
                     "phase B cold-start: running owner-release path "
@@ -6263,6 +6274,13 @@ def _run_one_binding_cycle() -> int:
                 log.warning(
                     "phase B cold-start owner-release failed: %s", exc
                 )
+        now_monotonic = time.monotonic()
+        if (
+            now_monotonic - last_ready_runtime_report_monotonic
+            >= READY_RUNTIME_STATE_REFRESH_SECONDS
+        ):
+            report_ready_runtime_state()
+            last_ready_runtime_report_monotonic = now_monotonic
         empty_count += 1
         if empty_count > 5:
             poll = BINDING_POLL_IDLE_CAP_SECONDS

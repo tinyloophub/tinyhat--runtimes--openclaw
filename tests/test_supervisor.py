@@ -693,6 +693,83 @@ class RuntimeStateV1Tests(unittest.TestCase):
             self.assertEqual(posted[0][1], payload)
             self.assertEqual(posted[0][1]["runtime_health"], "healthy")
 
+    def test_ready_runtime_state_refresh_contract_fits_platform_stale_window(
+        self,
+    ) -> None:
+        self.assertLess(
+            supervisor.READY_RUNTIME_STATE_REFRESH_SECONDS,
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS,
+        )
+        self.assertLess(
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+        worst_case_idle_post_seconds = (
+            supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
+            + supervisor.BINDING_LONG_POLL_WAIT_SECONDS
+            + supervisor.BINDING_POLL_IDLE_CAP_SECONDS
+        )
+        self.assertLess(
+            worst_case_idle_post_seconds,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+
+    def test_ready_runtime_state_posts_again_before_platform_stale_window(
+        self,
+    ) -> None:
+        supervisor._reset_runtime_state_identity_cache()
+        supervisor._reset_runtime_state_platform_post_cache()
+        platform_post_times: list[str] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            self.assertEqual(path, "/hapi/v1/computers/me/runtime-state")
+            platform_post_times.append(body["observed_at"])
+            return {"ok": True}
+
+        base_time = 1_760_000_000
+        post_floor = supervisor.RUNTIME_STATE_PLATFORM_POST_MIN_INTERVAL_SECONDS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "runtime-state.json")
+            env = {
+                **self._env(state_path),
+                "TINYHAT_PLATFORM_BASE_URL": "https://platform.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_repo_version",
+                    return_value="0.11.0",
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_runtime_git_sha",
+                    return_value="abcdef1234567890",
+                ),
+                patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            ):
+                with patch.object(supervisor.time, "time", return_value=base_time):
+                    supervisor.report_ready_runtime_state()
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base_time + post_floor - 1,
+                ):
+                    supervisor.report_ready_runtime_state()
+                with patch.object(
+                    supervisor.time,
+                    "time",
+                    return_value=base_time + post_floor + 1,
+                ):
+                    supervisor.report_ready_runtime_state()
+
+        self.assertEqual(len(platform_post_times), 2)
+        self.assertLess(
+            post_floor + 1,
+            supervisor.READY_RUNTIME_STATE_PLATFORM_STALE_WINDOW_SECONDS,
+        )
+
     def test_ready_runtime_state_mirror_is_best_effort(self) -> None:
         with (
             patch.object(
@@ -4147,6 +4224,76 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         )
         self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
         self.assertEqual(payload, runtime_state_posts[0])
+
+    def test_unbound_phase_refreshes_ready_runtime_state_while_waiting(
+        self,
+    ) -> None:
+        report_events: list[str] = []
+        get_calls: list[str] = []
+        sleeps: list[float] = []
+
+        def fake_report_ready_runtime_state() -> None:
+            report_events.append("ready")
+
+        def fake_get_json(path: str, **_kwargs) -> dict:
+            get_calls.append(path)
+            return {"assigned": False}
+
+        def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", return_value={}),
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    side_effect=fake_get_json,
+                ),
+                patch.object(
+                    supervisor,
+                    "report_ready_runtime_state",
+                    side_effect=fake_report_ready_runtime_state,
+                ),
+                patch.object(supervisor, "_wipe_on_owner_release"),
+                patch.object(supervisor, "checkpoint_supervisor_progress"),
+                patch.object(
+                    supervisor.time,
+                    "monotonic",
+                    side_effect=[0.0, 1.0, 8.0, 9.0, 20.0, 28.0, 29.0],
+                ),
+                patch.object(
+                    supervisor,
+                    "_interruptible_sleep",
+                    side_effect=record_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(
+            get_calls,
+            [
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+            ],
+        )
+        self.assertEqual(len(report_events), 3)
+        self.assertEqual(
+            sleeps,
+            [
+                supervisor.BINDING_POLL_BASE_SECONDS,
+                supervisor.BINDING_POLL_BASE_SECONDS,
+            ],
+        )
 
     def test_refused_ready_transition_still_posts_runtime_state_when_unbound(
         self,
