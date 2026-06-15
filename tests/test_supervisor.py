@@ -4148,6 +4148,76 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
         self.assertEqual(payload, runtime_state_posts[0])
 
+    def test_unbound_phase_refreshes_ready_runtime_state_while_waiting(
+        self,
+    ) -> None:
+        report_events: list[str] = []
+        get_calls: list[str] = []
+        sleeps: list[float] = []
+
+        def fake_report_ready_runtime_state() -> None:
+            report_events.append("ready")
+
+        def fake_get_json(path: str, **_kwargs) -> dict:
+            get_calls.append(path)
+            return {"assigned": False}
+
+        def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                supervisor._stop_holder["stop"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                "DEV_AUTO_COMPUTER_ID": "123",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor, "post_json", return_value={}),
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    side_effect=fake_get_json,
+                ),
+                patch.object(
+                    supervisor,
+                    "report_ready_runtime_state",
+                    side_effect=fake_report_ready_runtime_state,
+                ),
+                patch.object(supervisor, "_wipe_on_owner_release"),
+                patch.object(supervisor, "checkpoint_supervisor_progress"),
+                patch.object(
+                    supervisor.time,
+                    "monotonic",
+                    side_effect=[0.0, 1.0, 8.0, 9.0, 20.0, 28.0, 29.0],
+                ),
+                patch.object(
+                    supervisor,
+                    "_interruptible_sleep",
+                    side_effect=record_sleep,
+                ),
+            ):
+                self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+
+        self.assertEqual(
+            get_calls,
+            [
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+                "/hapi/v1/computers/me/binding?wait_seconds=8",
+            ],
+        )
+        self.assertEqual(len(report_events), 3)
+        self.assertEqual(
+            sleeps,
+            [
+                supervisor.BINDING_POLL_BASE_SECONDS,
+                supervisor.BINDING_POLL_BASE_SECONDS,
+            ],
+        )
+
     def test_refused_ready_transition_still_posts_runtime_state_when_unbound(
         self,
     ) -> None:
