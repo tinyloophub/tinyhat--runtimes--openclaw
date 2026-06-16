@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from typing import Any
@@ -37,6 +38,10 @@ from tinyhat_cli._facade import supervisor_module as _sup
 UNIT_CATEGORY = "release-update-lifecycle"
 
 log = logging.getLogger("tinyhat-supervisor")
+
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+RUNTIME_SOURCE_OVERRIDE_PATH_ENV = "TINYHAT_RUNTIME_SOURCE_OVERRIDE_PATH"
+_DEFAULT_RUNTIME_SOURCE_OVERRIDE_PATH = "/var/lib/tinyhat/tinyhat-runtime-source.json"
 
 # Keys bootstrap.sh writes into /etc/tinyhat/runtime.env. Unknown keys
 # are reported by NAME only — their values are never echoed.
@@ -69,13 +74,76 @@ def _read_runtime_repo_version() -> str:
         return ""
 
 
-def _read_runtime_git_sha() -> str:
-    """Full git SHA of this runtime checkout, or ``""`` when not a git tree.
+def _normalize_git_sha(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if _GIT_SHA_RE.fullmatch(candidate) else ""
 
-    The production Computer clones the runtime repo at a pinned ref, so a
-    ``rev-parse HEAD`` resolves the exact commit. A non-git deployment
-    (e.g. a tarball drop) returns ``""`` and the caller sends a null sha.
-    """
+
+def _runtime_source_override_path() -> str:
+    """Durable runtime source marker path, outside the runtime checkout."""
+    sup = _sup()
+    configured = (os.environ.get(RUNTIME_SOURCE_OVERRIDE_PATH_ENV) or "").strip()
+    default_path = os.path.abspath(
+        os.path.join(sup.openclaw_state_dir(), "tinyhat-runtime-source.json")
+        if sup._dev_mode()
+        else _DEFAULT_RUNTIME_SOURCE_OVERRIDE_PATH
+    )
+    path = os.path.abspath(configured or default_path)
+    checkout_dir = os.path.abspath(sup.runtime_dir())
+    try:
+        inside_checkout = os.path.commonpath([path, checkout_dir]) == checkout_dir
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        log.warning(
+            "%s=%s resolves inside the runtime checkout dir (%s); runtime "
+            "source markers must survive runtime checkouts. Falling back to %s.",
+            RUNTIME_SOURCE_OVERRIDE_PATH_ENV,
+            path,
+            checkout_dir,
+            default_path,
+        )
+        return default_path
+    return path
+
+
+def _read_runtime_source_override_payload() -> dict | None:
+    try:
+        with open(_runtime_source_override_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_runtime_source_override_sha() -> str:
+    payload = _read_runtime_source_override_payload()
+    if not payload:
+        return ""
+    return _normalize_git_sha(payload.get("resolved_commit_sha") or payload.get("sha"))
+
+
+def _write_runtime_source_override(
+    *,
+    repo_ref: str,
+    resolved_commit_sha: str,
+    version: str | None = None,
+) -> None:
+    """Persist the runtime source selected by an in-place component update."""
+    sha = _normalize_git_sha(resolved_commit_sha)
+    if not sha:
+        raise ValueError("runtime source override requires a full git SHA")
+    payload = {
+        "repo_ref": str(repo_ref or "").strip(),
+        "resolved_commit_sha": sha,
+    }
+    if version:
+        payload["version"] = str(version).strip()
+    _sup()._atomic_write_json(_runtime_source_override_path(), payload, mode=0o600)
+
+
+def _read_runtime_git_checkout_sha() -> str:
+    """Full git SHA of this runtime checkout, or ``""`` when not a git tree."""
     sup = _sup()
     try:
         result = subprocess.run(
@@ -89,7 +157,22 @@ def _read_runtime_git_sha() -> str:
         return ""
     if result.returncode != 0:
         return ""
-    return (result.stdout or "").strip()
+    return _normalize_git_sha(result.stdout)
+
+
+def _read_runtime_git_sha() -> str:
+    """Full runtime SHA from git, or a durable source marker when not a git tree.
+
+    Production Computers normally clone the runtime repo at a pinned ref, so
+    ``rev-parse HEAD`` is authoritative. Dev/package-style deployments may copy
+    the runtime source without ``.git``; runtime component updates still carry a
+    platform-resolved SHA, so we persist that marker outside the checkout and
+    report it only when Git cannot answer.
+    """
+    checkout_sha = _read_runtime_git_checkout_sha()
+    if checkout_sha:
+        return checkout_sha
+    return _read_runtime_source_override_sha()
 
 
 def _read_installed_plugin_marker() -> dict:

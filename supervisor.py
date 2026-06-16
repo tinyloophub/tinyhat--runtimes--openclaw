@@ -525,11 +525,15 @@ from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
     wait_for_openclaw_start,
 )
 from tinyhat_cli.units.manifest import (  # noqa: E402,F401
+    RUNTIME_SOURCE_OVERRIDE_PATH_ENV,
     _component_update_state_path,
     _read_component_update_state,
     _read_installed_plugin_marker,
+    _read_runtime_git_checkout_sha,
     _read_runtime_git_sha,
     _read_runtime_repo_version,
+    _runtime_source_override_path,
+    _write_runtime_source_override,
     collect_component_versions,
     manifest_drift,
     manifest_show,
@@ -5402,9 +5406,9 @@ def handle_apply_config_command(command: dict) -> None:
 # up a running Computer::
 #
 #     {"type": "update_component", "revision": <int>, "targets": {
-#         "runtime":   {"ref": "<git tag>"},        # optional
-#         "plugin":    {"ref": "<git tag>"},        # optional
-#         "framework": {"version": "<npm version>"} # optional
+#         "runtime":   {"ref": "<git tag>", "sha": "<resolved sha>"}, # optional
+#         "plugin":    {"ref": "<git tag>"},                         # optional
+#         "framework": {"version": "<npm version>"}                  # optional
 #     }}
 #
 # Only the components present in ``targets`` are touched. The update is
@@ -5576,7 +5580,9 @@ def _update_framework_component(
     return True, None, transaction
 
 
-def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
+def _update_runtime_component(
+    ref: str, *, expected_sha: str | None = None
+) -> tuple[bool, str | None]:
     """Check out the runtime repo to ``ref`` in place (the self-update).
 
     The supervisor updates the very repo it runs from. The running process
@@ -5597,6 +5603,15 @@ def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
     supervisor.
     """
     if _dev_mode():
+        if expected_sha:
+            try:
+                _write_runtime_source_override(
+                    repo_ref=ref,
+                    resolved_commit_sha=expected_sha,
+                    version=_read_runtime_repo_version() or None,
+                )
+            except Exception as exc:  # noqa: BLE001 - dev marker is best effort
+                log.warning("dev runtime source marker write failed: %s", exc)
         log.info("dev runtime: skipping runtime self-update (source is bind-mounted)")
         return True, "dev runtime: runtime self-update skipped (bind-mounted source)"
     d = runtime_dir()
@@ -5626,12 +5641,22 @@ def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
     except Exception as exc:  # noqa: BLE001
         return False, f"runtime update raised: {exc}"
     new_version = _read_runtime_repo_version()
-    new_sha = _read_runtime_git_sha()
+    new_sha = _read_runtime_git_checkout_sha()
+    marker_sha = new_sha or str(expected_sha or "").strip()
+    if marker_sha:
+        try:
+            _write_runtime_source_override(
+                repo_ref=ref,
+                resolved_commit_sha=marker_sha,
+                version=new_version or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - git checkout remains authoritative
+            log.warning("runtime source marker write failed: %s", exc)
     log.info(
         "component update: runtime checked out to ref=%s (version=%s sha=%s)",
         ref,
         new_version or "unknown",
-        new_sha[:12] or "unknown",
+        (new_sha or marker_sha)[:12] or "unknown",
     )
     return True, None
 
@@ -6228,7 +6253,10 @@ def handle_update_component_command(
     )
     runtime_needs_restart = False
     if runtime_requested and all_ok:
-        ok, diag = _update_runtime_component(str(runtime_target["ref"]).strip())
+        ok, diag = _update_runtime_component(
+            str(runtime_target["ref"]).strip(),
+            expected_sha=str(runtime_target.get("sha") or "").strip() or None,
+        )
         all_ok = all_ok and ok
         if diag:
             diagnostics.append(diag)

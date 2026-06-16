@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
-from tinyhat_cli.units import component_update
+from tinyhat_cli.units import component_update, manifest as manifest_unit
 
 _AMBIENT_ENV: dict[str, str | None] = {}
 _AMBIENT_ENV_KEYS = (
@@ -6550,6 +6550,37 @@ class CollectComponentVersionsTests(unittest.TestCase):
     null body); and a failing reader must never break the heartbeat.
     """
 
+    def test_runtime_sha_falls_back_to_source_marker_when_not_git(self) -> None:
+        """Packaged/dev runtimes can report the platform-resolved runtime SHA.
+
+        The dev Docker image copies the runtime source without ``.git``. After a
+        runtime component update, the supervisor persists the target SHA outside
+        the checkout so heartbeats still satisfy the platform's exact-SHA gate.
+        """
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker_path = os.path.join(tmpdir, "runtime-source.json")
+            with patch.dict(
+                os.environ,
+                {supervisor.RUNTIME_SOURCE_OVERRIDE_PATH_ENV: marker_path},
+                clear=False,
+            ):
+                supervisor._write_runtime_source_override(
+                    repo_ref="v0.14.0",
+                    resolved_commit_sha=sha,
+                    version="0.14.0",
+                )
+                with patch.object(
+                    manifest_unit.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="not a git repository",
+                    ),
+                ):
+                    self.assertEqual(supervisor._read_runtime_git_sha(), sha)
+
     def test_includes_all_three_components(self) -> None:
         """All readers resolve → runtime + plugin carry their sha, the
         framework carries ``version`` with ``sha`` always ``None``."""
@@ -7262,6 +7293,10 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self._tmp,
             "plugin-source.json",
         )
+        self._runtime_source_path = os.path.join(
+            self._tmp,
+            "runtime-source.json",
+        )
         # Point the dedupe-state file at a tempdir and force prod (non-dev)
         # mode unless an individual test overrides it.
         self._env = patch.dict(
@@ -7269,6 +7304,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
             {
                 "TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path,
                 "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH": self._plugin_override_path,
+                supervisor.RUNTIME_SOURCE_OVERRIDE_PATH_ENV: self._runtime_source_path,
                 "TINYHAT_PLATFORM_PLUGIN_REPO_URL": "https://example.com/tinyhat.git",
                 "TINYHAT_PLATFORM_PLUGIN_REPO_REF": "boot-ref",
             },
@@ -7517,6 +7553,25 @@ class UpdateComponentCommandTests(unittest.TestCase):
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 4)
         self.assertEqual(kwargs["status"], "applied")
+
+    def test_runtime_target_persists_expected_sha_in_dev_mode(self) -> None:
+        sha = "b" * 40
+        os.environ["TINYHAT_DEV_RUNTIME"] = "1"
+        cmd = {
+            "type": "update_component",
+            "revision": 44,
+            "targets": {"runtime": {"ref": "v0.14.0", "sha": sha}},
+        }
+
+        with patch.object(supervisor, "_restart_supervisor") as restart_supervisor:
+            supervisor.handle_update_component_command(cmd)
+
+        restart_supervisor.assert_not_called()
+        with open(self._runtime_source_path, encoding="utf-8") as fh:
+            marker = json.load(fh)
+        self.assertEqual(marker["repo_ref"], "v0.14.0")
+        self.assertEqual(marker["resolved_commit_sha"], sha)
+        self.assertEqual(self._posted.call_args.kwargs["status"], "applied")
 
     def test_framework_prepare_cleans_npm_temp_and_installs_exact_version(
         self,
