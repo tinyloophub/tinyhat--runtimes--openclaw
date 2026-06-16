@@ -94,6 +94,83 @@ verify_codex_subscription_plugin() {
     | python3 -c 'import json, sys; p=(json.load(sys.stdin).get("plugin") or {}); ids=p.get("providerIds") or p.get("providers") or []; sys.exit(0 if p.get("id") == "codex" and p.get("enabled") is not False and p.get("status") == "loaded" and "codex" in ids else 1)'
 }
 
+remove_path_if_present() {
+  local path="$1"
+  if [[ -e "${path}" || -L "${path}" ]]; then
+    rm -rf -- "${path}"
+  fi
+}
+
+cleanup_stale_openclaw_npm_temp_dirs() {
+  local global_root="$1"
+  local path
+  shopt -s nullglob
+  for path in "${global_root}"/.openclaw-*; do
+    echo "[tinyhat-runtime] removing stale OpenClaw npm temp dir: ${path}"
+    remove_path_if_present "${path}"
+  done
+  shopt -u nullglob
+}
+
+repair_or_cleanup_openclaw_backups() {
+  local global_root="$1"
+  local package_dir="${global_root}/openclaw"
+  local latest=""
+  local backup
+  local backups=()
+  shopt -s nullglob
+  backups=("${global_root}"/.tinyhat-openclaw-backup-*)
+  shopt -u nullglob
+  if [[ "${#backups[@]}" -gt 0 ]]; then
+    latest="${backups[$((${#backups[@]} - 1))]}"
+    echo "[tinyhat-runtime] restoring interrupted OpenClaw framework backup: ${latest}"
+    remove_path_if_present "${package_dir}"
+    mv -- "${latest}" "${package_dir}"
+  fi
+  for backup in "${backups[@]}"; do
+    if [[ -n "${latest}" && "${backup}" == "${latest}" ]]; then
+      continue
+    fi
+    echo "[tinyhat-runtime] removing stale OpenClaw framework backup: ${backup}"
+    remove_path_if_present "${backup}"
+  done
+}
+
+install_openclaw_framework_package() {
+  local install_spec="$1"
+  local global_root
+  global_root="$(npm root -g | awk 'NF { line = $0 } END { print line }')"
+  if [[ -z "${global_root}" ]]; then
+    echo "[tinyhat-runtime] ERROR: npm root -g returned an empty path" >&2
+    return 1
+  fi
+  local package_dir="${global_root}/openclaw"
+  local backup_dir=""
+  local install_log
+  repair_or_cleanup_openclaw_backups "${global_root}"
+  cleanup_stale_openclaw_npm_temp_dirs "${global_root}"
+  if [[ -e "${package_dir}" || -L "${package_dir}" ]]; then
+    backup_dir="${global_root}/.tinyhat-openclaw-backup-$(date +%s)-$$"
+    mv -- "${package_dir}" "${backup_dir}"
+  fi
+  install_log="$(mktemp /tmp/tinyhat-openclaw-npm.XXXXXX.log)"
+  if npm install -g --no-fund --no-audit "${install_spec}" >"${install_log}" 2>&1; then
+    remove_path_if_present "${backup_dir}"
+    rm -f "${install_log}"
+    echo "[tinyhat-runtime] installed framework package: ${install_spec}"
+    return 0
+  fi
+  echo "[tinyhat-runtime] ERROR: npm install failed for ${install_spec}" >&2
+  tail -n 20 "${install_log}" >&2 || true
+  remove_path_if_present "${package_dir}"
+  if [[ -n "${backup_dir}" && ( -e "${backup_dir}" || -L "${backup_dir}" ) ]]; then
+    mv -- "${backup_dir}" "${package_dir}"
+    echo "[tinyhat-runtime] restored previous OpenClaw framework package after failed install" >&2
+  fi
+  rm -f "${install_log}"
+  return 1
+}
+
 if [[ ! -f "${SUPERVISOR_PATH}" ]]; then
   echo "[tinyhat-runtime] ERROR: supervisor.py not found at ${SUPERVISOR_PATH}" >&2
   exit 1
@@ -158,10 +235,10 @@ if [[ "${PRIVATE_ACCESS_PROVIDER}" == "tailscale" ]]; then
 fi
 
 if [[ -n "${OPENCLAW_INSTALL_SPEC}" ]]; then
-  if npm install -g "${OPENCLAW_INSTALL_SPEC}"; then
-    echo "[tinyhat-runtime] installed framework package: ${OPENCLAW_INSTALL_SPEC}"
+  if install_openclaw_framework_package "${OPENCLAW_INSTALL_SPEC}"; then
+    :
   else
-    write_runtime_bootstrap_status "error" "openclaw npm install failed"
+    write_runtime_bootstrap_status "error" "openclaw framework npm install failed"
     echo "[tinyhat-runtime] ERROR: failed to install ${OPENCLAW_INSTALL_SPEC}" >&2
     exit 1
   fi

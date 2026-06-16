@@ -6,10 +6,12 @@ Usage:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
+from tinyhat_cli.units import component_update, manifest as manifest_unit
 
 _AMBIENT_ENV: dict[str, str | None] = {}
 _AMBIENT_ENV_KEYS = (
@@ -59,6 +62,16 @@ def _bootstrap_unit_block(unit_var: str) -> str:
     start = text.index("\n", start) + 1
     end = text.index("\nUNIT", start)
     return text[start:end]
+
+
+def _bootstrap_function_definitions(*names: str) -> str:
+    text = _bootstrap_script_text()
+    blocks: list[str] = []
+    for name in names:
+        start = text.index(f"{name}() {{")
+        end = text.index("\n}\n\n", start) + len("\n}\n")
+        blocks.append(text[start:end])
+    return "\n".join(blocks)
 
 
 def _write_config_in_temp_runtime(
@@ -2183,6 +2196,37 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "_journal_runtime_log_lines",
                     return_value=[],
                 ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
+                ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
+                ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
@@ -2313,6 +2357,37 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "_journal_runtime_log_lines",
                     return_value=[],
                 ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
+                ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
+                ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
@@ -2396,6 +2471,37 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     supervisor,
                     "_journal_runtime_log_lines",
                     return_value=[],
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
+                ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
                 ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep", side_effect=_sleep) as sleep,
@@ -6615,6 +6721,37 @@ class CollectComponentVersionsTests(unittest.TestCase):
     null body); and a failing reader must never break the heartbeat.
     """
 
+    def test_runtime_sha_falls_back_to_source_marker_when_not_git(self) -> None:
+        """Packaged/dev runtimes can report the platform-resolved runtime SHA.
+
+        The dev Docker image copies the runtime source without ``.git``. After a
+        runtime component update, the supervisor persists the target SHA outside
+        the checkout so heartbeats still satisfy the platform's exact-SHA gate.
+        """
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker_path = os.path.join(tmpdir, "runtime-source.json")
+            with patch.dict(
+                os.environ,
+                {supervisor.RUNTIME_SOURCE_OVERRIDE_PATH_ENV: marker_path},
+                clear=False,
+            ):
+                supervisor._write_runtime_source_override(
+                    repo_ref="v0.14.0",
+                    resolved_commit_sha=sha,
+                    version="0.14.0",
+                )
+                with patch.object(
+                    manifest_unit.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="not a git repository",
+                    ),
+                ):
+                    self.assertEqual(supervisor._read_runtime_git_sha(), sha)
+
     def test_includes_all_three_components(self) -> None:
         """All readers resolve → runtime + plugin carry their sha, the
         framework carries ``version`` with ``sha`` always ``None``."""
@@ -6805,6 +6942,89 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         self.assertGreaterEqual(script.count("chown_runtime_paths"), 3)
         self.assertIn('systemctl start "${WORKLOAD_SLICE_UNIT_NAME}"', script)
 
+    def test_bootstrap_framework_install_repairs_stale_global_tree(self) -> None:
+        script = _bootstrap_script_text()
+
+        self.assertIn("cleanup_stale_openclaw_npm_temp_dirs", script)
+        self.assertIn('"${global_root}"/.openclaw-*', script)
+        self.assertIn("repair_or_cleanup_openclaw_backups", script)
+        self.assertIn(".tinyhat-openclaw-backup-", script)
+        self.assertIn(
+            'npm install -g --no-fund --no-audit "${install_spec}"',
+            script,
+        )
+        self.assertIn(
+            "restored previous OpenClaw framework package after failed install",
+            script,
+        )
+
+    def test_bootstrap_framework_install_restores_backup_on_npm_failure(
+        self,
+    ) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "cleanup_stale_openclaw_npm_temp_dirs",
+            "repair_or_cleanup_openclaw_backups",
+            "install_openclaw_framework_package",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_root = os.path.join(tmpdir, "npm-root")
+            package_dir = os.path.join(global_root, "openclaw")
+            backup_dir = os.path.join(
+                global_root, ".tinyhat-openclaw-backup-200-1"
+            )
+            stale_temp = os.path.join(global_root, ".openclaw-gX1GdeX9")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(package_dir)
+            os.makedirs(backup_dir)
+            os.makedirs(stale_temp)
+            os.makedirs(bin_dir)
+            with open(os.path.join(package_dir, "partial.txt"), "w", encoding="utf-8") as fh:
+                fh.write("partial")
+            with open(os.path.join(backup_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+            fake_npm = os.path.join(bin_dir, "npm")
+            with open(fake_npm, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then\n"
+                    "  printf '%s\\n' \"$FAKE_NPM_ROOT\"\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [ \"$1\" = install ]; then\n"
+                    "  mkdir -p \"$FAKE_NPM_ROOT/openclaw\"\n"
+                    "  printf partial > \"$FAKE_NPM_ROOT/openclaw/partial.txt\"\n"
+                    "  printf 'npm error code ENOTEMPTY\\n' >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "exit 2\n"
+                )
+            os.chmod(fake_npm, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    helper_script
+                    + "\ninstall_openclaw_framework_package openclaw@1.5.0",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "FAKE_NPM_ROOT": global_root,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertFalse(os.path.exists(backup_dir))
+            self.assertFalse(os.path.exists(stale_temp))
+
     def test_workload_slice_is_bounded_for_hold_down_sampling(self) -> None:
         unit = _bootstrap_unit_block("WORKLOAD_SLICE_UNIT")
 
@@ -6924,13 +7144,47 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
             patch.object(
                 supervisor, "wait_for_openclaw_start", side_effect=fake_wait
             ) as wait,
+            patch.object(supervisor, "_write_runtime_state") as write_state,
         ):
             supervisor._restart_gateway_for_component_update(binding)
 
         start.assert_called_once_with(binding)
         wait.assert_called_once_with(1234.5)
+        write_state.assert_called_once_with(
+            "healthy",
+            "openclaw gateway restarted after component update",
+            gateway_active=True,
+            gateway_action="restarted",
+            openclaw_ready=True,
+            event_type="gateway_restart",
+            event_detail="component update restarted OpenClaw gateway",
+        )
         self.assertFalse(supervisor._stop_holder["stop"])
         self.assertFalse(supervisor._stop_holder["rebind"])
+        self.assertFalse(supervisor._stop_holder["component_update_restart"])
+
+    def test_component_update_restart_keeps_success_when_state_mirror_fails(
+        self,
+    ) -> None:
+        with (
+            patch.object(supervisor, "start_openclaw_gateway", return_value=1234.5),
+            patch.object(supervisor, "wait_for_openclaw_start"),
+            patch.object(
+                supervisor,
+                "_write_runtime_state",
+                side_effect=PermissionError("state dir unavailable"),
+            ) as write_state,
+            self.assertLogs("tinyhat-supervisor", level="WARNING") as logs,
+        ):
+            supervisor._restart_gateway_for_component_update()
+
+        write_state.assert_called_once()
+        self.assertTrue(
+            any(
+                "runtime_state mirror after gateway restart failed" in line
+                for line in logs.output
+            )
+        )
         self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
     def test_component_update_restart_propagates_readiness_failure(self) -> None:
@@ -6945,9 +7199,11 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
                 "wait_for_openclaw_start",
                 side_effect=RuntimeError("telegram did not reconnect"),
             ),
+            patch.object(supervisor, "_write_runtime_state") as write_state,
         ):
             with self.assertRaisesRegex(RuntimeError, "telegram did not reconnect"):
                 supervisor._restart_gateway_for_component_update()
+        write_state.assert_not_called()
         self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
 
@@ -7208,6 +7464,10 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self._tmp,
             "plugin-source.json",
         )
+        self._runtime_source_path = os.path.join(
+            self._tmp,
+            "runtime-source.json",
+        )
         # Point the dedupe-state file at a tempdir and force prod (non-dev)
         # mode unless an individual test overrides it.
         self._env = patch.dict(
@@ -7215,6 +7475,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
             {
                 "TINYHAT_COMPONENT_UPDATE_STATE_PATH": self._state_path,
                 "TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH": self._plugin_override_path,
+                supervisor.RUNTIME_SOURCE_OVERRIDE_PATH_ENV: self._runtime_source_path,
                 "TINYHAT_PLATFORM_PLUGIN_REPO_URL": "https://example.com/tinyhat.git",
                 "TINYHAT_PLATFORM_PLUGIN_REPO_REF": "boot-ref",
             },
@@ -7382,13 +7643,13 @@ class UpdateComponentCommandTests(unittest.TestCase):
             patch.object(
                 supervisor,
                 "_restart_gateway_for_component_update",
-                side_effect=RuntimeError("telegram did not reconnect"),
+                side_effect=[RuntimeError("telegram did not reconnect"), None],
             ) as restart_gateway,
             patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
         ):
             supervisor.handle_update_component_command(cmd)
 
-        restart_gateway.assert_called_once()
+        self.assertEqual(restart_gateway.call_count, 2)
         restart_supervisor.assert_not_called()
         self._posted.assert_called_once()
         kwargs = self._posted.call_args.kwargs
@@ -7396,6 +7657,8 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["status"], "failed")
         self.assertIn("gateway restart after component update failed", kwargs["diagnostic"])
         self.assertIn("telegram did not reconnect", kwargs["diagnostic"])
+        self.assertIn("plugin rollback restored", kwargs["diagnostic"])
+        self.assertIn("gateway restarted after component rollback", kwargs["diagnostic"])
         state = self._read_state()
         self.assertEqual(state["last_revision"], 32)
         self.assertEqual(state["status"], "failed")
@@ -7432,33 +7695,400 @@ class UpdateComponentCommandTests(unittest.TestCase):
         finally:
             os.environ.pop(supervisor.TINYHAT_PLUGIN_REPO_REF_ENV, None)
 
-    def test_framework_target_invokes_npm_and_verifies_version(self) -> None:
+    def test_framework_target_commits_transaction_after_gateway_smoke(self) -> None:
         cmd = {
             "type": "update_component",
             "revision": 4,
             "targets": {"framework": {"version": "1.5.0"}},
         }
-        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        transaction = {
+            "package_dir": os.path.join(self._tmp, "openclaw"),
+            "backup_dir": "",
+        }
         with (
-            patch.object(supervisor.subprocess, "run", return_value=ok) as runner,
             patch.object(
-                supervisor, "_read_openclaw_framework_version", return_value="1.5.0"
-            ),
+                supervisor,
+                "_prepare_framework_install_transaction",
+                return_value=transaction,
+            ) as prepare,
+            patch.object(supervisor, "_commit_framework_install_transaction") as commit,
             patch.object(
                 supervisor, "_restart_gateway_for_component_update"
             ) as restart_gateway,
         ):
             supervisor.handle_update_component_command(cmd)
 
-        invoked = [call.args[0] for call in runner.call_args_list]
-        self.assertIn(
-            ["npm", "install", "-g", "--no-fund", "--no-audit", "openclaw@1.5.0"],
-            invoked,
-        )
+        prepare.assert_called_once_with("1.5.0")
         restart_gateway.assert_called_once()
+        commit.assert_called_once_with(transaction)
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 4)
         self.assertEqual(kwargs["status"], "applied")
+
+    def test_runtime_target_persists_expected_sha_in_dev_mode(self) -> None:
+        sha = "b" * 40
+        os.environ["TINYHAT_DEV_RUNTIME"] = "1"
+        cmd = {
+            "type": "update_component",
+            "revision": 44,
+            "targets": {"runtime": {"ref": "v0.14.0", "sha": sha}},
+        }
+
+        with patch.object(supervisor, "_restart_supervisor") as restart_supervisor:
+            supervisor.handle_update_component_command(cmd)
+
+        restart_supervisor.assert_not_called()
+        with open(self._runtime_source_path, encoding="utf-8") as fh:
+            marker = json.load(fh)
+        self.assertEqual(marker["repo_ref"], "v0.14.0")
+        self.assertEqual(marker["resolved_commit_sha"], sha)
+        self.assertEqual(self._posted.call_args.kwargs["status"], "applied")
+
+    def test_framework_prepare_cleans_npm_temp_and_installs_exact_version(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            old_package = os.path.join(global_root, "openclaw")
+            stale_temp = os.path.join(global_root, ".openclaw-gX1GdeX9")
+            stale_committed = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-committed-backup-100-1",
+            )
+            stale_copying = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-copying-100-1",
+            )
+            os.makedirs(old_package)
+            os.makedirs(stale_temp)
+            os.makedirs(stale_committed)
+            os.makedirs(stale_copying)
+
+            def fake_run(cmd, **_kwargs):
+                self.assertEqual(
+                    cmd,
+                    [
+                        "npm",
+                        "install",
+                        "-g",
+                        "--no-fund",
+                        "--no-audit",
+                        "openclaw@1.5.0",
+                    ],
+                )
+                os.makedirs(old_package)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(supervisor, "_npm_global_root", return_value=global_root),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor,
+                    "_read_openclaw_framework_version",
+                    return_value="1.5.0",
+                ),
+            ):
+                transaction = supervisor._prepare_framework_install_transaction(
+                    "1.5.0"
+                )
+                supervisor._commit_framework_install_transaction(transaction)
+
+            self.assertTrue(os.path.isdir(old_package))
+            self.assertFalse(os.path.exists(stale_temp))
+            self.assertFalse(os.path.exists(stale_committed))
+            self.assertFalse(os.path.exists(stale_copying))
+            self.assertFalse(os.path.exists(transaction["backup_dir"]))
+
+    def test_framework_prepare_handles_cross_device_backup_move(self) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            os.makedirs(package_dir)
+            with open(os.path.join(package_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+
+            real_replace = os.replace
+
+            def fake_replace(src, dst):
+                if src == package_dir and os.path.basename(dst).startswith(
+                    ".tinyhat-openclaw-backup-"
+                ):
+                    raise OSError(errno.EXDEV, "Invalid cross-device link")
+                return real_replace(src, dst)
+
+            def fake_run(_cmd, **_kwargs):
+                self.assertFalse(os.path.exists(package_dir))
+                os.makedirs(package_dir)
+                with open(
+                    os.path.join(package_dir, "new.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write("new")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(supervisor, "_npm_global_root", return_value=global_root),
+                patch(
+                    "tinyhat_cli.units.component_update.os.replace",
+                    side_effect=fake_replace,
+                ),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor,
+                    "_read_openclaw_framework_version",
+                    return_value="1.5.0",
+                ),
+            ):
+                transaction = supervisor._prepare_framework_install_transaction(
+                    "1.5.0"
+                )
+
+            backup_dir = str(transaction["backup_dir"])
+            self.assertTrue(os.path.isdir(backup_dir))
+            self.assertTrue(os.path.exists(os.path.join(backup_dir, "old.txt")))
+            self.assertFalse(
+                any(
+                    name.startswith(".tinyhat-openclaw-copying-")
+                    for name in os.listdir(global_root)
+                )
+            )
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
+
+            supervisor._commit_framework_install_transaction(transaction)
+            self.assertFalse(os.path.exists(backup_dir))
+
+    def test_framework_commit_cleanup_failure_does_not_repair_old_backup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            backup_dir = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-backup-100-1",
+            )
+            os.makedirs(package_dir)
+            os.makedirs(backup_dir)
+            with open(os.path.join(package_dir, "new.txt"), "w", encoding="utf-8") as fh:
+                fh.write("new")
+            with open(os.path.join(backup_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+
+            original_remove = supervisor._remove_filesystem_entry
+
+            def fake_remove(path):
+                if ".tinyhat-openclaw-committed-backup-" in path:
+                    raise OSError("cleanup denied")
+                return original_remove(path)
+
+            transaction = {"package_dir": package_dir, "backup_dir": backup_dir}
+            with patch.object(
+                supervisor,
+                "_remove_filesystem_entry",
+                side_effect=fake_remove,
+            ):
+                supervisor._commit_framework_install_transaction(transaction)
+
+            self.assertTrue(transaction["committed"])
+            self.assertTrue(transaction["commit_cleanup_failed"])
+            self.assertIn(".tinyhat-openclaw-committed-backup-", transaction["backup_dir"])
+            actions = supervisor._repair_or_cleanup_framework_backups(global_root)
+
+            self.assertEqual(actions, [])
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+            removed = component_update._cleanup_stale_framework_backup_artifacts(
+                global_root
+            )
+
+            self.assertIn(
+                os.path.basename(str(transaction["backup_dir"])),
+                removed,
+            )
+            self.assertFalse(os.path.exists(str(transaction["backup_dir"])))
+
+    def test_framework_npm_enotempty_failure_restores_previous_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            stale_temp = os.path.join(global_root, ".openclaw-gX1GdeX9")
+            os.makedirs(package_dir)
+            os.makedirs(stale_temp)
+            old_marker = os.path.join(package_dir, "old.txt")
+            with open(old_marker, "w", encoding="utf-8") as fh:
+                fh.write("old")
+
+            def fake_run(_cmd, **_kwargs):
+                os.makedirs(package_dir, exist_ok=True)
+                with open(
+                    os.path.join(package_dir, "partial.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write("partial")
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr=(
+                        "npm error code ENOTEMPTY\n"
+                        "npm error path /usr/lib/node_modules/openclaw\n"
+                        "npm error dest /usr/lib/node_modules/.openclaw-gX1GdeX9"
+                    ),
+                )
+
+            with (
+                patch.object(supervisor, "_npm_global_root", return_value=global_root),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                ok, diagnostic, transaction = supervisor._update_framework_component(
+                    "1.5.0"
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNone(transaction)
+            self.assertIsInstance(diagnostic, str)
+            self.assertIn("ENOTEMPTY", diagnostic)
+            self.assertTrue(os.path.exists(old_marker))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertFalse(os.path.exists(stale_temp))
+
+    def test_framework_retry_restores_interrupted_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            stale_backup = os.path.join(
+                global_root, ".tinyhat-openclaw-backup-100-1"
+            )
+            latest_backup = os.path.join(
+                global_root, ".tinyhat-openclaw-backup-200-1"
+            )
+            os.makedirs(stale_backup)
+            os.makedirs(latest_backup)
+            os.makedirs(package_dir)
+            with open(
+                os.path.join(package_dir, "partial.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("partial")
+            with open(
+                os.path.join(latest_backup, "old.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("old")
+
+            actions = supervisor._repair_or_cleanup_framework_backups(global_root)
+
+            self.assertIn("restored .tinyhat-openclaw-backup-200-1", actions)
+            self.assertIn("removed stale .tinyhat-openclaw-backup-100-1", actions)
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertFalse(os.path.exists(stale_backup))
+            self.assertFalse(os.path.exists(latest_backup))
+
+    def test_framework_gateway_failure_rolls_back_and_reports_failed(self) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 41,
+            "targets": {"framework": {"version": "1.5.0"}},
+        }
+        package_dir = os.path.join(self._tmp, "openclaw")
+        backup_dir = os.path.join(self._tmp, ".tinyhat-openclaw-backup-test")
+        os.makedirs(package_dir)
+        os.makedirs(backup_dir)
+        with open(os.path.join(package_dir, "new.txt"), "w", encoding="utf-8") as fh:
+            fh.write("new")
+        with open(os.path.join(backup_dir, "old.txt"), "w", encoding="utf-8") as fh:
+            fh.write("old")
+        transaction = {"package_dir": package_dir, "backup_dir": backup_dir}
+        with (
+            patch.object(
+                supervisor,
+                "_update_framework_component",
+                return_value=(True, None, transaction),
+            ),
+            patch.object(
+                supervisor,
+                "_restart_gateway_for_component_update",
+                side_effect=[
+                    RuntimeError(
+                        "gateway startup failed: Cannot find package highlight.js"
+                    ),
+                    None,
+                ],
+            ) as restart_gateway,
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        self.assertEqual(restart_gateway.call_count, 2)
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 41)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("Cannot find package highlight.js", kwargs["diagnostic"])
+        self.assertIn("framework rollback restored", kwargs["diagnostic"])
+        self.assertIn("gateway restarted after component rollback", kwargs["diagnostic"])
+        self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
+        self.assertFalse(os.path.exists(os.path.join(package_dir, "new.txt")))
+
+    def test_plugin_gateway_failure_rolls_back_previous_source(self) -> None:
+        override_path = os.path.join(self._tmp, "plugin-source.json")
+        env = {
+            supervisor.TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV: override_path,
+        }
+        cmd = {
+            "type": "update_component",
+            "revision": 42,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        calls: list[tuple[str, str]] = []
+
+        def fake_install(*, repo_url, repo_ref):
+            calls.append((repo_url, repo_ref))
+
+        with patch.dict(os.environ, env, clear=False):
+            supervisor._write_tinyhat_plugin_source_override(
+                repo_url="https://example.com/tinyhat.git",
+                repo_ref="v1.0.0",
+                resolved_commit_sha="oldsha",
+                version="1.0.0",
+            )
+            with (
+                patch.object(
+                    supervisor,
+                    "ensure_tinyhat_plugin_installed",
+                    side_effect=fake_install,
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_installed_plugin_marker",
+                    return_value={
+                        "resolved_commit_sha": "newsha",
+                        "version": "2.0.0",
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_restart_gateway_for_component_update",
+                    side_effect=[RuntimeError("plugin failed to load"), None],
+                ) as restart_gateway,
+            ):
+                supervisor.handle_update_component_command(cmd)
+
+            self.assertEqual(
+                calls,
+                [
+                    ("https://example.com/tinyhat.git", "v2.0.0"),
+                    ("https://example.com/tinyhat.git", "v1.0.0"),
+                ],
+            )
+            self.assertEqual(restart_gateway.call_count, 2)
+            self.assertEqual(
+                supervisor._tinyhat_plugin_source(),
+                ("https://example.com/tinyhat.git", "v1.0.0"),
+            )
+
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 42)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("plugin failed to load", kwargs["diagnostic"])
+        self.assertIn("plugin rollback restored", kwargs["diagnostic"])
 
     def test_plugin_and_framework_targets_restart_gateway_once(self) -> None:
         cmd = {
@@ -7469,7 +8099,10 @@ class UpdateComponentCommandTests(unittest.TestCase):
                 "framework": {"version": "1.5.0"},
             },
         }
-        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        transaction = {
+            "package_dir": os.path.join(self._tmp, "openclaw"),
+            "backup_dir": "",
+        }
         with (
             patch.object(supervisor, "ensure_tinyhat_plugin_installed") as installer,
             patch.object(
@@ -7477,10 +8110,12 @@ class UpdateComponentCommandTests(unittest.TestCase):
                 "_read_installed_plugin_marker",
                 return_value={"resolved_commit_sha": "abc123", "version": "2.0.0"},
             ),
-            patch.object(supervisor.subprocess, "run", return_value=ok),
             patch.object(
-                supervisor, "_read_openclaw_framework_version", return_value="1.5.0"
+                supervisor,
+                "_prepare_framework_install_transaction",
+                return_value=transaction,
             ),
+            patch.object(supervisor, "_commit_framework_install_transaction") as commit,
             patch.object(
                 supervisor, "_restart_gateway_for_component_update"
             ) as restart_gateway,
@@ -7489,6 +8124,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
 
         installer.assert_called_once()
         restart_gateway.assert_called_once()
+        commit.assert_called_once_with(transaction)
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 33)
         self.assertEqual(kwargs["status"], "applied")
@@ -7499,11 +8135,13 @@ class UpdateComponentCommandTests(unittest.TestCase):
             "revision": 5,
             "targets": {"framework": {"version": "1.5.0"}},
         }
-        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
         with (
-            patch.object(supervisor.subprocess, "run", return_value=ok),
             patch.object(
-                supervisor, "_read_openclaw_framework_version", return_value="1.4.2"
+                supervisor,
+                "_prepare_framework_install_transaction",
+                side_effect=RuntimeError(
+                    "framework version mismatch after install: wanted 1.5.0, got 1.4.2"
+                ),
             ),
             patch.object(
                 supervisor, "_restart_gateway_for_component_update"
@@ -7610,7 +8248,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
         # the platform records success even if the restart kills this process.
         self.assertEqual(order, ["post", "restart"])
 
-    def test_runtime_success_with_plugin_skips_redundant_gateway_restart(
+    def test_runtime_success_with_plugin_smokes_gateway_before_restart(
         self,
     ) -> None:
         cmd = {
@@ -7622,6 +8260,8 @@ class UpdateComponentCommandTests(unittest.TestCase):
             },
         }
         ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        order: list[str] = []
+        self._posted.side_effect = lambda *a, **k: order.append("post")
         with (
             patch.object(supervisor, "ensure_tinyhat_plugin_installed"),
             patch.object(
@@ -7639,14 +8279,71 @@ class UpdateComponentCommandTests(unittest.TestCase):
             patch.object(
                 supervisor, "_restart_gateway_for_component_update"
             ) as restart_gateway,
-            patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
+            patch.object(
+                supervisor,
+                "_restart_supervisor",
+                side_effect=lambda *a, **k: order.append("restart"),
+            ) as restart_supervisor,
         ):
             supervisor.handle_update_component_command(cmd)
 
-        restart_gateway.assert_not_called()
+        restart_gateway.assert_called_once()
         restart_supervisor.assert_called_once()
+        self.assertEqual(order, ["post", "restart"])
         kwargs = self._posted.call_args.kwargs
         self.assertEqual(kwargs["revision"], 34)
+        self.assertEqual(kwargs["status"], "applied")
+
+    def test_runtime_with_framework_smokes_gateway_before_result_and_restart(
+        self,
+    ) -> None:
+        cmd = {
+            "type": "update_component",
+            "revision": 35,
+            "targets": {
+                "framework": {"version": "1.5.0"},
+                "runtime": {"ref": "v0.10.2"},
+            },
+        }
+        transaction = {
+            "package_dir": os.path.join(self._tmp, "openclaw"),
+            "backup_dir": "",
+        }
+        order: list[str] = []
+        self._posted.side_effect = lambda *a, **k: order.append("post")
+        with (
+            patch.object(
+                supervisor,
+                "_update_framework_component",
+                return_value=(True, None, transaction),
+            ),
+            patch.object(
+                supervisor,
+                "_restart_gateway_for_component_update",
+                side_effect=lambda *_args, **_kwargs: order.append("gateway"),
+            ),
+            patch.object(
+                supervisor,
+                "_commit_framework_install_transaction",
+                side_effect=lambda *_args, **_kwargs: order.append("commit"),
+            ),
+            patch.object(
+                supervisor,
+                "_update_runtime_component",
+                side_effect=lambda *_args, **_kwargs: order.append("runtime")
+                or (True, None),
+            ),
+            patch.object(
+                supervisor,
+                "_restart_supervisor",
+                side_effect=lambda *_args, **_kwargs: order.append("restart"),
+            ),
+        ):
+            supervisor.handle_update_component_command(cmd)
+
+        self.assertEqual(order, ["gateway", "commit", "runtime", "post", "restart"])
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 35)
         self.assertEqual(kwargs["status"], "applied")
 
     def test_runtime_checkout_failure_does_not_restart(self) -> None:

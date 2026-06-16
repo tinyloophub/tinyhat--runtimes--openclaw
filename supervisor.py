@@ -505,6 +505,22 @@ from tinyhat_cli.units.command_lock import (  # noqa: E402,F401
     CommandLockBusy,
     active_transaction as _active_command_lock_transaction,
 )
+from tinyhat_cli.units.component_update import (  # noqa: E402,F401
+    _cleanup_stale_openclaw_npm_temp_dirs,
+    _commit_framework_install_transaction,
+    _framework_backup_dirs,
+    _framework_package_dir,
+    _npm_global_root,
+    _prepare_framework_install_transaction,
+    _read_tinyhat_plugin_source_override,
+    _read_tinyhat_plugin_source_override_payload,
+    _remove_filesystem_entry,
+    _repair_or_cleanup_framework_backups,
+    _restore_tinyhat_plugin_source_override,
+    _rollback_framework_install_transaction,
+    _rollback_plugin_update_transaction,
+    _tinyhat_plugin_source_override_path,
+)
 from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
     delete_telegram_webhook,
     reconcile_runner_lost,
@@ -513,11 +529,15 @@ from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
     wait_for_openclaw_start,
 )
 from tinyhat_cli.units.manifest import (  # noqa: E402,F401
+    RUNTIME_SOURCE_OVERRIDE_PATH_ENV,
     _component_update_state_path,
     _read_component_update_state,
     _read_installed_plugin_marker,
+    _read_runtime_git_checkout_sha,
     _read_runtime_git_sha,
     _read_runtime_repo_version,
+    _runtime_source_override_path,
+    _write_runtime_source_override,
     collect_component_versions,
     manifest_drift,
     manifest_show,
@@ -1099,53 +1119,6 @@ def _tinyhat_plugin_version(plugin_dir: str) -> str:
 
 def _tinyhat_plugin_marker_path() -> str:
     return os.path.join(openclaw_state_dir(), "tinyhat-plugin.version")
-
-
-def _tinyhat_plugin_source_override_path() -> str:
-    configured = (
-        os.environ.get(TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV) or ""
-    ).strip()
-    default_path = os.path.abspath(
-        os.path.join(openclaw_state_dir(), "tinyhat-plugin-source.json")
-        if _dev_mode()
-        else _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
-    )
-    path = os.path.abspath(
-        configured
-        or default_path
-    )
-    checkout_dir = os.path.abspath(runtime_dir())
-    try:
-        inside_checkout = os.path.commonpath([path, checkout_dir]) == checkout_dir
-    except ValueError:
-        inside_checkout = False
-    if inside_checkout:
-        log.warning(
-            "%s=%s resolves inside the runtime checkout dir (%s); plugin "
-            "update source overrides must survive runtime checkouts. Falling "
-            "back to %s.",
-            TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV,
-            path,
-            checkout_dir,
-            default_path,
-        )
-        return default_path
-    return path
-
-
-def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
-    try:
-        with open(_tinyhat_plugin_source_override_path(), encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    repo_url = str(payload.get("repo_url") or "").strip()
-    repo_ref = str(payload.get("repo_ref") or "").strip()
-    if not repo_url or not repo_ref:
-        return None
-    return repo_url, repo_ref
 
 
 def _public_runtime_cache_plugin_hit(
@@ -5543,9 +5516,9 @@ def handle_apply_config_command(command: dict) -> None:
 # up a running Computer::
 #
 #     {"type": "update_component", "revision": <int>, "targets": {
-#         "runtime":   {"ref": "<git tag>"},        # optional
-#         "plugin":    {"ref": "<git tag>"},        # optional
-#         "framework": {"version": "<npm version>"} # optional
+#         "runtime":   {"ref": "<git tag>", "sha": "<resolved sha>"}, # optional
+#         "plugin":    {"ref": "<git tag>"},                         # optional
+#         "framework": {"version": "<npm version>"}                  # optional
 #     }}
 #
 # Only the components present in ``targets`` are touched. The update is
@@ -5639,11 +5612,29 @@ def _restart_gateway_for_component_update(binding: dict | None = None) -> None:
         if restart_result.outcome != "succeeded":
             raise RuntimeError(restart_result.detail or restart_result.outcome)
         log.info("component update: OpenClaw gateway restarted and healthy")
+        try:
+            _write_runtime_state(
+                "healthy",
+                "openclaw gateway restarted after component update",
+                gateway_active=True,
+                gateway_action="restarted",
+                openclaw_ready=True,
+                event_type="gateway_restart",
+                event_detail="component update restarted OpenClaw gateway",
+            )
+        except Exception as exc:  # noqa: BLE001 - update result already succeeded
+            log.warning(
+                "component update: runtime_state mirror after gateway restart "
+                "failed: %s",
+                exc,
+            )
     finally:
         _stop_holder["component_update_restart"] = previous_marker
 
 
-def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
+def _update_plugin_component(
+    ref: str,
+) -> tuple[bool, str | None, dict[str, object] | None]:
     """Update the Tinyhat plugin to ``ref`` in place.
 
     The boot-time ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` stays pinned to the
@@ -5655,7 +5646,15 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
 
     Returns ``(ok, diagnostic)``; never raises.
     """
-    repo_url, _current_ref = _tinyhat_plugin_source()
+    previous_override = _read_tinyhat_plugin_source_override_payload()
+    repo_url, current_ref = _tinyhat_plugin_source()
+    transaction: dict[str, object] = {
+        "repo_url": repo_url,
+        "repo_ref": current_ref,
+        "previous_override": previous_override,
+        "rolled_back": False,
+        "restored_previous": False,
+    }
     try:
         ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=ref)
         marker = _read_installed_plugin_marker()
@@ -5667,47 +5666,33 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
             version=str(marker.get("version") or "").strip() or None,
         )
     except Exception as exc:  # noqa: BLE001 - keep the update non-fatal
-        return False, f"plugin update to {ref} failed: {exc}"
+        return False, f"plugin update to {ref} failed: {exc}", None
     sha = str(marker.get("resolved_commit_sha") or "")
     log.info("component update: plugin now at ref=%s sha=%s", ref, sha[:12])
-    return True, None
+    return True, None, transaction
 
 
-def _update_framework_component(version: str) -> tuple[bool, str | None]:
+def _update_framework_component(
+    version: str,
+) -> tuple[bool, str | None, dict[str, object] | None]:
     """Update the OpenClaw framework (npm package) to ``version`` in place.
 
-    Mirrors the bootstrap install style (``npm install -g`` with the
-    non-interactive flags). Verifies the installed version matches the
-    target via ``_read_openclaw_framework_version`` before declaring success.
-    Returns ``(ok, diagnostic)``; never raises.
+    The new package tree is prepared while the previous global package tree is
+    kept in a Tinyhat-owned backup. The caller must commit that transaction
+    only after the post-update gateway smoke passes, or roll it back if the
+    gateway cannot start from the new tree.
     """
     try:
-        install = subprocess.run(
-            ["npm", "install", "-g", "--no-fund", "--no-audit", f"openclaw@{version}"],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"framework npm install of openclaw@{version} timed out"
+        transaction = _prepare_framework_install_transaction(version)
     except Exception as exc:  # noqa: BLE001
-        return False, f"framework npm install raised: {exc}"
-    if install.returncode != 0:
-        detail = (install.stderr or install.stdout or "").strip()
-        return False, f"framework npm install failed: {detail[:200]}"
-    installed = _read_openclaw_framework_version()
-    if installed != version:
-        return (
-            False,
-            "framework version mismatch after install: "
-            f"wanted {version}, got {installed or 'unknown'}",
-        )
+        return False, f"framework update to openclaw@{version} failed: {exc}", None
     log.info("component update: framework now at %s", version)
-    return True, None
+    return True, None, transaction
 
 
-def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
+def _update_runtime_component(
+    ref: str, *, expected_sha: str | None = None
+) -> tuple[bool, str | None]:
     """Check out the runtime repo to ``ref`` in place (the self-update).
 
     The supervisor updates the very repo it runs from. The running process
@@ -5728,6 +5713,15 @@ def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
     supervisor.
     """
     if _dev_mode():
+        if expected_sha:
+            try:
+                _write_runtime_source_override(
+                    repo_ref=ref,
+                    resolved_commit_sha=expected_sha,
+                    version=_read_runtime_repo_version() or None,
+                )
+            except Exception as exc:  # noqa: BLE001 - dev marker is best effort
+                log.warning("dev runtime source marker write failed: %s", exc)
         log.info("dev runtime: skipping runtime self-update (source is bind-mounted)")
         return True, "dev runtime: runtime self-update skipped (bind-mounted source)"
     d = runtime_dir()
@@ -5757,12 +5751,22 @@ def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
     except Exception as exc:  # noqa: BLE001
         return False, f"runtime update raised: {exc}"
     new_version = _read_runtime_repo_version()
-    new_sha = _read_runtime_git_sha()
+    new_sha = _read_runtime_git_checkout_sha()
+    marker_sha = new_sha or str(expected_sha or "").strip()
+    if marker_sha:
+        try:
+            _write_runtime_source_override(
+                repo_ref=ref,
+                resolved_commit_sha=marker_sha,
+                version=new_version or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - git checkout remains authoritative
+            log.warning("runtime source marker write failed: %s", exc)
     log.info(
         "component update: runtime checked out to ref=%s (version=%s sha=%s)",
         ref,
         new_version or "unknown",
-        new_sha[:12] or "unknown",
+        (new_sha or marker_sha)[:12] or "unknown",
     )
     return True, None
 
@@ -6273,17 +6277,24 @@ def handle_update_component_command(
     diagnostics: list[str] = []
     all_ok = True
     gateway_restart_needed = False
+    plugin_transaction: dict[str, object] | None = None
+    framework_transaction: dict[str, object] | None = None
 
     # Order: plugin -> framework -> runtime. The runtime self-update is the
     # riskiest (rewrites the repo the supervisor runs from and must restart
     # the process), so it runs last — a plugin/framework failure never
-    # strands a half-updated runtime.
+    # strands a half-updated runtime. Plugin/framework targets also verify the
+    # gateway before the runtime checkout happens, so a combined
+    # plugin/framework+runtime revision is not reported applied until the
+    # updated package tree can start the gateway.
 
     plugin_target = targets.get("plugin")
     if isinstance(plugin_target, dict) and str(plugin_target.get("ref") or "").strip():
-        ok, diag = _update_plugin_component(str(plugin_target["ref"]).strip())
+        ok, diag, transaction = _update_plugin_component(str(plugin_target["ref"]).strip())
         all_ok = all_ok and ok
         gateway_restart_needed = gateway_restart_needed or ok
+        if transaction is not None:
+            plugin_transaction = transaction
         if diag:
             diagnostics.append(diag)
 
@@ -6291,11 +6302,57 @@ def handle_update_component_command(
     if isinstance(framework_target, dict) and str(
         framework_target.get("version") or ""
     ).strip():
-        ok, diag = _update_framework_component(str(framework_target["version"]).strip())
+        ok, diag, transaction = _update_framework_component(
+            str(framework_target["version"]).strip()
+        )
         all_ok = all_ok and ok
         gateway_restart_needed = gateway_restart_needed or ok
+        if transaction is not None:
+            framework_transaction = transaction
         if diag:
             diagnostics.append(diag)
+
+    # These handlers run inside the heartbeat thread. Blocking that thread
+    # through the restart/readiness wait is intentional: the update result
+    # must reflect whether the updated gateway process actually loaded and
+    # reconnected Telegram. The Phase D monitor suppresses its inactive
+    # gateway counter while this marker is set so restart failures can be
+    # reported here rather than racing the broken-state path.
+    if gateway_restart_needed:
+        try:
+            _restart_gateway_for_component_update(binding)
+        except Exception as exc:  # noqa: BLE001 - report the failed update
+            all_ok = False
+            diagnostics.append(f"gateway restart after component update failed: {exc}")
+            restart_after_rollback = False
+            if framework_transaction is not None:
+                rollback_detail = _rollback_framework_install_transaction(
+                    framework_transaction
+                )
+                diagnostics.append(rollback_detail)
+                restart_after_rollback = restart_after_rollback or bool(
+                    framework_transaction.get("restored_previous")
+                )
+            if plugin_transaction is not None:
+                rollback_detail = _rollback_plugin_update_transaction(
+                    plugin_transaction
+                )
+                diagnostics.append(rollback_detail)
+                restart_after_rollback = restart_after_rollback or bool(
+                    plugin_transaction.get("restored_previous")
+                )
+            if restart_after_rollback:
+                try:
+                    _restart_gateway_for_component_update(binding)
+                    diagnostics.append("gateway restarted after component rollback")
+                except Exception as rollback_exc:  # noqa: BLE001
+                    diagnostics.append(
+                        "gateway restart after component rollback failed: "
+                        f"{rollback_exc}"
+                    )
+        else:
+            if framework_transaction is not None:
+                _commit_framework_install_transaction(framework_transaction)
 
     # Runtime is handled specially: because the running process is still the
     # OLD code until restarted, on a SUCCESSFUL real (non-dev) checkout we
@@ -6305,8 +6362,11 @@ def handle_update_component_command(
         str(runtime_target.get("ref") or "").strip()
     )
     runtime_needs_restart = False
-    if runtime_requested:
-        ok, diag = _update_runtime_component(str(runtime_target["ref"]).strip())
+    if runtime_requested and all_ok:
+        ok, diag = _update_runtime_component(
+            str(runtime_target["ref"]).strip(),
+            expected_sha=str(runtime_target.get("sha") or "").strip() or None,
+        )
         all_ok = all_ok and ok
         if diag:
             diagnostics.append(diag)
@@ -6314,19 +6374,8 @@ def handle_update_component_command(
         # restart to take effect. Dev mode returns ok with a "skipped"
         # diagnostic and must not restart.
         runtime_needs_restart = ok and not _dev_mode()
-
-    # These handlers run inside the heartbeat thread. Blocking that thread
-    # through the restart/readiness wait is intentional: the update result
-    # must reflect whether the updated gateway process actually loaded and
-    # reconnected Telegram. The Phase D monitor suppresses its inactive
-    # gateway counter while this marker is set so restart failures can be
-    # reported here rather than racing the broken-state path.
-    if gateway_restart_needed and not runtime_needs_restart:
-        try:
-            _restart_gateway_for_component_update(binding)
-        except Exception as exc:  # noqa: BLE001 - report the failed update
-            all_ok = False
-            diagnostics.append(f"gateway restart after component update failed: {exc}")
+    elif runtime_requested:
+        diagnostics.append("runtime update skipped because an earlier component failed")
 
     status = "applied" if all_ok else "failed"
     diagnostic = "; ".join(diagnostics) if diagnostics else None
