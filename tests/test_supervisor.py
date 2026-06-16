@@ -2661,6 +2661,13 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
                     self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["openclaw", "plugins", "inspect", "tinyhat", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"plugin": {"id": "tinyhat"}}),
+                        stderr="",
+                    )
                 self.fail(f"unexpected command: {cmd}")
 
             with (
@@ -2966,6 +2973,13 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
                     self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd == ["openclaw", "plugins", "inspect", "tinyhat", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"plugin": {"id": "tinyhat"}}),
+                        stderr="",
+                    )
                 self.fail(f"unexpected command: {cmd}")
 
             with (
@@ -2979,6 +2993,7 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 [
                     ["git", "-C", plugin_dir, "rev-parse", "HEAD"],
                     ["openclaw", "plugins", "install", plugin_dir, "--force"],
+                    ["openclaw", "plugins", "inspect", "tinyhat", "--json"],
                 ],
             )
 
@@ -3039,6 +3054,7 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                 "TINYHAT_PLATFORM_PLUGIN_REPO_REF": repo_ref,
             }
             calls: list[list[str]] = []
+            inspect_calls = {"n": 0}
 
             def fake_run(cmd, **kwargs):
                 calls.append(list(cmd))
@@ -3064,10 +3080,17 @@ class TinyhatPluginInstallTests(unittest.TestCase):
                     )
                 if cmd == ["openclaw", "plugins", "inspect", "tinyhat", "--json"]:
                     self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    inspect_calls["n"] += 1
+                    if inspect_calls["n"] == 1:
+                        return SimpleNamespace(
+                            returncode=1,
+                            stdout="",
+                            stderr="Plugin not found: tinyhat",
+                        )
                     return SimpleNamespace(
-                        returncode=1,
-                        stdout="",
-                        stderr="Plugin not found: tinyhat",
+                        returncode=0,
+                        stdout=json.dumps({"plugin": {"id": "tinyhat"}}),
+                        stderr="",
                     )
                 if cmd == ["openclaw", "plugins", "install", plugin_dir, "--force"]:
                     self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
@@ -3193,19 +3216,31 @@ class ChatgptSubscriptionProviderTests(unittest.TestCase):
                 supervisor.ensure_chatgpt_subscription_provider_available()
 
     def test_codex_subscription_plugin_skips_install_when_available(self) -> None:
-        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            calls: list[list[str]] = []
 
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            self.assertEqual(cmd, ["openclaw", "plugins", "inspect", "codex", "--json"])
-            return SimpleNamespace(
-                returncode=0,
-                stdout=self._codex_plugin_payload(),
-                stderr="",
-            )
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                self.assertEqual(
+                    cmd,
+                    ["openclaw", "plugins", "inspect", "codex", "--json"],
+                )
+                self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=self._codex_plugin_payload(),
+                    stderr="",
+                )
 
-        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
-            self.assertTrue(supervisor.ensure_codex_subscription_plugin_installed())
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(supervisor.ensure_codex_subscription_plugin_installed())
 
         self.assertEqual(calls, [["openclaw", "plugins", "inspect", "codex", "--json"]])
 
@@ -3262,34 +3297,135 @@ class ChatgptSubscriptionProviderTests(unittest.TestCase):
             ],
         )
 
+    def test_codex_subscription_plugin_install_runs_as_runtime_user(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(
+                    tmpdir,
+                    "openclaw",
+                    "tinyhat-secrets.json",
+                ),
+            }
+            calls: list[list[str]] = []
+            chowned: list[tuple[str, int, int]] = []
+
+            def fake_chown(path, uid, gid):
+                chowned.append((path, uid, gid))
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                self.assertIs(
+                    kwargs.get("preexec_fn"),
+                    supervisor._drop_to_runtime_user_for_exec,
+                )
+                if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    if calls.count(list(cmd)) == 1:
+                        return SimpleNamespace(
+                            returncode=1,
+                            stdout="",
+                            stderr="Plugin not found: codex",
+                        )
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=self._codex_plugin_payload(),
+                        stderr="",
+                    )
+                if cmd == [
+                    "openclaw",
+                    "plugins",
+                    "install",
+                    "@openclaw/codex",
+                    "--force",
+                ]:
+                    self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout="Installed plugin: codex",
+                        stderr="",
+                    )
+                self.fail(f"unexpected command: {cmd}")
+
+            with patch.dict(os.environ, env, clear=False):
+                config_path = supervisor.openclaw_config_path()
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as fh:
+                    json.dump({"plugins": {"entries": {}}}, fh)
+
+                with (
+                    patch.object(
+                        supervisor,
+                        "_runtime_ownership_ids",
+                        return_value=(4242, 4243),
+                    ),
+                    patch.object(supervisor.os, "chown", side_effect=fake_chown),
+                    patch.object(supervisor.os, "lchown", side_effect=fake_chown),
+                    patch.object(
+                        supervisor.subprocess,
+                        "run",
+                        side_effect=fake_run,
+                    ),
+                ):
+                    self.assertTrue(
+                        supervisor.ensure_codex_subscription_plugin_installed()
+                    )
+
+            self.assertEqual(
+                calls,
+                [
+                    ["openclaw", "plugins", "inspect", "codex", "--json"],
+                    ["openclaw", "plugins", "install", "@openclaw/codex", "--force"],
+                    ["openclaw", "plugins", "inspect", "codex", "--json"],
+                ],
+            )
+            chowned_paths = {path for path, _uid, _gid in chowned}
+            self.assertIn(config_path, chowned_paths)
+            self.assertIn(tmpdir, chowned_paths)
+            self.assertTrue(
+                all((uid, gid) == (4242, 4243) for _p, uid, gid in chowned)
+            )
+
     def test_codex_subscription_plugin_install_failure_raises(self) -> None:
-        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            calls: list[list[str]] = []
 
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
-                return SimpleNamespace(
-                    returncode=1,
-                    stdout="",
-                    stderr="Plugin not found: codex",
-                )
-            if cmd == [
-                "openclaw",
-                "plugins",
-                "install",
-                "@openclaw/codex",
-                "--force",
-            ]:
-                return SimpleNamespace(
-                    returncode=1,
-                    stdout="",
-                    stderr="npm registry timeout",
-                )
-            self.fail(f"unexpected command: {cmd}")
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="Plugin not found: codex",
+                    )
+                if cmd == [
+                    "openclaw",
+                    "plugins",
+                    "install",
+                    "@openclaw/codex",
+                    "--force",
+                ]:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="npm registry timeout",
+                    )
+                self.fail(f"unexpected command: {cmd}")
 
-        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
-            with self.assertRaises(RuntimeError) as raised:
-                supervisor.ensure_codex_subscription_plugin_installed()
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    supervisor.ensure_codex_subscription_plugin_installed()
 
         self.assertIn("Codex subscription plugin install failed", str(raised.exception))
         self.assertEqual(
@@ -3301,33 +3437,42 @@ class ChatgptSubscriptionProviderTests(unittest.TestCase):
         )
 
     def test_codex_subscription_plugin_verify_failure_raises(self) -> None:
-        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            calls: list[list[str]] = []
 
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
-                return SimpleNamespace(
-                    returncode=1,
-                    stdout="",
-                    stderr="Plugin not found: codex",
-                )
-            if cmd == [
-                "openclaw",
-                "plugins",
-                "install",
-                "@openclaw/codex",
-                "--force",
-            ]:
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout="Installed plugin: codex",
-                    stderr="",
-                )
-            self.fail(f"unexpected command: {cmd}")
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                self.assertEqual(kwargs["env"]["OPENCLAW_STATE_DIR"], tmpdir)
+                if cmd == ["openclaw", "plugins", "inspect", "codex", "--json"]:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="Plugin not found: codex",
+                    )
+                if cmd == [
+                    "openclaw",
+                    "plugins",
+                    "install",
+                    "@openclaw/codex",
+                    "--force",
+                ]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout="Installed plugin: codex",
+                        stderr="",
+                    )
+                self.fail(f"unexpected command: {cmd}")
 
-        with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
-            with self.assertRaises(RuntimeError) as raised:
-                supervisor.ensure_codex_subscription_plugin_installed()
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    supervisor.ensure_codex_subscription_plugin_installed()
 
         self.assertIn(
             "install completed but provider 'codex' is still unavailable",
@@ -4356,42 +4501,16 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         )
         self.assertEqual(payload, runtime_state_posts[0])
 
-    def test_codex_plugin_failure_does_not_disable_openai_subscription_provider(
-        self,
-    ) -> None:
-        import threading as threading_mod
-
+    def test_platform_setup_failure_fails_closed_before_config_apply(self) -> None:
         binding = _subscription_binding(with_openrouter=True)
-        captured_config_kwargs: list[dict] = []
+        posts: list[tuple[str, dict]] = []
 
-        class _NoopThread:
-            def __init__(self, target, daemon):
-                self._target = target
-                self.daemon = daemon
-
-            def start(self):
-                pass
-
-            def join(self, timeout=None):
-                pass
-
-        def fake_write_openclaw_config(config_binding: dict, **kwargs) -> None:
-            self.assertEqual(config_binding, binding)
-            captured_config_kwargs.append(dict(kwargs))
-
-        def fake_gateway_active() -> bool:
-            supervisor._stop_holder["stop"] = True
-            return True
-
-        config_fingerprint = {
-            "algorithm": "sha256",
-            "source": "openclaw_config",
-            "path": "/etc/openclaw/openclaw.json",
-            "value": "test",
-        }
+        def fake_post_json(path: str, body: dict) -> dict:
+            posts.append((path, dict(body)))
+            return {}
 
         with (
-            patch.object(supervisor, "post_json", return_value={}),
+            patch.object(supervisor, "post_json", side_effect=fake_post_json),
             patch.object(
                 supervisor,
                 "get_json",
@@ -4399,55 +4518,32 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             ),
             patch.object(
                 supervisor,
-                "try_install_codex_subscription_plugin",
-                return_value=False,
+                "prepare_platform_runtime_setup",
+                side_effect=RuntimeError("Tinyhat platform plugin unavailable"),
             ),
+            patch.object(supervisor, "write_openclaw_config") as write_config,
             patch.object(
                 supervisor,
-                "try_check_chatgpt_subscription_provider",
-                return_value=True,
-            ),
-            patch.object(supervisor, "try_install_tinyhat_plugin", return_value=True),
-            patch.object(
-                supervisor,
-                "write_openclaw_config",
-                side_effect=fake_write_openclaw_config,
-            ),
-            patch.object(
-                supervisor,
-                "_openclaw_config_fingerprint",
-                return_value=config_fingerprint,
-            ),
-            patch.object(
-                supervisor,
-                "probe_current_openclaw_gateway_health",
-                return_value=(True, "ok"),
-            ),
-            patch.object(supervisor, "_write_runtime_state"),
-            patch.object(supervisor, "delete_telegram_webhook"),
-            patch.object(supervisor, "start_openclaw_gateway", return_value=123.0),
-            patch.object(supervisor, "wait_for_openclaw_start"),
-            patch.object(
-                supervisor,
-                "is_openclaw_gateway_active",
-                side_effect=fake_gateway_active,
-            ),
-            patch.object(supervisor, "stop_openclaw_gateway"),
-            patch.object(supervisor.time, "sleep"),
-            patch.object(threading_mod, "Thread", _NoopThread),
+                "ensure_openclaw_gateway_ready",
+            ) as ensure_gateway,
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gateway,
+            patch.object(supervisor, "checkpoint_supervisor_progress"),
         ):
-            self.assertEqual(supervisor._run_one_binding_cycle(), 0)
+            self.assertEqual(supervisor._run_one_binding_cycle(), 1)
 
         self.assertEqual(
-            captured_config_kwargs,
-            [
-                {
-                    "enable_tinyhat_plugin": True,
-                    "enable_chatgpt_subscription_provider": True,
-                    "enable_codex_subscription_plugins": False,
-                }
-            ],
+            posts[0][1],
+            {"state": "ready", "detail": "bootstrap complete"},
         )
+        self.assertEqual(posts[-1][0], "/hapi/v1/computers/me/state")
+        self.assertEqual(posts[-1][1]["state"], "broken")
+        self.assertIn(
+            "Tinyhat platform plugin unavailable",
+            posts[-1][1]["detail"],
+        )
+        write_config.assert_not_called()
+        ensure_gateway.assert_not_called()
+        stop_gateway.assert_called_once()
 
     def test_binding_cycle_uses_long_poll_and_reports_phase_timings(self) -> None:
         import threading as threading_mod
@@ -4514,18 +4610,12 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                     patch.object(supervisor, "get_json", side_effect=fake_get_json),
                     patch.object(
                         supervisor,
-                        "try_install_codex_subscription_plugin",
-                        return_value=True,
-                    ),
-                    patch.object(
-                        supervisor,
-                        "try_check_chatgpt_subscription_provider",
-                        return_value=True,
-                    ),
-                    patch.object(
-                        supervisor,
-                        "try_install_tinyhat_plugin",
-                        return_value=True,
+                        "prepare_platform_runtime_setup",
+                        return_value={
+                            "codex_subscription_plugin_installed": True,
+                            "chatgpt_subscription_provider_available": True,
+                            "tinyhat_plugin_installed": True,
+                        },
                     ),
                     patch.object(supervisor, "write_openclaw_config"),
                     patch.object(
@@ -4706,15 +4796,13 @@ class BindingCycleManualRecoveryTests(unittest.TestCase):
             ),
             patch.object(
                 supervisor,
-                "try_install_codex_subscription_plugin",
-                return_value=True,
+                "prepare_platform_runtime_setup",
+                return_value={
+                    "codex_subscription_plugin_installed": True,
+                    "chatgpt_subscription_provider_available": True,
+                    "tinyhat_plugin_installed": True,
+                },
             ),
-            patch.object(
-                supervisor,
-                "try_check_chatgpt_subscription_provider",
-                return_value=True,
-            ),
-            patch.object(supervisor, "try_install_tinyhat_plugin", return_value=True),
             patch.object(supervisor, "write_openclaw_config"),
             patch.object(
                 supervisor,
@@ -6694,6 +6782,7 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         unit = _bootstrap_unit_block("SUPERVISOR_UNIT")
 
         for directive in (
+            "After=network-online.target google-startup-scripts.service",
             "Type=notify",
             "NotifyAccess=main",
             "WatchdogSec=180s",
@@ -6715,6 +6804,21 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             "TimeoutStopSec=30",
         ):
             self.assertIn(directive, unit)
+
+    def test_bootstrap_queues_supervisor_start_after_gce_startup_scripts(self) -> None:
+        script = _bootstrap_script_text()
+        unit = _bootstrap_unit_block("SUPERVISOR_UNIT")
+
+        self.assertNotIn('systemctl enable --now "${SUPERVISOR_UNIT_NAME}"', script)
+        self.assertNotIn('systemctl enable "${SUPERVISOR_UNIT_NAME}"', script)
+        self.assertIn('systemctl disable "${SUPERVISOR_UNIT_NAME}"', script)
+        self.assertIn('systemctl start --no-block "${SUPERVISOR_UNIT_NAME}"', script)
+        self.assertNotIn('systemctl start "${SUPERVISOR_UNIT_NAME}"', script)
+        self.assertNotIn("WantedBy=multi-user.target", unit)
+        self.assertIn(
+            "[tinyhat-runtime] queueing supervisor start after bootstrap",
+            script,
+        )
 
 
 class ComponentUpdateGatewayRestartTests(unittest.TestCase):
@@ -6767,6 +6871,244 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "telegram did not reconnect"):
                 supervisor._restart_gateway_for_component_update()
         self.assertFalse(supervisor._stop_holder["component_update_restart"])
+
+
+class PlatformRuntimeSetupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._stop_holder = dict(supervisor._stop_holder)
+        supervisor._stop_holder.update({"stop": False, "rebind": False})
+
+    def tearDown(self) -> None:
+        supervisor._stop_holder.clear()
+        supervisor._stop_holder.update(self._stop_holder)
+
+    def test_openclaw_cli_wait_retries_until_cli_works(self) -> None:
+        writes: list[tuple[str, str]] = []
+        sleeps: list[float] = []
+
+        def fake_write(state: str, detail: str, **_kwargs) -> None:
+            writes.append((state, detail))
+
+        with (
+            patch.object(
+                supervisor.shutil,
+                "which",
+                side_effect=[None, "/usr/local/bin/openclaw"],
+            ),
+            patch.object(
+                supervisor.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout="2026.6.1\n", stderr=""),
+            ) as run,
+            patch.object(supervisor, "_write_runtime_state", side_effect=fake_write),
+            patch.object(
+                supervisor,
+                "checkpoint_supervisor_progress",
+                return_value=True,
+            ) as checkpoint,
+            patch.object(
+                supervisor, "_interruptible_sleep", side_effect=lambda s: sleeps.append(s)
+            ),
+        ):
+            self.assertTrue(
+                supervisor.wait_for_openclaw_cli_available(
+                    timeout_seconds=5,
+                    retry_seconds=0.25,
+                )
+            )
+
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], "openclaw_not_ready")
+        self.assertIn("waiting for OpenClaw CLI", writes[0][1])
+        self.assertEqual(sleeps, [0.25])
+        checkpoint.assert_called_once_with("phase-c-openclaw-cli-wait")
+        run.assert_called_once_with(
+            ["openclaw", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=supervisor.OPENCLAW_CLI_VERSION_TIMEOUT_SECONDS,
+            env=supervisor._openclaw_cli_env(),
+        )
+
+    def test_openclaw_cli_wait_fails_closed_after_timeout(self) -> None:
+        with (
+            patch.object(supervisor.shutil, "which", return_value=None),
+            patch.object(supervisor, "_write_runtime_state") as write_state,
+            patch.object(
+                supervisor,
+                "checkpoint_supervisor_progress",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "OpenClaw CLI unavailable"):
+                supervisor.wait_for_openclaw_cli_available(
+                    timeout_seconds=0,
+                    retry_seconds=0,
+                )
+        write_state.assert_called_once()
+
+    def test_required_platform_setup_retries_and_sanitizes_diagnostics(self) -> None:
+        attempts = {"n": 0}
+        writes: list[tuple[str, str]] = []
+
+        def action() -> bool:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("failed with api_key=sk-test-secret-value")
+            return True
+
+        def fake_write(state: str, detail: str, **_kwargs) -> None:
+            writes.append((state, detail))
+
+        with (
+            patch.object(supervisor, "_write_runtime_state", side_effect=fake_write),
+            patch.object(
+                supervisor,
+                "checkpoint_supervisor_progress",
+                return_value=True,
+            ),
+            patch.object(supervisor, "_interruptible_sleep", return_value=None),
+        ):
+            self.assertTrue(
+                supervisor._run_required_platform_setup(
+                    "Tinyhat platform plugin",
+                    action,
+                    retry_delays=(0,),
+                )
+            )
+
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(writes[0][0], "openclaw_not_ready")
+        self.assertIn("Tinyhat platform plugin unavailable", writes[0][1])
+        self.assertNotIn("sk-test-secret-value", writes[0][1])
+
+    def test_prepare_platform_runtime_setup_requires_subscription_provider_when_profile_present(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        with (
+            patch.object(supervisor, "wait_for_openclaw_cli_available") as wait_cli,
+            patch.object(
+                supervisor,
+                "ensure_codex_subscription_plugin_installed",
+                side_effect=lambda: calls.append("codex") or True,
+            ),
+            patch.object(
+                supervisor,
+                "read_chatgpt_subscription_profile",
+                return_value={"__profile_id": "openai:owner"},
+            ),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                side_effect=lambda: calls.append("openai") or True,
+            ),
+            patch.object(
+                supervisor,
+                "ensure_tinyhat_plugin_installed",
+                side_effect=lambda: calls.append("tinyhat") or True,
+            ),
+        ):
+            result = supervisor.prepare_platform_runtime_setup(
+                {"llm_auth_mode": "chatgpt_subscription"}
+            )
+
+        wait_cli.assert_called_once()
+        self.assertEqual(calls, ["codex", "openai", "tinyhat"])
+        self.assertTrue(result["codex_subscription_plugin_installed"])
+        self.assertTrue(result["chatgpt_subscription_provider_available"])
+        self.assertTrue(result["tinyhat_plugin_installed"])
+
+    def test_prepare_platform_runtime_setup_keeps_codex_plugin_optional_for_platform_credits(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fail_codex() -> bool:
+            calls.append("codex")
+            raise RuntimeError("codex registry unavailable")
+
+        def fail_openai() -> bool:
+            calls.append("openai")
+            raise RuntimeError("openai provider unavailable")
+
+        with (
+            patch.object(supervisor, "wait_for_openclaw_cli_available") as wait_cli,
+            patch.object(
+                supervisor,
+                "ensure_codex_subscription_plugin_installed",
+                side_effect=fail_codex,
+            ),
+            patch.object(
+                supervisor,
+                "ensure_chatgpt_subscription_provider_available",
+                side_effect=fail_openai,
+            ),
+            patch.object(
+                supervisor,
+                "ensure_tinyhat_plugin_installed",
+                side_effect=lambda: calls.append("tinyhat") or True,
+            ),
+        ):
+            result = supervisor.prepare_platform_runtime_setup(
+                {
+                    "telegram_bot_username": "Tinychattestbot",
+                    "openrouter_api_key": "sk-or-v1-child",
+                }
+            )
+
+        wait_cli.assert_called_once()
+        self.assertEqual(calls, ["codex", "openai", "tinyhat"])
+        self.assertFalse(result["codex_subscription_plugin_installed"])
+        self.assertFalse(result["chatgpt_subscription_provider_available"])
+        self.assertTrue(result["tinyhat_plugin_installed"])
+
+    def test_binding_cycle_fails_closed_before_gateway_when_setup_fails(self) -> None:
+        posts: list[tuple[str, dict]] = []
+        binding = {
+            "telegram_bot_username": "Tinychattestbot",
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_token": "token",
+        }
+
+        def fake_post(path: str, body: dict) -> dict:
+            posts.append((path, body))
+            return {}
+
+        with (
+            patch.object(supervisor, "post_json", side_effect=fake_post),
+            patch.object(
+                supervisor,
+                "get_json",
+                return_value={"assigned": True, "binding": binding},
+            ),
+            patch.object(supervisor, "report_ready_runtime_state"),
+            patch.object(supervisor, "_wipe_on_owner_release"),
+            patch.object(
+                supervisor,
+                "checkpoint_supervisor_progress",
+                return_value=True,
+            ),
+            patch.object(
+                supervisor,
+                "prepare_platform_runtime_setup",
+                side_effect=RuntimeError("Tinyhat platform plugin unavailable"),
+            ),
+            patch.object(supervisor, "write_openclaw_config") as write_config,
+            patch.object(supervisor, "start_openclaw_gateway") as start_gateway,
+            patch.object(supervisor, "stop_openclaw_gateway") as stop_gateway,
+        ):
+            self.assertEqual(supervisor._run_one_binding_cycle(), 1)
+
+        self.assertEqual(posts[0][0], "/hapi/v1/computers/me/state")
+        self.assertEqual(posts[0][1]["state"], "ready")
+        self.assertEqual(posts[-1][0], "/hapi/v1/computers/me/state")
+        self.assertEqual(posts[-1][1]["state"], "broken")
+        self.assertIn("platform setup/gateway start failed", posts[-1][1]["detail"])
+        write_config.assert_not_called()
+        start_gateway.assert_not_called()
+        stop_gateway.assert_called_once()
 
 
 class UpdateComponentCommandTests(unittest.TestCase):
@@ -8200,6 +8542,9 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
             ),
             patch.object(supervisor.os, "chown", side_effect=fake_chown),
             patch.object(supervisor.os, "lchown", side_effect=fake_chown),
+            patch.object(
+                supervisor, "_is_tinyhat_plugin_registered", return_value=True
+            ),
         ):
             self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
         return plugin_dir
@@ -8370,6 +8715,9 @@ class TinyhatPluginRuntimeOwnershipTests(unittest.TestCase):
                 ),
                 patch.object(supervisor.os, "chown", side_effect=fake_chown),
                 patch.object(supervisor.os, "lchown", side_effect=fake_chown),
+                patch.object(
+                    supervisor, "_is_tinyhat_plugin_registered", return_value=True
+                ),
             ):
                 self.assertTrue(supervisor.ensure_tinyhat_plugin_installed())
 

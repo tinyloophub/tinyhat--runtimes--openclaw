@@ -304,12 +304,15 @@ StandardOutput=journal
 StandardError=journal
 UNIT
 
-# The supervisor: enabled on boot + restarted on failure. Owns
-# binding coordination and starts/stops the gateway unit above.
+# The supervisor: started by the GCE startup script after this bootstrap
+# completes on every boot, then restarted by systemd on failure. Do not enable
+# it directly under multi-user.target: combined with
+# After=google-startup-scripts.service, that creates an ordering cycle and can
+# make reboot recovery depend on which job systemd deletes.
 cat > "${SUPERVISOR_UNIT}" <<UNIT
 [Unit]
 Description=Tinyhat OpenClaw Computer supervisor
-After=network-online.target
+After=network-online.target google-startup-scripts.service
 Wants=network-online.target
 StartLimitIntervalSec=10min
 StartLimitBurst=6
@@ -337,13 +340,15 @@ RestartSec=10
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
 systemctl start "${WORKLOAD_SLICE_UNIT_NAME}"
-systemctl enable --now "${SUPERVISOR_UNIT_NAME}"
+# Remove stale boot-target symlinks from older bootstrap versions. The GCE
+# metadata startup script runs this bootstrap on each boot and queues the
+# supervisor after the runtime package/plugin install has completed.
+systemctl disable "${SUPERVISOR_UNIT_NAME}" >/dev/null 2>&1 || true
+echo "[tinyhat-runtime] queueing supervisor start after bootstrap"
+systemctl start --no-block "${SUPERVISOR_UNIT_NAME}"
 
 echo "[tinyhat-runtime] bootstrap complete"

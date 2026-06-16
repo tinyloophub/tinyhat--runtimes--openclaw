@@ -275,6 +275,10 @@ OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS = (5, 10, 20, 30, 30)
 OPENCLAW_SECRETS_RELOAD_ATTEMPTS = (
     len(OPENCLAW_SECRETS_RELOAD_RETRY_DELAYS_SECONDS) + 1
 )
+OPENCLAW_CLI_READY_TIMEOUT_SECONDS = 180
+OPENCLAW_CLI_READY_RETRY_SECONDS = 5
+OPENCLAW_CLI_VERSION_TIMEOUT_SECONDS = 10
+PLATFORM_SETUP_RETRY_DELAYS_SECONDS = (5, 10, 20, 30, 30)
 
 # Marker bearer used in dev mode so the request reaches the
 # Computer-authenticated platform routes. The platform's verifier
@@ -1304,9 +1308,11 @@ def ensure_codex_subscription_plugin_installed() -> bool:
     config and before starting the gateway; the generated config below includes
     the same plugin entries so the installer's config mutation is not lost.
     """
+    _sync_openclaw_cli_runtime_ownership()
     if _is_codex_subscription_plugin_available():
         return True
 
+    runtime_subprocess_kwargs = _runtime_user_subprocess_kwargs()
     result = subprocess.run(
         [
             "openclaw",
@@ -1319,7 +1325,9 @@ def ensure_codex_subscription_plugin_installed() -> bool:
         text=True,
         timeout=300,
         env=_openclaw_cli_env(),
+        **runtime_subprocess_kwargs,
     )
+    _sync_openclaw_cli_runtime_ownership()
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Codex subscription plugin install failed: {detail}")
@@ -1333,19 +1341,6 @@ def ensure_codex_subscription_plugin_installed() -> bool:
         CODEX_SUBSCRIPTION_PLUGIN_PACKAGE,
     )
     return True
-
-
-def try_install_codex_subscription_plugin() -> bool:
-    """Best-effort install for ChatGPT/Codex subscription link support."""
-    try:
-        return ensure_codex_subscription_plugin_installed()
-    except Exception as exc:
-        log.warning(
-            "Codex subscription plugin unavailable; subscription linking may "
-            "need platform credits or manual repair: %s",
-            exc,
-        )
-        return False
 
 
 def ensure_chatgpt_subscription_provider_available() -> bool:
@@ -1368,6 +1363,173 @@ def try_check_chatgpt_subscription_provider() -> bool:
             exc,
         )
         return False
+
+
+def wait_for_openclaw_cli_available(
+    *,
+    timeout_seconds: float = OPENCLAW_CLI_READY_TIMEOUT_SECONDS,
+    retry_seconds: float = OPENCLAW_CLI_READY_RETRY_SECONDS,
+) -> bool:
+    """Wait for the OpenClaw CLI before mutating plugin/config state.
+
+    On GCE reboot, google-startup-scripts may be reinstalling the OpenClaw npm
+    package while systemd is starting services. Treat a missing or transiently
+    broken CLI as a boot-in-progress condition, not as permission to write
+    degraded config and continue active.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    attempt = 0
+    last_detail = "OpenClaw CLI is not available"
+    while not _stop_holder["stop"]:
+        attempt += 1
+        openclaw_path = shutil.which("openclaw")
+        if openclaw_path:
+            try:
+                result = subprocess.run(
+                    ["openclaw", "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=OPENCLAW_CLI_VERSION_TIMEOUT_SECONDS,
+                    env=_openclaw_cli_env(),
+                )
+            except Exception as exc:
+                last_detail = f"OpenClaw CLI version check failed: {exc}"
+            else:
+                if result.returncode == 0:
+                    log.info(
+                        "OpenClaw CLI available after %d attempt(s): %s",
+                        attempt,
+                        openclaw_path,
+                    )
+                    return True
+                detail = (result.stderr or result.stdout or "").strip()
+                last_detail = (
+                    "OpenClaw CLI version check failed"
+                    + (f": {detail}" if detail else "")
+                )
+        else:
+            last_detail = "OpenClaw CLI is not on PATH"
+
+        safe_detail = _sanitize_runtime_state_text(last_detail, limit=255)
+        _write_runtime_state(
+            "openclaw_not_ready",
+            f"waiting for OpenClaw CLI before platform setup: {safe_detail}",
+        )
+        checkpoint_supervisor_progress("phase-c-openclaw-cli-wait")
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                "OpenClaw CLI unavailable before platform setup: "
+                f"{safe_detail}"
+            )
+        _interruptible_sleep(min(max(0.0, retry_seconds), deadline - now))
+    raise RuntimeError("OpenClaw CLI wait interrupted by clean shutdown")
+
+
+def _run_required_platform_setup(
+    label: str,
+    action,
+    *,
+    retry_delays: tuple[int | float, ...] | None = None,
+) -> bool:
+    """Run a required OpenClaw setup action with bounded retries."""
+    if retry_delays is None:
+        retry_delays = PLATFORM_SETUP_RETRY_DELAYS_SECONDS
+    attempts = len(retry_delays) + 1
+    last_detail = f"{label} did not report ready"
+    for attempt in range(1, attempts + 1):
+        if _stop_holder["stop"]:
+            raise RuntimeError(f"{label} interrupted by clean shutdown")
+        try:
+            if action():
+                if attempt > 1:
+                    log.info("%s became ready on attempt %d", label, attempt)
+                return True
+            last_detail = f"{label} returned false"
+        except Exception as exc:
+            last_detail = str(exc) or exc.__class__.__name__
+        safe_detail = _sanitize_runtime_state_text(last_detail, limit=255)
+        if attempt >= attempts:
+            raise RuntimeError(
+                f"{label} unavailable after {attempts} attempt(s): {safe_detail}"
+            )
+        log.warning(
+            "%s unavailable on attempt %d/%d; retrying: %s",
+            label,
+            attempt,
+            attempts,
+            safe_detail,
+        )
+        _write_runtime_state(
+            "openclaw_not_ready",
+            f"{label} unavailable; retrying platform setup: {safe_detail}",
+        )
+        checkpoint_supervisor_progress("phase-c-platform-setup-retry")
+        _interruptible_sleep(float(retry_delays[attempt - 1]))
+    raise RuntimeError(f"{label} unavailable")
+
+
+def _binding_requires_chatgpt_subscription_provider(binding: dict) -> bool:
+    if str(binding.get("llm_auth_mode") or "platform_credits") != (
+        "chatgpt_subscription"
+    ):
+        return False
+    return read_chatgpt_subscription_profile() is not None
+
+
+def _try_check_codex_subscription_plugin() -> bool:
+    try:
+        return ensure_codex_subscription_plugin_installed()
+    except Exception as exc:
+        log.warning(
+            "Codex subscription plugin unavailable; continuing without "
+            "auxiliary Codex plugin tools: %s",
+            exc,
+        )
+        return False
+
+
+def prepare_platform_runtime_setup(binding: dict) -> dict[str, bool]:
+    """Prepare required OpenClaw platform capabilities before gateway start."""
+    wait_for_openclaw_cli_available()
+    requires_chatgpt_subscription = _binding_requires_chatgpt_subscription_provider(
+        binding
+    )
+    if requires_chatgpt_subscription:
+        codex_subscription_plugin_installed = _run_required_platform_setup(
+            "Codex subscription plugin",
+            ensure_codex_subscription_plugin_installed,
+        )
+    else:
+        # Optional unless the owner has completed ChatGPT subscription auth.
+        # Platform-credit bindings use OpenRouter and the Tinyhat plugin path;
+        # a transient npm/plugin registry issue must not brick an otherwise
+        # usable rebooted Computer.
+        codex_subscription_plugin_installed = _try_check_codex_subscription_plugin()
+    chatgpt_subscription_provider_available = True
+    if requires_chatgpt_subscription:
+        chatgpt_subscription_provider_available = _run_required_platform_setup(
+            "ChatGPT subscription provider",
+            ensure_chatgpt_subscription_provider_available,
+        )
+    else:
+        # Optional when no owner subscription profile is active. Keep the old
+        # warning-only behavior so platform-credit bindings do not fail because
+        # a subscription-only provider is absent.
+        chatgpt_subscription_provider_available = (
+            try_check_chatgpt_subscription_provider()
+        )
+    tinyhat_plugin_installed = _run_required_platform_setup(
+        "Tinyhat platform plugin",
+        ensure_tinyhat_plugin_installed,
+    )
+    return {
+        "codex_subscription_plugin_installed": codex_subscription_plugin_installed,
+        "chatgpt_subscription_provider_available": (
+            chatgpt_subscription_provider_available
+        ),
+        "tinyhat_plugin_installed": tinyhat_plugin_installed,
+    }
 
 
 def _is_tinyhat_plugin_registered() -> bool:
@@ -1490,6 +1652,7 @@ def ensure_tinyhat_plugin_installed(
     # Machines upgraded from pre-isolation builds can already have a
     # root-owned checkout. Repair before the first `git -C` call so
     # Git's safe.directory guard does not reject the repo.
+    _sync_openclaw_cli_runtime_ownership()
     _sync_tinyhat_plugin_runtime_ownership()
     runtime_subprocess_kwargs = _runtime_user_subprocess_kwargs()
     install_status = "installed"
@@ -1608,6 +1771,7 @@ def ensure_tinyhat_plugin_installed(
     if marker_json and install_status != "cache_checkout_match":
         install_status = "marker_mismatch_reinstalled"
     cmd = ["openclaw", "plugins", "install", plugin_dir, "--force"]
+    _sync_openclaw_cli_runtime_ownership()
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -1619,6 +1783,12 @@ def ensure_tinyhat_plugin_installed(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Tinyhat plugin install failed: {detail}")
+    _sync_openclaw_cli_runtime_ownership()
+    if not _is_tinyhat_plugin_registered():
+        raise RuntimeError(
+            "Tinyhat plugin install completed but the plugin is still "
+            "unavailable in OpenClaw"
+        )
     os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
     with open(marker, "w", encoding="utf-8") as fh:
         json.dump(marker_payload, fh, indent=2, sort_keys=True)
@@ -1641,28 +1811,6 @@ def ensure_tinyhat_plugin_installed(
         version=version,
     )
     return True
-
-
-def try_install_tinyhat_plugin() -> bool:
-    """Best-effort install for optional chat credential tools.
-
-    The runtime must still boot without this plugin: core agent
-    credentials flow through the supervisor's secret-file path, while
-    the plugin only adds metadata-only helper tools for chat UX.
-    """
-    try:
-        return ensure_tinyhat_plugin_installed()
-    except Exception as exc:
-        log.warning(
-            "Tinyhat plugin unavailable; continuing without "
-            "credential tools: %s",
-            exc,
-        )
-        _set_tinyhat_plugin_install_result(
-            status="failed",
-            diagnostic=_sanitize_runtime_state_text(str(exc), limit=255),
-        )
-        return False
 
 
 def _runtime_ownership_ids() -> tuple[int, int] | None:
@@ -1792,6 +1940,24 @@ def _sync_tinyhat_plugin_runtime_ownership() -> None:
     plugin_dir = tinyhat_plugin_checkout_dir()
     _chown_runtime_owned_tree(os.path.dirname(plugin_dir))
     _chown_runtime_owned_tree(os.path.join(openclaw_state_dir(), "extensions"))
+
+
+def _sync_openclaw_cli_runtime_ownership() -> None:
+    """Repair OpenClaw config/state ownership before CLI self-heal commands.
+
+    GCE metadata startup scripts rerun as root after a VM reset, while the
+    gateway and runtime-user plugin commands run as the isolated Tinyhat user.
+    Any root-owned config rewrite in that window can make later plugin
+    installs fail with OpenClaw's "config file is not readable" error. Keep the
+    small set of OpenClaw files the CLI reads/writes owned by the gateway user
+    before and after install/inspect operations.
+    """
+    _prepare_runtime_owned_dir(os.path.dirname(openclaw_config_path()))
+    _prepare_runtime_owned_dir(openclaw_state_dir())
+    _chmod_runtime_owned_file(openclaw_config_path(), mode=0o600)
+    _chmod_runtime_owned_file(tinyhat_secrets_path(), mode=0o600)
+    _chown_runtime_owned_tree(os.path.join(openclaw_state_dir(), "extensions"))
+    _chown_runtime_owned_tree(os.path.join(openclaw_state_dir(), "npm", "projects"))
 
 
 def _atomic_write_json(
@@ -6300,18 +6466,16 @@ def _run_one_binding_cycle() -> int:
     ]
     try:
         config_apply_started_monotonic = time.monotonic()
-        codex_subscription_plugin_installed = (
-            try_install_codex_subscription_plugin()
-        )
-        chatgpt_subscription_provider_available = (
-            try_check_chatgpt_subscription_provider()
-        )
-        tinyhat_plugin_installed = try_install_tinyhat_plugin()
+        platform_setup = prepare_platform_runtime_setup(binding)
         write_openclaw_config(
             binding,
-            enable_tinyhat_plugin=tinyhat_plugin_installed,
-            enable_chatgpt_subscription_provider=chatgpt_subscription_provider_available,
-            enable_codex_subscription_plugins=codex_subscription_plugin_installed,
+            enable_tinyhat_plugin=platform_setup["tinyhat_plugin_installed"],
+            enable_chatgpt_subscription_provider=platform_setup[
+                "chatgpt_subscription_provider_available"
+            ],
+            enable_codex_subscription_plugins=platform_setup[
+                "codex_subscription_plugin_installed"
+            ],
         )
         config_apply_done_monotonic = time.monotonic()
         phase_spans.append(
@@ -6357,11 +6521,14 @@ def _run_one_binding_cycle() -> int:
         )
         return 1
     except Exception as exc:
-        log.exception("OpenClaw gateway start failed: %s", exc)
+        log.exception("OpenClaw platform setup/gateway start failed: %s", exc)
         stop_openclaw_gateway()
         post_json(
             "/hapi/v1/computers/me/state",
-            {"state": "broken", "detail": f"openclaw gateway start failed: {exc}"},
+            {
+                "state": "broken",
+                "detail": f"openclaw platform setup/gateway start failed: {exc}",
+            },
         )
         return 1
 

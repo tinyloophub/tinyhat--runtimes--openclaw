@@ -55,6 +55,7 @@ def _read_openclaw_framework_version() -> str:
             timeout=15,
             check=False,
             env=sup._openclaw_cli_env(),
+            **sup._runtime_user_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -101,6 +102,7 @@ def openclaw_plugin_registry_entry(plugin_id: str) -> tuple[dict | None, str | N
             timeout=30,
             check=False,
             env=sup._openclaw_cli_env(),
+            **sup._runtime_user_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.debug("openclaw registry inspect unavailable for %s: %s", plugin_id, exc)
@@ -128,6 +130,7 @@ def _inspect_openclaw_plugin(plugin_id: str) -> dict | None:
             timeout=30,
             check=False,
             env=sup._openclaw_cli_env(),
+            **sup._runtime_user_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("could not inspect OpenClaw plugin %s: %s", plugin_id, exc)
