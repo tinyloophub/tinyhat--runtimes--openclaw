@@ -16,6 +16,18 @@ runtime's published `VERSION` on each new Computer row.
   consuming platform's hard-gate rows for those two metrics had no data.
   Telemetry-only; no change to assignment behavior or latency.
 
+### Changed
+
+- Startup latency: the binding-independent Tinyhat plugin is now pre-installed in
+  a background daemon thread at supervisor start, while the Computer waits for a
+  binding, instead of being installed on the binding (assignment) critical path.
+  When a binding arrives the bind-time setup hits the install marker fast-path,
+  so `binding/config apply` no longer pays the git-clone + `openclaw plugins
+  install` cost on un-baked images. The plugin install is serialized by a lock
+  shared between the prewarm thread and the bind-time setup (no concurrent
+  checkout/install race), and the prewarm is best-effort — any failure falls
+  back to the existing bind-time install, so readiness is never blocked.
+
 ## 0.14.0
 
 This release aligns the public OpenClaw runtime with the Tinyloop `v0.14.0`

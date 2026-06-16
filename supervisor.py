@@ -1633,6 +1633,13 @@ def _chatgpt_device_code_worker_kwargs() -> dict[str, float | int]:
     }
 
 
+# Serializes the Tinyhat plugin git ops + ``openclaw plugins install`` so the
+# ready-time prewarm thread (``_prewarm_tinyhat_plugin``) and the bind-time
+# setup never run them concurrently on the same checkout
+# (tinyloophub/tinyloop#775).
+_TINYHAT_PLUGIN_INSTALL_LOCK = threading.Lock()
+
+
 def ensure_tinyhat_plugin_installed(
     *, repo_url: str | None = None, repo_ref: str | None = None
 ) -> bool:
@@ -1643,7 +1650,21 @@ def ensure_tinyhat_plugin_installed(
     platform manifest and asks OpenClaw to install that checkout.
     The plugin contains no Tinyhat credentials; requests authenticate
     with the same Computer identity-token boundary as the supervisor.
+
+    Serialized by ``_TINYHAT_PLUGIN_INSTALL_LOCK``: the ready-time prewarm
+    thread and the bind-time setup may both call this, and a binding that
+    lands mid-prewarm waits for the in-flight install and then hits the
+    marker fast-path instead of racing a second git checkout / install.
     """
+    with _TINYHAT_PLUGIN_INSTALL_LOCK:
+        return _ensure_tinyhat_plugin_installed_locked(
+            repo_url=repo_url, repo_ref=repo_ref
+        )
+
+
+def _ensure_tinyhat_plugin_installed_locked(
+    *, repo_url: str | None = None, repo_ref: str | None = None
+) -> bool:
     configured_url, configured_ref = _tinyhat_plugin_source()
     repo_url = (repo_url or configured_url).strip()
     repo_ref = (repo_ref or configured_ref).strip()
@@ -1811,6 +1832,25 @@ def ensure_tinyhat_plugin_installed(
         version=version,
     )
     return True
+
+
+def _prewarm_tinyhat_plugin() -> None:
+    """Best-effort: install the binding-independent Tinyhat plugin while the
+    Computer is idle, before a binding arrives, so the bind-time setup hits the
+    install marker fast-path instead of paying the git-clone + plugin-install
+    cost on the user's assignment critical path (tinyloophub/tinyloop#775).
+
+    Runs in a daemon thread spawned at supervisor start. Serialized with the
+    bind-time install via ``ensure_tinyhat_plugin_installed``'s lock; any
+    failure is swallowed so it never blocks readiness, and the bind-time
+    ``prepare_platform_runtime_setup`` remains the source of truth.
+    """
+    try:
+        wait_for_openclaw_cli_available()
+        ensure_tinyhat_plugin_installed()
+        log.info("prewarm: Tinyhat plugin installed before binding")
+    except Exception as exc:  # noqa: BLE001 - prewarm must never crash the supervisor
+        log.info("prewarm: Tinyhat plugin pre-install deferred to bind: %s", exc)
 
 
 def _runtime_ownership_ids() -> tuple[int, int] | None:
@@ -6322,6 +6362,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     notify_supervisor_ready()
+
+    # Pre-install the binding-independent Tinyhat plugin in the background while
+    # the Computer waits for a binding, so the bind-time setup hits the install
+    # marker fast-path instead of cloning + installing on the user's assignment
+    # critical path (tinyloophub/tinyloop#775). Daemon + best-effort: it never
+    # blocks readiness, and the bind-time install stays the fallback.
+    threading.Thread(
+        target=_prewarm_tinyhat_plugin,
+        name="tinyhat-plugin-prewarm",
+        daemon=True,
+    ).start()
 
     # Outer rebind loop: every iteration is one full
     # bind->active->OpenClaw cycle. The heartbeat watchdog flips

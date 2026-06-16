@@ -9309,3 +9309,65 @@ class CleanShutdownGatewayTeardownTests(unittest.TestCase):
         with patch.object(supervisor.time, "sleep", side_effect=lambda s: slept.append(s)):
             supervisor._interruptible_sleep(30)
         self.assertEqual(slept, [])  # never sleeps once stop is already set
+
+
+class TinyhatPluginPrewarmTests(unittest.TestCase):
+    """tinyloop#775: pre-install the binding-independent plugin off the bind path."""
+
+    def test_prewarm_installs_plugin_best_effort(self) -> None:
+        with (
+            patch.object(supervisor, "wait_for_openclaw_cli_available") as wait,
+            patch.object(
+                supervisor, "ensure_tinyhat_plugin_installed", return_value=True
+            ) as install,
+        ):
+            supervisor._prewarm_tinyhat_plugin()
+        wait.assert_called_once()
+        install.assert_called_once_with()
+
+    def test_prewarm_swallows_install_failure(self) -> None:
+        # A prewarm failure must never crash the supervisor; the bind-time
+        # install remains the source of truth.
+        with (
+            patch.object(supervisor, "wait_for_openclaw_cli_available"),
+            patch.object(
+                supervisor,
+                "ensure_tinyhat_plugin_installed",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            supervisor._prewarm_tinyhat_plugin()  # does not raise
+
+    def test_prewarm_skips_install_when_cli_unavailable(self) -> None:
+        with (
+            patch.object(
+                supervisor,
+                "wait_for_openclaw_cli_available",
+                side_effect=RuntimeError("no cli"),
+            ),
+            patch.object(supervisor, "ensure_tinyhat_plugin_installed") as install,
+        ):
+            supervisor._prewarm_tinyhat_plugin()  # does not raise
+        install.assert_not_called()
+
+    def test_install_runs_under_lock_and_releases(self) -> None:
+        observed: dict[str, object] = {}
+
+        def fake_locked(*, repo_url=None, repo_ref=None):
+            observed["held"] = supervisor._TINYHAT_PLUGIN_INSTALL_LOCK.locked()
+            observed["args"] = (repo_url, repo_ref)
+            return True
+
+        with patch.object(
+            supervisor,
+            "_ensure_tinyhat_plugin_installed_locked",
+            side_effect=fake_locked,
+        ):
+            result = supervisor.ensure_tinyhat_plugin_installed(
+                repo_url="u", repo_ref="r"
+            )
+        self.assertTrue(result)
+        self.assertTrue(observed["held"])  # body ran while the lock was held
+        self.assertEqual(observed["args"], ("u", "r"))
+        # lock is released after the wrapper returns
+        self.assertFalse(supervisor._TINYHAT_PLUGIN_INSTALL_LOCK.locked())
