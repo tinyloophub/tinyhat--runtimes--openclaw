@@ -1134,6 +1134,17 @@ def _tinyhat_plugin_source_override_path() -> str:
 
 
 def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
+    payload = _read_tinyhat_plugin_source_override_payload()
+    if payload is None:
+        return None
+    repo_url = str(payload.get("repo_url") or "").strip()
+    repo_ref = str(payload.get("repo_ref") or "").strip()
+    if not repo_url or not repo_ref:
+        return None
+    return repo_url, repo_ref
+
+
+def _read_tinyhat_plugin_source_override_payload() -> dict | None:
     try:
         with open(_tinyhat_plugin_source_override_path(), encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -1141,11 +1152,22 @@ def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
         return None
     if not isinstance(payload, dict):
         return None
+    return payload
+
+
+def _restore_tinyhat_plugin_source_override(payload: dict | None) -> None:
+    path = _tinyhat_plugin_source_override_path()
+    if payload is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
     repo_url = str(payload.get("repo_url") or "").strip()
     repo_ref = str(payload.get("repo_ref") or "").strip()
     if not repo_url or not repo_ref:
-        return None
-    return repo_url, repo_ref
+        raise RuntimeError("previous plugin source override is invalid")
+    _atomic_write_json(path, payload, mode=0o600)
 
 
 def _public_runtime_cache_plugin_hit(
@@ -5468,7 +5490,29 @@ def _restart_gateway_for_component_update(binding: dict | None = None) -> None:
         _stop_holder["component_update_restart"] = previous_marker
 
 
-def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
+def _rollback_plugin_update_transaction(transaction: dict[str, object]) -> str:
+    repo_url = str(transaction.get("repo_url") or "").strip()
+    repo_ref = str(transaction.get("repo_ref") or "").strip()
+    previous_override = transaction.get("previous_override")
+    if not repo_url or not repo_ref:
+        transaction["rollback_failed"] = True
+        return "plugin rollback failed: previous Tinyhat plugin source is missing"
+    try:
+        ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=repo_ref)
+        _restore_tinyhat_plugin_source_override(
+            previous_override if isinstance(previous_override, dict) else None
+        )
+        transaction["rolled_back"] = True
+        transaction["restored_previous"] = True
+        return "plugin rollback restored previous Tinyhat plugin source"
+    except Exception as exc:  # noqa: BLE001
+        transaction["rollback_failed"] = True
+        return f"plugin rollback failed: {exc}"
+
+
+def _update_plugin_component(
+    ref: str,
+) -> tuple[bool, str | None, dict[str, object] | None]:
     """Update the Tinyhat plugin to ``ref`` in place.
 
     The boot-time ``TINYHAT_PLATFORM_PLUGIN_REPO_REF`` stays pinned to the
@@ -5480,7 +5524,15 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
 
     Returns ``(ok, diagnostic)``; never raises.
     """
-    repo_url, _current_ref = _tinyhat_plugin_source()
+    previous_override = _read_tinyhat_plugin_source_override_payload()
+    repo_url, current_ref = _tinyhat_plugin_source()
+    transaction: dict[str, object] = {
+        "repo_url": repo_url,
+        "repo_ref": current_ref,
+        "previous_override": previous_override,
+        "rolled_back": False,
+        "restored_previous": False,
+    }
     try:
         ensure_tinyhat_plugin_installed(repo_url=repo_url, repo_ref=ref)
         marker = _read_installed_plugin_marker()
@@ -5492,10 +5544,10 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
             version=str(marker.get("version") or "").strip() or None,
         )
     except Exception as exc:  # noqa: BLE001 - keep the update non-fatal
-        return False, f"plugin update to {ref} failed: {exc}"
+        return False, f"plugin update to {ref} failed: {exc}", None
     sha = str(marker.get("resolved_commit_sha") or "")
     log.info("component update: plugin now at ref=%s sha=%s", ref, sha[:12])
-    return True, None
+    return True, None, transaction
 
 
 def _remove_filesystem_entry(path: str) -> None:
@@ -5555,8 +5607,10 @@ def _repair_or_cleanup_framework_backups(global_root: str) -> list[str]:
     backups = _framework_backup_dirs(global_root)
     actions: list[str] = []
     restored: str | None = None
-    if not os.path.lexists(package_dir) and backups:
+    if backups:
         restored = backups[-1]
+        if os.path.lexists(package_dir):
+            _remove_filesystem_entry(package_dir)
         os.replace(restored, package_dir)
         actions.append(f"restored {os.path.basename(restored)}")
     for backup in backups:
@@ -5598,8 +5652,10 @@ def _rollback_framework_install_transaction(transaction: dict[str, object]) -> s
         if backup_dir and os.path.lexists(backup_dir):
             os.replace(backup_dir, package_dir)
             transaction["rolled_back"] = True
+            transaction["restored_previous"] = True
             return "framework rollback restored previous OpenClaw package tree"
         transaction["rolled_back"] = True
+        transaction["restored_previous"] = False
         return "framework rollback removed partial OpenClaw package tree"
     except Exception as exc:  # noqa: BLE001
         transaction["rollback_failed"] = True
@@ -5644,6 +5700,7 @@ def _prepare_framework_install_transaction(version: str) -> dict[str, object]:
         "target_version": version,
         "committed": False,
         "rolled_back": False,
+        "restored_previous": False,
     }
     try:
         install = subprocess.run(
@@ -6264,6 +6321,7 @@ def handle_update_component_command(
     diagnostics: list[str] = []
     all_ok = True
     gateway_restart_needed = False
+    plugin_transaction: dict[str, object] | None = None
     framework_transaction: dict[str, object] | None = None
 
     # Order: plugin -> framework -> runtime. The runtime self-update is the
@@ -6276,9 +6334,11 @@ def handle_update_component_command(
 
     plugin_target = targets.get("plugin")
     if isinstance(plugin_target, dict) and str(plugin_target.get("ref") or "").strip():
-        ok, diag = _update_plugin_component(str(plugin_target["ref"]).strip())
+        ok, diag, transaction = _update_plugin_component(str(plugin_target["ref"]).strip())
         all_ok = all_ok and ok
         gateway_restart_needed = gateway_restart_needed or ok
+        if transaction is not None:
+            plugin_transaction = transaction
         if diag:
             diagnostics.append(diag)
 
@@ -6308,22 +6368,32 @@ def handle_update_component_command(
         except Exception as exc:  # noqa: BLE001 - report the failed update
             all_ok = False
             diagnostics.append(f"gateway restart after component update failed: {exc}")
+            restart_after_rollback = False
             if framework_transaction is not None:
                 rollback_detail = _rollback_framework_install_transaction(
                     framework_transaction
                 )
                 diagnostics.append(rollback_detail)
-                if "restored previous OpenClaw package tree" in rollback_detail:
-                    try:
-                        _restart_gateway_for_component_update(binding)
-                        diagnostics.append(
-                            "gateway restarted after framework rollback"
-                        )
-                    except Exception as rollback_exc:  # noqa: BLE001
-                        diagnostics.append(
-                            "gateway restart after framework rollback failed: "
-                            f"{rollback_exc}"
-                        )
+                restart_after_rollback = restart_after_rollback or bool(
+                    framework_transaction.get("restored_previous")
+                )
+            if plugin_transaction is not None:
+                rollback_detail = _rollback_plugin_update_transaction(
+                    plugin_transaction
+                )
+                diagnostics.append(rollback_detail)
+                restart_after_rollback = restart_after_rollback or bool(
+                    plugin_transaction.get("restored_previous")
+                )
+            if restart_after_rollback:
+                try:
+                    _restart_gateway_for_component_update(binding)
+                    diagnostics.append("gateway restarted after component rollback")
+                except Exception as rollback_exc:  # noqa: BLE001
+                    diagnostics.append(
+                        "gateway restart after component rollback failed: "
+                        f"{rollback_exc}"
+                    )
         else:
             if framework_transaction is not None:
                 _commit_framework_install_transaction(framework_transaction)

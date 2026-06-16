@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -59,6 +60,16 @@ def _bootstrap_unit_block(unit_var: str) -> str:
     start = text.index("\n", start) + 1
     end = text.index("\nUNIT", start)
     return text[start:end]
+
+
+def _bootstrap_function_definitions(*names: str) -> str:
+    text = _bootstrap_script_text()
+    blocks: list[str] = []
+    for name in names:
+        start = text.index(f"{name}() {{")
+        end = text.index("\n}\n\n", start) + len("\n}\n")
+        blocks.append(text[start:end])
+    return "\n".join(blocks)
 
 
 def _write_config_in_temp_runtime(
@@ -6743,6 +6754,73 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             script,
         )
 
+    def test_bootstrap_framework_install_restores_backup_on_npm_failure(
+        self,
+    ) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "cleanup_stale_openclaw_npm_temp_dirs",
+            "repair_or_cleanup_openclaw_backups",
+            "install_openclaw_framework_package",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_root = os.path.join(tmpdir, "npm-root")
+            package_dir = os.path.join(global_root, "openclaw")
+            backup_dir = os.path.join(
+                global_root, ".tinyhat-openclaw-backup-200-1"
+            )
+            stale_temp = os.path.join(global_root, ".openclaw-gX1GdeX9")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(package_dir)
+            os.makedirs(backup_dir)
+            os.makedirs(stale_temp)
+            os.makedirs(bin_dir)
+            with open(os.path.join(package_dir, "partial.txt"), "w", encoding="utf-8") as fh:
+                fh.write("partial")
+            with open(os.path.join(backup_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+            fake_npm = os.path.join(bin_dir, "npm")
+            with open(fake_npm, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then\n"
+                    "  printf '%s\\n' \"$FAKE_NPM_ROOT\"\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [ \"$1\" = install ]; then\n"
+                    "  mkdir -p \"$FAKE_NPM_ROOT/openclaw\"\n"
+                    "  printf partial > \"$FAKE_NPM_ROOT/openclaw/partial.txt\"\n"
+                    "  printf 'npm error code ENOTEMPTY\\n' >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "exit 2\n"
+                )
+            os.chmod(fake_npm, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    helper_script
+                    + "\ninstall_openclaw_framework_package openclaw@1.5.0",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "FAKE_NPM_ROOT": global_root,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertFalse(os.path.exists(backup_dir))
+            self.assertFalse(os.path.exists(stale_temp))
+
     def test_workload_slice_is_bounded_for_hold_down_sampling(self) -> None:
         unit = _bootstrap_unit_block("WORKLOAD_SLICE_UNIT")
 
@@ -7320,13 +7398,13 @@ class UpdateComponentCommandTests(unittest.TestCase):
             patch.object(
                 supervisor,
                 "_restart_gateway_for_component_update",
-                side_effect=RuntimeError("telegram did not reconnect"),
+                side_effect=[RuntimeError("telegram did not reconnect"), None],
             ) as restart_gateway,
             patch.object(supervisor, "_restart_supervisor") as restart_supervisor,
         ):
             supervisor.handle_update_component_command(cmd)
 
-        restart_gateway.assert_called_once()
+        self.assertEqual(restart_gateway.call_count, 2)
         restart_supervisor.assert_not_called()
         self._posted.assert_called_once()
         kwargs = self._posted.call_args.kwargs
@@ -7334,6 +7412,8 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["status"], "failed")
         self.assertIn("gateway restart after component update failed", kwargs["diagnostic"])
         self.assertIn("telegram did not reconnect", kwargs["diagnostic"])
+        self.assertIn("plugin rollback restored", kwargs["diagnostic"])
+        self.assertIn("gateway restarted after component rollback", kwargs["diagnostic"])
         state = self._read_state()
         self.assertEqual(state["last_revision"], 32)
         self.assertEqual(state["status"], "failed")
@@ -7497,6 +7577,13 @@ class UpdateComponentCommandTests(unittest.TestCase):
             )
             os.makedirs(stale_backup)
             os.makedirs(latest_backup)
+            os.makedirs(package_dir)
+            with open(
+                os.path.join(package_dir, "partial.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("partial")
             with open(
                 os.path.join(latest_backup, "old.txt"),
                 "w",
@@ -7509,6 +7596,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self.assertIn("restored .tinyhat-openclaw-backup-200-1", actions)
             self.assertIn("removed stale .tinyhat-openclaw-backup-100-1", actions)
             self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
             self.assertFalse(os.path.exists(stale_backup))
             self.assertFalse(os.path.exists(latest_backup))
 
@@ -7552,9 +7640,72 @@ class UpdateComponentCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["status"], "failed")
         self.assertIn("Cannot find package highlight.js", kwargs["diagnostic"])
         self.assertIn("framework rollback restored", kwargs["diagnostic"])
-        self.assertIn("gateway restarted after framework rollback", kwargs["diagnostic"])
+        self.assertIn("gateway restarted after component rollback", kwargs["diagnostic"])
         self.assertTrue(os.path.exists(os.path.join(package_dir, "old.txt")))
         self.assertFalse(os.path.exists(os.path.join(package_dir, "new.txt")))
+
+    def test_plugin_gateway_failure_rolls_back_previous_source(self) -> None:
+        override_path = os.path.join(self._tmp, "plugin-source.json")
+        env = {
+            supervisor.TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV: override_path,
+        }
+        cmd = {
+            "type": "update_component",
+            "revision": 42,
+            "targets": {"plugin": {"ref": "v2.0.0"}},
+        }
+        calls: list[tuple[str, str]] = []
+
+        def fake_install(*, repo_url, repo_ref):
+            calls.append((repo_url, repo_ref))
+
+        with patch.dict(os.environ, env, clear=False):
+            supervisor._write_tinyhat_plugin_source_override(
+                repo_url="https://example.com/tinyhat.git",
+                repo_ref="v1.0.0",
+                resolved_commit_sha="oldsha",
+                version="1.0.0",
+            )
+            with (
+                patch.object(
+                    supervisor,
+                    "ensure_tinyhat_plugin_installed",
+                    side_effect=fake_install,
+                ),
+                patch.object(
+                    supervisor,
+                    "_read_installed_plugin_marker",
+                    return_value={
+                        "resolved_commit_sha": "newsha",
+                        "version": "2.0.0",
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_restart_gateway_for_component_update",
+                    side_effect=[RuntimeError("plugin failed to load"), None],
+                ) as restart_gateway,
+            ):
+                supervisor.handle_update_component_command(cmd)
+
+            self.assertEqual(
+                calls,
+                [
+                    ("https://example.com/tinyhat.git", "v2.0.0"),
+                    ("https://example.com/tinyhat.git", "v1.0.0"),
+                ],
+            )
+            self.assertEqual(restart_gateway.call_count, 2)
+            self.assertEqual(
+                supervisor._tinyhat_plugin_source(),
+                ("https://example.com/tinyhat.git", "v1.0.0"),
+            )
+
+        kwargs = self._posted.call_args.kwargs
+        self.assertEqual(kwargs["revision"], 42)
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertIn("plugin failed to load", kwargs["diagnostic"])
+        self.assertIn("plugin rollback restored", kwargs["diagnostic"])
 
     def test_plugin_and_framework_targets_restart_gateway_once(self) -> None:
         cmd = {

@@ -121,9 +121,10 @@ repair_or_cleanup_openclaw_backups() {
   shopt -s nullglob
   backups=("${global_root}"/.tinyhat-openclaw-backup-*)
   shopt -u nullglob
-  if [[ ! -e "${package_dir}" && ! -L "${package_dir}" && "${#backups[@]}" -gt 0 ]]; then
+  if [[ "${#backups[@]}" -gt 0 ]]; then
     latest="${backups[$((${#backups[@]} - 1))]}"
     echo "[tinyhat-runtime] restoring interrupted OpenClaw framework backup: ${latest}"
+    remove_path_if_present "${package_dir}"
     mv -- "${latest}" "${package_dir}"
   fi
   for backup in "${backups[@]}"; do
