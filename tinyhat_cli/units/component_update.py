@@ -159,7 +159,6 @@ def _framework_backup_dirs(global_root: str) -> list[str]:
         os.path.join(global_root, name)
         for name in names
         if name.startswith(".tinyhat-openclaw-backup-")
-        and not name.endswith(".copying")
     )
 
 
