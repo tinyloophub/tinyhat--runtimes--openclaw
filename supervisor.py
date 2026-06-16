@@ -2066,8 +2066,10 @@ def report_ready_runtime_state() -> None:
         log.warning("runtime_state ready mirror failed: %s", exc)
 
 
-def _post_startup_timing_sample(sample: dict[str, object]) -> None:
-    """Attach one startup benchmark sample to the current runtime-state."""
+def _post_startup_timing_samples(samples: list[dict[str, object]]) -> None:
+    """Attach one or more startup benchmark samples to the current runtime-state."""
+    if not samples:
+        return
     payload = dict(read_runtime_state() or {})
     now = int(time.time())
     payload.setdefault("schema", RUNTIME_STATE_SCHEMA)
@@ -2077,7 +2079,7 @@ def _post_startup_timing_sample(sample: dict[str, object]) -> None:
     payload.setdefault("runtime_state", payload["runtime_health"])
     payload.setdefault("state", payload["runtime_health"])
     payload.setdefault("detail", "startup timing sample")
-    payload["startup_timings"] = [sample]
+    payload["startup_timings"] = list(samples)
     post_json("/hapi/v1/computers/me/runtime-state", payload)
 
 
@@ -2086,6 +2088,59 @@ def _runtime_startup_source_ref(binding: dict, started_wall: float) -> str:
     bot_username = str(binding.get("telegram_bot_username") or "").strip()
     identity = bot_id or bot_username or "unknown"
     return f"runtime-binding-cycle:{identity}:{int(started_wall * 1000)}"
+
+
+# The two v0.14.0 hard-gate metrics — config_apply_to_runtime_ack_ms and
+# bot_attach_to_first_ack_ms — were never emitted as their own samples; only
+# the coarse assignment_to_serving_ms sample carried the breakdown inside
+# phase_spans, so the admin matrix read n=0 for both and the release gates had
+# no data to evaluate. Derive them from the same phase spans we already
+# compute (tinyloophub/tinyloop#775).
+_PHASE_GATE_METRICS: tuple[tuple[str, str], ...] = (
+    ("binding_config_apply", "config_apply_to_runtime_ack_ms"),
+    ("bot_ready", "bot_attach_to_first_ack_ms"),
+)
+
+
+def _phase_span_duration_ms(
+    phase_spans: list[dict[str, object]], phase: str
+) -> int | None:
+    """Return the named phase span's duration in ms, or None if absent."""
+    for span in phase_spans:
+        if span.get("phase") != phase:
+            continue
+        value = span.get("duration_ms")
+        if isinstance(value, bool):  # bool is an int subclass — reject
+            return None
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    return None
+
+
+def _phase_gate_metric_sample(
+    *, metric_name: str, duration_ms: int, base_sample: dict[str, object]
+) -> dict[str, object]:
+    """Build a single-phase hard-gate sample from a binding-cycle phase span.
+
+    Mirrors the assignment sample's grouping fields (source_kind /
+    capacity_path / image_label) so the sample lands in the matching matrix
+    row. ``candidate_label`` is intentionally omitted: the platform defaults it
+    to the metric's canonical label, which is what the matrix groups on, so
+    these fill the existing rows instead of spawning new ones.
+    """
+    metadata = dict(base_sample.get("sample_metadata") or {})
+    metadata["duration_anchor"] = metric_name
+    metadata["derived_from_phase_span"] = True
+    return {
+        "metric_name": metric_name,
+        "source_kind": base_sample["source_kind"],
+        "capacity_path": base_sample["capacity_path"],
+        "image_label": base_sample["image_label"],
+        "duration_ms": max(0, int(duration_ms)),
+        "observed_at": base_sample["observed_at"],
+        "source_ref": f"{base_sample['source_ref']}:{metric_name}",
+        "sample_metadata": metadata,
+    }
 
 
 def report_binding_cycle_startup_timing(
@@ -2118,8 +2173,20 @@ def report_binding_cycle_startup_timing(
             "tinyhat_plugin_install": _tinyhat_plugin_install_result(),
         },
     }
+    samples: list[dict[str, object]] = [sample]
+    for phase_key, metric_name in _PHASE_GATE_METRICS:
+        phase_ms = _phase_span_duration_ms(phase_spans, phase_key)
+        if phase_ms is None:
+            continue
+        samples.append(
+            _phase_gate_metric_sample(
+                metric_name=metric_name,
+                duration_ms=phase_ms,
+                base_sample=sample,
+            )
+        )
     try:
-        _post_startup_timing_sample(sample)
+        _post_startup_timing_samples(samples)
     except Exception as exc:  # noqa: BLE001 - timing should never block startup
         log.warning("startup timing runtime-state POST failed: %s", exc)
 

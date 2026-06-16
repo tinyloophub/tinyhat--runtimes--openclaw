@@ -4680,6 +4680,84 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             sample["sample_metadata"]["tinyhat_plugin_install"]["status"],
             "marker_match",
         )
+        # tinyloop#775: the two v0.14.0 hard-gate metrics are now emitted as
+        # their own samples in the same runtime-state POST, derived from the
+        # phase spans, so the admin matrix stops reading n=0 for them.
+        samples = timing_posts[0]["startup_timings"]
+        by_metric = {s["metric_name"]: s for s in samples}
+        self.assertIn("config_apply_to_runtime_ack_ms", by_metric)
+        self.assertIn("bot_attach_to_first_ack_ms", by_metric)
+        spans = {sp["phase"]: sp for sp in sample["phase_spans"]}
+        self.assertEqual(
+            by_metric["config_apply_to_runtime_ack_ms"]["duration_ms"],
+            spans["binding_config_apply"]["duration_ms"],
+        )
+        self.assertEqual(
+            by_metric["bot_attach_to_first_ack_ms"]["duration_ms"],
+            spans["bot_ready"]["duration_ms"],
+        )
+        for metric in (
+            "config_apply_to_runtime_ack_ms",
+            "bot_attach_to_first_ack_ms",
+        ):
+            derived = by_metric[metric]
+            # candidate_label omitted so the backend defaults it to the
+            # canonical label and the sample lands in the existing row.
+            self.assertNotIn("candidate_label", derived)
+            self.assertEqual(derived["source_kind"], "runtime_report")
+            self.assertEqual(derived["capacity_path"], "hot_pool_running")
+            self.assertNotIn("phase_spans", derived)
+            self.assertTrue(
+                derived["source_ref"].endswith(f":{metric}"),
+                derived["source_ref"],
+            )
+
+    def test_phase_gate_metric_samples_derive_from_spans(self) -> None:
+        """_phase_span_duration_ms + _phase_gate_metric_sample build the two
+        hard-gate samples from the phase spans without changing the row group."""
+        phase_spans = [
+            supervisor._phase_span("binding_config_apply", "binding/config apply", 0.0, 49.0),
+            supervisor._phase_span("bot_ready", "bot-ready", 49.0, 87.0),
+        ]
+        self.assertEqual(
+            supervisor._phase_span_duration_ms(phase_spans, "binding_config_apply"),
+            49000,
+        )
+        self.assertEqual(
+            supervisor._phase_span_duration_ms(phase_spans, "bot_ready"), 38000
+        )
+        self.assertIsNone(
+            supervisor._phase_span_duration_ms(phase_spans, "missing_phase")
+        )
+        base = {
+            "metric_name": "assignment_to_serving_ms",
+            "source_kind": "runtime_report",
+            "capacity_path": "hot_pool_running",
+            "image_label": "not_applicable",
+            "observed_at": "2026-06-16T00:00:00+00:00",
+            "source_ref": "runtime-binding-cycle:8777805086:1700",
+            "sample_metadata": {"gateway_action": "started"},
+        }
+        derived = supervisor._phase_gate_metric_sample(
+            metric_name="config_apply_to_runtime_ack_ms",
+            duration_ms=49000,
+            base_sample=base,
+        )
+        self.assertEqual(derived["metric_name"], "config_apply_to_runtime_ack_ms")
+        self.assertEqual(derived["duration_ms"], 49000)
+        self.assertEqual(derived["source_kind"], "runtime_report")
+        self.assertEqual(derived["capacity_path"], "hot_pool_running")
+        self.assertEqual(derived["image_label"], "not_applicable")
+        self.assertNotIn("candidate_label", derived)
+        self.assertNotIn("phase_spans", derived)
+        self.assertEqual(
+            derived["source_ref"],
+            "runtime-binding-cycle:8777805086:1700:config_apply_to_runtime_ack_ms",
+        )
+        # base metadata is copied, not mutated
+        self.assertEqual(derived["sample_metadata"]["gateway_action"], "started")
+        self.assertTrue(derived["sample_metadata"]["derived_from_phase_span"])
+        self.assertNotIn("derived_from_phase_span", base["sample_metadata"])
 
     def test_binding_get_failures_use_error_backoff(self) -> None:
         get_calls: list[tuple[str, dict]] = []
