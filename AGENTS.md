@@ -3,6 +3,26 @@
 This public repo is the standalone runtime a Tinyhat-managed Computer clones at boot.
 It is intentionally smaller than the Tinyloop monorepo: boot, supervision, config apply, diagnostics, and external plugin pin/install only.
 
+## OpenClaw boundary — official interfaces only (load-bearing)
+
+This runtime drives OpenClaw **only through its official commands and interfaces** —
+e.g. `openclaw secrets reload`, `openclaw plugins …`, `openclaw gateway …`,
+`openclaw models status`, and the documented config/CLI surface. **Never** read,
+write, or assume OpenClaw's internal state: its config-file format/location, its
+databases, or its on-disk auth/secret stores.
+
+Why: OpenClaw moves fast and has relocated config between formats before (e.g. auth
+profiles from a JSON file into a SQLite store). Anything that reaches around the
+official interface is a latent break the next OpenClaw bump can trigger — and we
+have hit exactly this.
+
+If a behavior needs something OpenClaw does not expose officially, **request the
+capability upstream** (`github.com/openclaw/openclaw`); do not hack the internal
+state as a workaround. The same rule applies to any other framework this runtime
+wraps. Existing direct-internal-state access (e.g. the bot token written inline
+into the gateway config) is legacy to migrate away from, not a pattern to extend —
+track and fix it via the internal-state audit issue.
+
 ## Dev Skills
 
 Canonical repo-local development skills live under [`.agents/skills`](.agents/skills).
