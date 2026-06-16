@@ -2196,6 +2196,12 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "_journal_runtime_log_lines",
                     return_value=[],
                 ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
+                ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
@@ -2326,6 +2332,12 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "_journal_runtime_log_lines",
                     return_value=[],
                 ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
+                ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep") as sleep,
             ):
@@ -2409,6 +2421,12 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     supervisor,
                     "_journal_runtime_log_lines",
                     return_value=[],
+                ),
+                patch.object(
+                    supervisor,
+                    "log_gateway_readiness_split",
+                    return_value=None,
+                    create=True,
                 ),
                 patch.object(supervisor, "_read_runtime_git_sha", return_value=""),
                 patch.object(supervisor.time, "sleep", side_effect=_sleep) as sleep,

@@ -512,10 +512,14 @@ from tinyhat_cli.units.component_update import (  # noqa: E402,F401
     _framework_package_dir,
     _npm_global_root,
     _prepare_framework_install_transaction,
+    _read_tinyhat_plugin_source_override,
+    _read_tinyhat_plugin_source_override_payload,
     _remove_filesystem_entry,
     _repair_or_cleanup_framework_backups,
+    _restore_tinyhat_plugin_source_override,
     _rollback_framework_install_transaction,
     _rollback_plugin_update_transaction,
+    _tinyhat_plugin_source_override_path,
 )
 from tinyhat_cli.units.gateway_restart import (  # noqa: E402,F401
     delete_telegram_webhook,
@@ -1115,75 +1119,6 @@ def _tinyhat_plugin_version(plugin_dir: str) -> str:
 
 def _tinyhat_plugin_marker_path() -> str:
     return os.path.join(openclaw_state_dir(), "tinyhat-plugin.version")
-
-
-def _tinyhat_plugin_source_override_path() -> str:
-    configured = (
-        os.environ.get(TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV) or ""
-    ).strip()
-    default_path = os.path.abspath(
-        os.path.join(openclaw_state_dir(), "tinyhat-plugin-source.json")
-        if _dev_mode()
-        else _DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
-    )
-    path = os.path.abspath(
-        configured
-        or default_path
-    )
-    checkout_dir = os.path.abspath(runtime_dir())
-    try:
-        inside_checkout = os.path.commonpath([path, checkout_dir]) == checkout_dir
-    except ValueError:
-        inside_checkout = False
-    if inside_checkout:
-        log.warning(
-            "%s=%s resolves inside the runtime checkout dir (%s); plugin "
-            "update source overrides must survive runtime checkouts. Falling "
-            "back to %s.",
-            TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV,
-            path,
-            checkout_dir,
-            default_path,
-        )
-        return default_path
-    return path
-
-
-def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
-    payload = _read_tinyhat_plugin_source_override_payload()
-    if payload is None:
-        return None
-    repo_url = str(payload.get("repo_url") or "").strip()
-    repo_ref = str(payload.get("repo_ref") or "").strip()
-    if not repo_url or not repo_ref:
-        return None
-    return repo_url, repo_ref
-
-
-def _read_tinyhat_plugin_source_override_payload() -> dict | None:
-    try:
-        with open(_tinyhat_plugin_source_override_path(), encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
-
-
-def _restore_tinyhat_plugin_source_override(payload: dict | None) -> None:
-    path = _tinyhat_plugin_source_override_path()
-    if payload is None:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        return
-    repo_url = str(payload.get("repo_url") or "").strip()
-    repo_ref = str(payload.get("repo_ref") or "").strip()
-    if not repo_url or not repo_ref:
-        raise RuntimeError("previous plugin source override is invalid")
-    _atomic_write_json(path, payload, mode=0o600)
 
 
 def _public_runtime_cache_plugin_hit(

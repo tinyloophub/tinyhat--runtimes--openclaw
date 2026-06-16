@@ -9,6 +9,7 @@ test patches on ``supervisor.<name>`` still affect these paths.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import shutil
@@ -20,6 +21,72 @@ from tinyhat_cli._facade import supervisor_module as _sup
 log = logging.getLogger("tinyhat-supervisor")
 
 UNIT_CATEGORY = "release-update-lifecycle"
+
+
+def _tinyhat_plugin_source_override_path() -> str:
+    sup = _sup()
+    configured = (
+        os.environ.get(sup.TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV) or ""
+    ).strip()
+    default_path = os.path.abspath(
+        os.path.join(sup.openclaw_state_dir(), "tinyhat-plugin-source.json")
+        if sup._dev_mode()
+        else sup._DEFAULT_TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH
+    )
+    path = os.path.abspath(configured or default_path)
+    checkout_dir = os.path.abspath(sup.runtime_dir())
+    try:
+        inside_checkout = os.path.commonpath([path, checkout_dir]) == checkout_dir
+    except ValueError:
+        inside_checkout = False
+    if inside_checkout:
+        log.warning(
+            "%s=%s resolves inside the runtime checkout dir (%s); plugin "
+            "update source overrides must survive runtime checkouts. Falling "
+            "back to %s.",
+            sup.TINYHAT_PLUGIN_SOURCE_OVERRIDE_PATH_ENV,
+            path,
+            checkout_dir,
+            default_path,
+        )
+        return default_path
+    return path
+
+
+def _read_tinyhat_plugin_source_override() -> tuple[str, str] | None:
+    payload = _read_tinyhat_plugin_source_override_payload()
+    if payload is None:
+        return None
+    repo_url = str(payload.get("repo_url") or "").strip()
+    repo_ref = str(payload.get("repo_ref") or "").strip()
+    if not repo_url or not repo_ref:
+        return None
+    return repo_url, repo_ref
+
+
+def _read_tinyhat_plugin_source_override_payload() -> dict | None:
+    try:
+        with open(_tinyhat_plugin_source_override_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _restore_tinyhat_plugin_source_override(payload: dict | None) -> None:
+    sup = _sup()
+    path = _tinyhat_plugin_source_override_path()
+    if payload is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    repo_url = str(payload.get("repo_url") or "").strip()
+    repo_ref = str(payload.get("repo_ref") or "").strip()
+    if not repo_url or not repo_ref:
+        raise RuntimeError("previous plugin source override is invalid")
+    sup._atomic_write_json(path, payload, mode=0o600)
 
 
 def _rollback_plugin_update_transaction(transaction: dict[str, object]) -> str:
