@@ -18,6 +18,8 @@ from tinyhat_cli._facade import supervisor_module as _sup
 
 log = logging.getLogger("tinyhat-supervisor")
 
+UNIT_CATEGORY = "release-update-lifecycle"
+
 
 def _rollback_plugin_update_transaction(transaction: dict[str, object]) -> str:
     sup = _sup()
