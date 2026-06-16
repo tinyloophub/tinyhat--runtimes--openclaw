@@ -4168,6 +4168,74 @@ def probe_current_openclaw_gateway_health() -> tuple[bool, str]:
     )
 
 
+def _first_marker_epoch(logs: str, marker: str) -> float | None:
+    """Return the unix timestamp of the first journal line (``-o short-unix``
+    format: ``<epoch> host unit[pid]: <message>``) containing ``marker``."""
+    for line in logs.splitlines():
+        if marker not in line:
+            continue
+        head = line.split(maxsplit=1)
+        if not head:
+            return None
+        try:
+            return float(head[0])
+        except ValueError:
+            return None
+    return None
+
+
+def log_gateway_readiness_split(started_at: float) -> None:
+    """Measure-first instrumentation for tinyloophub/tinyloop#775.
+
+    On a successful readiness probe, split the bot-ready wait into the
+    *prewarmable* gateway/plugin boot (time to ``[gateway] ready``) vs the
+    largely *irreducible* Telegram-connect floor (``[gateway] ready`` ->
+    ``[telegram] connected to gateway``). This is the data the runtime did not
+    record before; it sizes whether a gateway prewarm is worth building.
+
+    Reads the gateway's own journal via the official ``journalctl`` interface;
+    best-effort and log-only, so it never blocks or fails readiness. Skipped in
+    dev mode (logs go to a flat file there, not journald).
+    """
+    if _dev_mode():
+        return
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "-u",
+                GATEWAY_SYSTEMD_UNIT,
+                "--no-pager",
+                "-o",
+                "short-unix",
+                "--since",
+                f"@{int(started_at)}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GATEWAY_HEALTH_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0:
+            return
+        gateway_ready_at = _first_marker_epoch(result.stdout, "[gateway] ready")
+        telegram_at = _first_marker_epoch(
+            result.stdout, "[telegram] connected to gateway"
+        )
+        if gateway_ready_at is None or telegram_at is None:
+            return
+        boot_s = max(0.0, round(gateway_ready_at - started_at, 1))
+        connect_s = max(0.0, round(telegram_at - gateway_ready_at, 1))
+        log.info(
+            "gateway readiness split: gateway/plugin boot=%.1fs (prewarmable), "
+            "telegram connect=%.1fs (Telegram floor)",
+            boot_s,
+            connect_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - measurement must never block readiness
+        log.debug("gateway readiness split unavailable: %s", exc)
+
+
 def ensure_openclaw_gateway_ready(
     binding: dict,
     config_fingerprint: dict[str, str],

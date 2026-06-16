@@ -15,6 +15,12 @@ runtime's published `VERSION` on each new Computer row.
   Previously only the coarse `assignment_to_serving_ms` sample was sent, so the
   consuming platform's hard-gate rows for those two metrics had no data.
   Telemetry-only; no change to assignment behavior or latency.
+- Startup metrics: on a successful gateway readiness probe the runtime now logs
+  the bot-ready split — prewarmable gateway/plugin boot (time to `[gateway]
+  ready`) vs the largely irreducible Telegram-connect floor (`[gateway] ready`
+  → `[telegram] connected to gateway`), read from the gateway's own journal via
+  `journalctl`. Measure-first data for sizing a future gateway prewarm;
+  log-only, best-effort, and never blocks or fails readiness.
 
 ### Changed
 

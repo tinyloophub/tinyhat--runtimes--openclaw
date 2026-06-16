@@ -9371,3 +9371,69 @@ class TinyhatPluginPrewarmTests(unittest.TestCase):
         self.assertEqual(observed["args"], ("u", "r"))
         # lock is released after the wrapper returns
         self.assertFalse(supervisor._TINYHAT_PLUGIN_INSTALL_LOCK.locked())
+
+
+class GatewayReadinessSplitTests(unittest.TestCase):
+    """tinyloop#775 Fix #3 (measure-first): split bot-ready into prewarmable
+    gateway/plugin boot vs the irreducible Telegram-connect floor."""
+
+    def test_first_marker_epoch_parses_short_unix(self) -> None:
+        logs = (
+            "1718542400.100000 host unit[1]: starting\n"
+            "1718542430.500000 host unit[1]: [gateway] ready\n"
+            "1718542448.200000 host unit[1]: [telegram] connected to gateway\n"
+        )
+        self.assertEqual(
+            supervisor._first_marker_epoch(logs, "[gateway] ready"), 1718542430.5
+        )
+        self.assertEqual(
+            supervisor._first_marker_epoch(
+                logs, "[telegram] connected to gateway"
+            ),
+            1718542448.2,
+        )
+        self.assertIsNone(supervisor._first_marker_epoch(logs, "[nope] missing"))
+
+    def test_split_logged_from_journal(self) -> None:
+        logs = (
+            "1718542400.0 host unit[1]: boot\n"
+            "1718542430.0 host unit[1]: [gateway] ready\n"
+            "1718542448.0 host unit[1]: [telegram] connected to gateway\n"
+        )
+        fake = SimpleNamespace(returncode=0, stdout=logs, stderr="")
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=False),
+            patch.object(supervisor.subprocess, "run", return_value=fake),
+            self.assertLogs(supervisor.log, level="INFO") as cm,
+        ):
+            supervisor.log_gateway_readiness_split(1718542400.0)
+        joined = "\n".join(cm.output)
+        self.assertIn("gateway/plugin boot=30.0s", joined)
+        self.assertIn("telegram connect=18.0s", joined)
+
+    def test_split_skipped_in_dev_mode(self) -> None:
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=True),
+            patch.object(supervisor.subprocess, "run") as run,
+        ):
+            supervisor.log_gateway_readiness_split(1.0)
+        run.assert_not_called()
+
+    def test_split_best_effort_on_journal_error(self) -> None:
+        # A measurement failure must never block/raise in the readiness path.
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=False),
+            patch.object(
+                supervisor.subprocess, "run", side_effect=RuntimeError("boom")
+            ),
+        ):
+            supervisor.log_gateway_readiness_split(1.0)
+
+    def test_split_noop_when_marker_missing(self) -> None:
+        logs = "1718542400.0 host unit[1]: [gateway] ready\n"  # no telegram line
+        fake = SimpleNamespace(returncode=0, stdout=logs, stderr="")
+        with (
+            patch.object(supervisor, "_dev_mode", return_value=False),
+            patch.object(supervisor.subprocess, "run", return_value=fake),
+        ):
+            supervisor.log_gateway_readiness_split(1718542400.0)  # no raise, no split
