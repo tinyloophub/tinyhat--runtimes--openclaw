@@ -615,6 +615,96 @@
         5747
       ],
       "destination": "tinyhat_cli.units.manifest"
+    },
+    {
+      "name": "_rollback_plugin_update_transaction",
+      "kind": "function",
+      "source_range": [
+        5493,
+        5510
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_remove_filesystem_entry",
+      "kind": "function",
+      "source_range": [
+        5553,
+        5559
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_npm_global_root",
+      "kind": "function",
+      "source_range": [
+        5562,
+        5585
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_framework_package_dir",
+      "kind": "function",
+      "source_range": [
+        5588,
+        5589
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_framework_backup_dirs",
+      "kind": "function",
+      "source_range": [
+        5592,
+        5601
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_repair_or_cleanup_framework_backups",
+      "kind": "function",
+      "source_range": [
+        5604,
+        5621
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_cleanup_stale_openclaw_npm_temp_dirs",
+      "kind": "function",
+      "source_range": [
+        5624,
+        5642
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_rollback_framework_install_transaction",
+      "kind": "function",
+      "source_range": [
+        5645,
+        5662
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_commit_framework_install_transaction",
+      "kind": "function",
+      "source_range": [
+        5665,
+        5680
+      ],
+      "destination": "tinyhat_cli.units.component_update"
+    },
+    {
+      "name": "_prepare_framework_install_transaction",
+      "kind": "function",
+      "source_range": [
+        5682,
+        5737
+      ],
+      "destination": "tinyhat_cli.units.component_update"
     }
   ]
 }
