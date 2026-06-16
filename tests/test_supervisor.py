@@ -6,6 +6,7 @@ Usage:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
+from tinyhat_cli.units import component_update
 
 _AMBIENT_ENV: dict[str, str | None] = {}
 _AMBIENT_ENV_KEYS = (
@@ -6940,13 +6942,47 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
             patch.object(
                 supervisor, "wait_for_openclaw_start", side_effect=fake_wait
             ) as wait,
+            patch.object(supervisor, "_write_runtime_state") as write_state,
         ):
             supervisor._restart_gateway_for_component_update(binding)
 
         start.assert_called_once_with(binding)
         wait.assert_called_once_with(1234.5)
+        write_state.assert_called_once_with(
+            "healthy",
+            "openclaw gateway restarted after component update",
+            gateway_active=True,
+            gateway_action="restarted",
+            openclaw_ready=True,
+            event_type="gateway_restart",
+            event_detail="component update restarted OpenClaw gateway",
+        )
         self.assertFalse(supervisor._stop_holder["stop"])
         self.assertFalse(supervisor._stop_holder["rebind"])
+        self.assertFalse(supervisor._stop_holder["component_update_restart"])
+
+    def test_component_update_restart_keeps_success_when_state_mirror_fails(
+        self,
+    ) -> None:
+        with (
+            patch.object(supervisor, "start_openclaw_gateway", return_value=1234.5),
+            patch.object(supervisor, "wait_for_openclaw_start"),
+            patch.object(
+                supervisor,
+                "_write_runtime_state",
+                side_effect=PermissionError("state dir unavailable"),
+            ) as write_state,
+            self.assertLogs("tinyhat-supervisor", level="WARNING") as logs,
+        ):
+            supervisor._restart_gateway_for_component_update()
+
+        write_state.assert_called_once()
+        self.assertTrue(
+            any(
+                "runtime_state mirror after gateway restart failed" in line
+                for line in logs.output
+            )
+        )
         self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
     def test_component_update_restart_propagates_readiness_failure(self) -> None:
@@ -6961,9 +6997,11 @@ class ComponentUpdateGatewayRestartTests(unittest.TestCase):
                 "wait_for_openclaw_start",
                 side_effect=RuntimeError("telegram did not reconnect"),
             ),
+            patch.object(supervisor, "_write_runtime_state") as write_state,
         ):
             with self.assertRaisesRegex(RuntimeError, "telegram did not reconnect"):
                 supervisor._restart_gateway_for_component_update()
+        write_state.assert_not_called()
         self.assertFalse(supervisor._stop_holder["component_update_restart"])
 
 
@@ -7486,8 +7524,18 @@ class UpdateComponentCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as global_root:
             old_package = os.path.join(global_root, "openclaw")
             stale_temp = os.path.join(global_root, ".openclaw-gX1GdeX9")
+            stale_committed = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-committed-backup-100-1",
+            )
+            stale_copying = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-copying-100-1",
+            )
             os.makedirs(old_package)
             os.makedirs(stale_temp)
+            os.makedirs(stale_committed)
+            os.makedirs(stale_copying)
 
             def fake_run(cmd, **_kwargs):
                 self.assertEqual(
@@ -7520,7 +7568,67 @@ class UpdateComponentCommandTests(unittest.TestCase):
 
             self.assertTrue(os.path.isdir(old_package))
             self.assertFalse(os.path.exists(stale_temp))
+            self.assertFalse(os.path.exists(stale_committed))
+            self.assertFalse(os.path.exists(stale_copying))
             self.assertFalse(os.path.exists(transaction["backup_dir"]))
+
+    def test_framework_prepare_handles_cross_device_backup_move(self) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            os.makedirs(package_dir)
+            with open(os.path.join(package_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+
+            real_replace = os.replace
+
+            def fake_replace(src, dst):
+                if src == package_dir and os.path.basename(dst).startswith(
+                    ".tinyhat-openclaw-backup-"
+                ):
+                    raise OSError(errno.EXDEV, "Invalid cross-device link")
+                return real_replace(src, dst)
+
+            def fake_run(_cmd, **_kwargs):
+                self.assertFalse(os.path.exists(package_dir))
+                os.makedirs(package_dir)
+                with open(
+                    os.path.join(package_dir, "new.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write("new")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(supervisor, "_npm_global_root", return_value=global_root),
+                patch(
+                    "tinyhat_cli.units.component_update.os.replace",
+                    side_effect=fake_replace,
+                ),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor,
+                    "_read_openclaw_framework_version",
+                    return_value="1.5.0",
+                ),
+            ):
+                transaction = supervisor._prepare_framework_install_transaction(
+                    "1.5.0"
+                )
+
+            backup_dir = str(transaction["backup_dir"])
+            self.assertTrue(os.path.isdir(backup_dir))
+            self.assertTrue(os.path.exists(os.path.join(backup_dir, "old.txt")))
+            self.assertFalse(
+                any(
+                    name.startswith(".tinyhat-openclaw-copying-")
+                    for name in os.listdir(global_root)
+                )
+            )
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
+
+            supervisor._commit_framework_install_transaction(transaction)
+            self.assertFalse(os.path.exists(backup_dir))
 
     def test_framework_commit_cleanup_failure_does_not_repair_old_backup(
         self,
@@ -7561,6 +7669,15 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self.assertEqual(actions, [])
             self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
             self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+            removed = component_update._cleanup_stale_framework_backup_artifacts(
+                global_root
+            )
+
+            self.assertIn(
+                os.path.basename(str(transaction["backup_dir"])),
+                removed,
+            )
+            self.assertFalse(os.path.exists(str(transaction["backup_dir"])))
 
     def test_framework_npm_enotempty_failure_restores_previous_tree(self) -> None:
         with tempfile.TemporaryDirectory() as global_root:

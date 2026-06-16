@@ -8,6 +8,7 @@ test patches on ``supervisor.<name>`` still affect these paths.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -91,7 +92,42 @@ def _framework_backup_dirs(global_root: str) -> list[str]:
         os.path.join(global_root, name)
         for name in names
         if name.startswith(".tinyhat-openclaw-backup-")
+        and not name.endswith(".copying")
     )
+
+
+def _cleanup_stale_framework_backup_artifacts(global_root: str) -> list[str]:
+    """Remove non-repair backup artifacts from prior framework updates."""
+    sup = _sup()
+    removed: list[str] = []
+    try:
+        names = os.listdir(global_root)
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect npm global root: {exc}") from exc
+    for name in sorted(names):
+        if not (
+            name.startswith(".tinyhat-openclaw-committed-backup-")
+            or name.startswith(".tinyhat-openclaw-copying-")
+        ):
+            continue
+        path = os.path.join(global_root, name)
+        try:
+            sup._remove_filesystem_entry(path)
+        except Exception as exc:  # noqa: BLE001 - stale cleanup is best effort
+            log.warning(
+                "component update: could not remove stale framework backup "
+                "artifact %s: %s",
+                path,
+                exc,
+            )
+            continue
+        removed.append(name)
+    if removed:
+        log.warning(
+            "component update: removed stale framework backup artifacts: %s",
+            ", ".join(removed[:10]),
+        )
+    return removed
 
 
 def _repair_or_cleanup_framework_backups(global_root: str) -> list[str]:
@@ -134,6 +170,45 @@ def _cleanup_stale_openclaw_npm_temp_dirs(global_root: str) -> list[str]:
             ", ".join(removed[:10]),
         )
     return removed
+
+
+def _move_framework_package_to_backup(package_dir: str, backup_dir: str) -> None:
+    """Move the current OpenClaw tree into a repair-discoverable backup.
+
+    Docker Desktop overlay/fakeowner paths can raise EXDEV for a directory
+    rename even when the source and destination are under the same apparent
+    parent. The fallback only publishes a repairable backup after the copy is
+    complete; an interrupted copy leaves a non-discoverable scratch directory.
+    """
+    try:
+        os.replace(package_dir, backup_dir)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    sup = _sup()
+    parent, backup_name = os.path.split(backup_dir)
+    backup_prefix = ".tinyhat-openclaw-backup-"
+    scratch_suffix = (
+        backup_name[len(backup_prefix) :]
+        if backup_name.startswith(backup_prefix)
+        else backup_name
+    )
+    scratch_dir = os.path.join(parent, f".tinyhat-openclaw-copying-{scratch_suffix}")
+    try:
+        if os.path.lexists(scratch_dir):
+            sup._remove_filesystem_entry(scratch_dir)
+        shutil.copytree(package_dir, scratch_dir, symlinks=True)
+        os.replace(scratch_dir, backup_dir)
+        sup._remove_filesystem_entry(package_dir)
+    except Exception:
+        if os.path.lexists(scratch_dir):
+            try:
+                sup._remove_filesystem_entry(scratch_dir)
+            except Exception:  # noqa: BLE001 - preserve original failure
+                pass
+        raise
 
 
 def _rollback_framework_install_transaction(transaction: dict[str, object]) -> str:
@@ -197,6 +272,7 @@ def _commit_framework_install_transaction(transaction: dict[str, object]) -> Non
 def _prepare_framework_install_transaction(version: str) -> dict[str, object]:
     sup = _sup()
     global_root = sup._npm_global_root()
+    _cleanup_stale_framework_backup_artifacts(global_root)
     sup._repair_or_cleanup_framework_backups(global_root)
     sup._cleanup_stale_openclaw_npm_temp_dirs(global_root)
 
@@ -207,7 +283,7 @@ def _prepare_framework_install_transaction(version: str) -> dict[str, object]:
             global_root,
             f".tinyhat-openclaw-backup-{int(time.time())}-{os.getpid()}",
         )
-        os.replace(package_dir, backup_dir)
+        _move_framework_package_to_backup(package_dir, backup_dir)
 
     transaction: dict[str, object] = {
         "global_root": global_root,

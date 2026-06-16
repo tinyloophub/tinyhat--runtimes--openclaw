@@ -67,7 +67,11 @@ RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
         --home-dir /home/tinyhat --shell /bin/bash tinyhat \
     && mkdir -p /home/tinyhat/runtime/openclaw /etc/openclaw \
-    && chown -R tinyhat:tinyhat /home/tinyhat /etc/openclaw
+    && chown -R tinyhat:tinyhat \
+        /home/tinyhat \
+        /etc/openclaw \
+        /usr/local/bin \
+        /usr/local/lib/node_modules
 
 # Ship the same official Codex provider plugin that production bootstrap
 # installs. The supervisor also self-heals this at boot, but baking it into

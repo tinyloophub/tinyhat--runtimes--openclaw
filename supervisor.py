@@ -5498,6 +5498,22 @@ def _restart_gateway_for_component_update(binding: dict | None = None) -> None:
         if restart_result.outcome != "succeeded":
             raise RuntimeError(restart_result.detail or restart_result.outcome)
         log.info("component update: OpenClaw gateway restarted and healthy")
+        try:
+            _write_runtime_state(
+                "healthy",
+                "openclaw gateway restarted after component update",
+                gateway_active=True,
+                gateway_action="restarted",
+                openclaw_ready=True,
+                event_type="gateway_restart",
+                event_detail="component update restarted OpenClaw gateway",
+            )
+        except Exception as exc:  # noqa: BLE001 - update result already succeeded
+            log.warning(
+                "component update: runtime_state mirror after gateway restart "
+                "failed: %s",
+                exc,
+            )
     finally:
         _stop_holder["component_update_restart"] = previous_marker
 
