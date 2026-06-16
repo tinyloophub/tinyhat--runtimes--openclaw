@@ -157,6 +157,17 @@ def _rollback_framework_install_transaction(transaction: dict[str, object]) -> s
         return f"framework rollback failed: {exc}"
 
 
+def _committed_framework_backup_dir(backup_dir: str) -> str:
+    parent, name = os.path.split(backup_dir)
+    prefix = ".tinyhat-openclaw-backup-"
+    if not name.startswith(prefix):
+        return backup_dir + ".committed"
+    return os.path.join(
+        parent,
+        ".tinyhat-openclaw-committed-backup-" + name[len(prefix) :],
+    )
+
+
 def _commit_framework_install_transaction(transaction: dict[str, object]) -> None:
     """Discard the saved tree only after the gateway smoke has passed."""
     sup = _sup()
@@ -165,9 +176,17 @@ def _commit_framework_install_transaction(transaction: dict[str, object]) -> Non
         transaction["committed"] = True
         return
     try:
+        if os.path.lexists(backup_dir):
+            committed_dir = _committed_framework_backup_dir(backup_dir)
+            if committed_dir != backup_dir:
+                os.replace(backup_dir, committed_dir)
+                backup_dir = committed_dir
+                transaction["backup_dir"] = committed_dir
         sup._remove_filesystem_entry(backup_dir)
         transaction["committed"] = True
     except Exception as exc:  # noqa: BLE001 - stale backup is non-fatal
+        transaction["committed"] = True
+        transaction["commit_cleanup_failed"] = True
         log.warning(
             "component update: could not remove framework install backup %s: %s",
             backup_dir,

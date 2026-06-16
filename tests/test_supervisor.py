@@ -7522,6 +7522,46 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self.assertFalse(os.path.exists(stale_temp))
             self.assertFalse(os.path.exists(transaction["backup_dir"]))
 
+    def test_framework_commit_cleanup_failure_does_not_repair_old_backup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            backup_dir = os.path.join(
+                global_root,
+                ".tinyhat-openclaw-backup-100-1",
+            )
+            os.makedirs(package_dir)
+            os.makedirs(backup_dir)
+            with open(os.path.join(package_dir, "new.txt"), "w", encoding="utf-8") as fh:
+                fh.write("new")
+            with open(os.path.join(backup_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+
+            original_remove = supervisor._remove_filesystem_entry
+
+            def fake_remove(path):
+                if ".tinyhat-openclaw-committed-backup-" in path:
+                    raise OSError("cleanup denied")
+                return original_remove(path)
+
+            transaction = {"package_dir": package_dir, "backup_dir": backup_dir}
+            with patch.object(
+                supervisor,
+                "_remove_filesystem_entry",
+                side_effect=fake_remove,
+            ):
+                supervisor._commit_framework_install_transaction(transaction)
+
+            self.assertTrue(transaction["committed"])
+            self.assertTrue(transaction["commit_cleanup_failed"])
+            self.assertIn(".tinyhat-openclaw-committed-backup-", transaction["backup_dir"])
+            actions = supervisor._repair_or_cleanup_framework_backups(global_root)
+
+            self.assertEqual(actions, [])
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+
     def test_framework_npm_enotempty_failure_restores_previous_tree(self) -> None:
         with tempfile.TemporaryDirectory() as global_root:
             package_dir = os.path.join(global_root, "openclaw")
