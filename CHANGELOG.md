@@ -7,6 +7,15 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Added
+
+- Startup metrics: the binding cycle now emits `config_apply_to_runtime_ack_ms`
+  and `bot_attach_to_first_ack_ms` as their own runtime samples, derived from
+  the `binding/config apply` and `bot-ready` phase spans it already records.
+  Previously only the coarse `assignment_to_serving_ms` sample was sent, so the
+  consuming platform's hard-gate rows for those two metrics had no data.
+  Telemetry-only; no change to assignment behavior or latency.
+
 ## 0.14.0
 
 This release aligns the public OpenClaw runtime with the Tinyloop `v0.14.0`
