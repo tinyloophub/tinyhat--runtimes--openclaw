@@ -7,6 +7,13 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.0
+
+This release aligns the public OpenClaw runtime with the Tinyloop `v0.15.0`
+in-place Computer operations train. It includes safer component updates, reboot
+bootstrap resilience, and startup-path measurements and prewarming used by the
+platform to operate existing Computers without replacing them.
+
 ### Added
 
 - Startup metrics: the binding cycle now emits `config_apply_to_runtime_ack_ms`
@@ -33,6 +40,18 @@ runtime's published `VERSION` on each new Computer row.
   shared between the prewarm thread and the bind-time setup (no concurrent
   checkout/install race), and the prewarm is best-effort — any failure falls
   back to the existing bind-time install, so readiness is never blocked.
+- Component update backup discovery now uses the framework's recorded backup
+  paths directly, keeping the rollback lookup small and tied to the update
+  transaction instead of scanning broader OpenClaw internals.
+
+### Fixed
+
+- Gate supervisor boot on successful platform setup so reboot recovery does not
+  claim the runtime is ready before the platform plugin and binding path are in
+  place.
+- Verify OpenClaw framework updates atomically before advancing the recorded
+  component set, preserving rollback state when a framework restart or readiness
+  probe fails.
 
 ## 0.14.0
 
