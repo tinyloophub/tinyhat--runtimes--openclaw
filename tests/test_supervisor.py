@@ -2198,6 +2198,31 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                 ),
                 patch.object(
                     supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
+                ),
+                patch.object(
+                    supervisor,
                     "log_gateway_readiness_split",
                     return_value=None,
                     create=True,
@@ -2334,6 +2359,31 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                 ),
                 patch.object(
                     supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
+                ),
+                patch.object(
+                    supervisor,
                     "log_gateway_readiness_split",
                     return_value=None,
                     create=True,
@@ -2421,6 +2471,31 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     supervisor,
                     "_journal_runtime_log_lines",
                     return_value=[],
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_identity",
+                    return_value={
+                        "computer_id": None,
+                        "instance_id": None,
+                        "runtime_ref": None,
+                    },
+                ),
+                patch.object(
+                    supervisor,
+                    "_runtime_state_recent_log_excerpts",
+                    return_value={"bootstrap": [], "supervisor": [], "gateway": []},
+                ),
+                patch.object(supervisor, "_plugin_load_check", return_value={}),
+                patch.object(
+                    supervisor,
+                    "capability_verification_cached",
+                    return_value=({}, {}),
+                ),
+                patch.object(
+                    supervisor,
+                    "fold_command_results",
+                    return_value=([], [], []),
                 ),
                 patch.object(
                     supervisor,
