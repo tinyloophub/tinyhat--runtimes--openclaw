@@ -5498,14 +5498,153 @@ def _update_plugin_component(ref: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def _update_framework_component(version: str) -> tuple[bool, str | None]:
-    """Update the OpenClaw framework (npm package) to ``version`` in place.
+def _remove_filesystem_entry(path: str) -> None:
+    if not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+        return
+    os.unlink(path)
 
-    Mirrors the bootstrap install style (``npm install -g`` with the
-    non-interactive flags). Verifies the installed version matches the
-    target via ``_read_openclaw_framework_version`` before declaring success.
-    Returns ``(ok, diagnostic)``; never raises.
-    """
+
+def _npm_global_root() -> str:
+    try:
+        result = subprocess.run(
+            ["npm", "root", "-g"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("npm root -g timed out") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"npm root -g raised: {exc}") from exc
+    if result.returncode != 0:
+        detail = _sanitize_runtime_state_text(
+            (result.stderr or result.stdout or "").strip(),
+            limit=300,
+        )
+        raise RuntimeError(f"npm root -g failed: {detail or result.returncode}")
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    root = lines[-1] if lines else ""
+    if not root:
+        raise RuntimeError("npm root -g returned an empty path")
+    return os.path.abspath(root)
+
+
+def _framework_package_dir(global_root: str) -> str:
+    return os.path.join(global_root, "openclaw")
+
+
+def _framework_backup_dirs(global_root: str) -> list[str]:
+    try:
+        names = os.listdir(global_root)
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect npm global root: {exc}") from exc
+    return sorted(
+        os.path.join(global_root, name)
+        for name in names
+        if name.startswith(".tinyhat-openclaw-backup-")
+    )
+
+
+def _repair_or_cleanup_framework_backups(global_root: str) -> list[str]:
+    """Repair an interrupted Tinyhat-owned framework swap when possible."""
+    package_dir = _framework_package_dir(global_root)
+    backups = _framework_backup_dirs(global_root)
+    actions: list[str] = []
+    restored: str | None = None
+    if not os.path.lexists(package_dir) and backups:
+        restored = backups[-1]
+        os.replace(restored, package_dir)
+        actions.append(f"restored {os.path.basename(restored)}")
+    for backup in backups:
+        if backup == restored:
+            continue
+        _remove_filesystem_entry(backup)
+        actions.append(f"removed stale {os.path.basename(backup)}")
+    return actions
+
+
+def _cleanup_stale_openclaw_npm_temp_dirs(global_root: str) -> list[str]:
+    """Remove npm's stale .openclaw-* dirs that cause ENOTEMPTY retries."""
+    removed: list[str] = []
+    try:
+        names = os.listdir(global_root)
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect npm global root: {exc}") from exc
+    for name in sorted(names):
+        if not name.startswith(".openclaw-"):
+            continue
+        path = os.path.join(global_root, name)
+        _remove_filesystem_entry(path)
+        removed.append(name)
+    if removed:
+        log.warning(
+            "component update: removed stale OpenClaw npm temp dirs: %s",
+            ", ".join(removed[:10]),
+        )
+    return removed
+
+
+def _rollback_framework_install_transaction(transaction: dict[str, object]) -> str:
+    """Restore the pre-update OpenClaw package tree after a failed smoke."""
+    package_dir = str(transaction.get("package_dir") or "")
+    backup_dir = str(transaction.get("backup_dir") or "")
+    try:
+        if package_dir:
+            _remove_filesystem_entry(package_dir)
+        if backup_dir and os.path.lexists(backup_dir):
+            os.replace(backup_dir, package_dir)
+            transaction["rolled_back"] = True
+            return "framework rollback restored previous OpenClaw package tree"
+        transaction["rolled_back"] = True
+        return "framework rollback removed partial OpenClaw package tree"
+    except Exception as exc:  # noqa: BLE001
+        transaction["rollback_failed"] = True
+        return f"framework rollback failed: {exc}"
+
+
+def _commit_framework_install_transaction(transaction: dict[str, object]) -> None:
+    """Discard the saved tree only after the gateway smoke has passed."""
+    backup_dir = str(transaction.get("backup_dir") or "")
+    if not backup_dir:
+        transaction["committed"] = True
+        return
+    try:
+        _remove_filesystem_entry(backup_dir)
+        transaction["committed"] = True
+    except Exception as exc:  # noqa: BLE001 - stale backup is non-fatal
+        log.warning(
+            "component update: could not remove framework install backup %s: %s",
+            backup_dir,
+            exc,
+        )
+
+
+def _prepare_framework_install_transaction(version: str) -> dict[str, object]:
+    global_root = _npm_global_root()
+    _repair_or_cleanup_framework_backups(global_root)
+    _cleanup_stale_openclaw_npm_temp_dirs(global_root)
+
+    package_dir = _framework_package_dir(global_root)
+    backup_dir = ""
+    if os.path.lexists(package_dir):
+        backup_dir = os.path.join(
+            global_root,
+            f".tinyhat-openclaw-backup-{int(time.time())}-{os.getpid()}",
+        )
+        os.replace(package_dir, backup_dir)
+
+    transaction: dict[str, object] = {
+        "global_root": global_root,
+        "package_dir": package_dir,
+        "backup_dir": backup_dir,
+        "target_version": version,
+        "committed": False,
+        "rolled_back": False,
+    }
     try:
         install = subprocess.run(
             ["npm", "install", "-g", "--no-fund", "--no-audit", f"openclaw@{version}"],
@@ -5514,22 +5653,49 @@ def _update_framework_component(version: str) -> tuple[bool, str | None]:
             timeout=300,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return False, f"framework npm install of openclaw@{version} timed out"
+    except subprocess.TimeoutExpired as exc:
+        rollback = _rollback_framework_install_transaction(transaction)
+        raise RuntimeError(
+            f"framework npm install of openclaw@{version} timed out; {rollback}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        return False, f"framework npm install raised: {exc}"
+        rollback = _rollback_framework_install_transaction(transaction)
+        raise RuntimeError(f"framework npm install raised: {exc}; {rollback}") from exc
     if install.returncode != 0:
-        detail = (install.stderr or install.stdout or "").strip()
-        return False, f"framework npm install failed: {detail[:200]}"
+        detail = _sanitize_runtime_state_text(
+            (install.stderr or install.stdout or "").strip(),
+            limit=500,
+        )
+        rollback = _rollback_framework_install_transaction(transaction)
+        raise RuntimeError(
+            f"framework npm install failed: {detail or install.returncode}; {rollback}"
+        )
     installed = _read_openclaw_framework_version()
     if installed != version:
-        return (
-            False,
+        rollback = _rollback_framework_install_transaction(transaction)
+        raise RuntimeError(
             "framework version mismatch after install: "
-            f"wanted {version}, got {installed or 'unknown'}",
+            f"wanted {version}, got {installed or 'unknown'}; {rollback}"
         )
+    return transaction
+
+
+def _update_framework_component(
+    version: str,
+) -> tuple[bool, str | None, dict[str, object] | None]:
+    """Update the OpenClaw framework (npm package) to ``version`` in place.
+
+    The new package tree is prepared while the previous global package tree is
+    kept in a Tinyhat-owned backup. The caller must commit that transaction
+    only after the post-update gateway smoke passes, or roll it back if the
+    gateway cannot start from the new tree.
+    """
+    try:
+        transaction = _prepare_framework_install_transaction(version)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"framework update to openclaw@{version} failed: {exc}", None
     log.info("component update: framework now at %s", version)
-    return True, None
+    return True, None, transaction
 
 
 def _update_runtime_component(ref: str) -> tuple[bool, str | None]:
@@ -6098,11 +6264,15 @@ def handle_update_component_command(
     diagnostics: list[str] = []
     all_ok = True
     gateway_restart_needed = False
+    framework_transaction: dict[str, object] | None = None
 
     # Order: plugin -> framework -> runtime. The runtime self-update is the
     # riskiest (rewrites the repo the supervisor runs from and must restart
     # the process), so it runs last — a plugin/framework failure never
-    # strands a half-updated runtime.
+    # strands a half-updated runtime. Plugin/framework targets also verify the
+    # gateway before the runtime checkout happens, so a combined
+    # plugin/framework+runtime revision is not reported applied until the
+    # updated package tree can start the gateway.
 
     plugin_target = targets.get("plugin")
     if isinstance(plugin_target, dict) and str(plugin_target.get("ref") or "").strip():
@@ -6116,11 +6286,47 @@ def handle_update_component_command(
     if isinstance(framework_target, dict) and str(
         framework_target.get("version") or ""
     ).strip():
-        ok, diag = _update_framework_component(str(framework_target["version"]).strip())
+        ok, diag, transaction = _update_framework_component(
+            str(framework_target["version"]).strip()
+        )
         all_ok = all_ok and ok
         gateway_restart_needed = gateway_restart_needed or ok
+        if transaction is not None:
+            framework_transaction = transaction
         if diag:
             diagnostics.append(diag)
+
+    # These handlers run inside the heartbeat thread. Blocking that thread
+    # through the restart/readiness wait is intentional: the update result
+    # must reflect whether the updated gateway process actually loaded and
+    # reconnected Telegram. The Phase D monitor suppresses its inactive
+    # gateway counter while this marker is set so restart failures can be
+    # reported here rather than racing the broken-state path.
+    if gateway_restart_needed:
+        try:
+            _restart_gateway_for_component_update(binding)
+        except Exception as exc:  # noqa: BLE001 - report the failed update
+            all_ok = False
+            diagnostics.append(f"gateway restart after component update failed: {exc}")
+            if framework_transaction is not None:
+                rollback_detail = _rollback_framework_install_transaction(
+                    framework_transaction
+                )
+                diagnostics.append(rollback_detail)
+                if "restored previous OpenClaw package tree" in rollback_detail:
+                    try:
+                        _restart_gateway_for_component_update(binding)
+                        diagnostics.append(
+                            "gateway restarted after framework rollback"
+                        )
+                    except Exception as rollback_exc:  # noqa: BLE001
+                        diagnostics.append(
+                            "gateway restart after framework rollback failed: "
+                            f"{rollback_exc}"
+                        )
+        else:
+            if framework_transaction is not None:
+                _commit_framework_install_transaction(framework_transaction)
 
     # Runtime is handled specially: because the running process is still the
     # OLD code until restarted, on a SUCCESSFUL real (non-dev) checkout we
@@ -6130,7 +6336,7 @@ def handle_update_component_command(
         str(runtime_target.get("ref") or "").strip()
     )
     runtime_needs_restart = False
-    if runtime_requested:
+    if runtime_requested and all_ok:
         ok, diag = _update_runtime_component(str(runtime_target["ref"]).strip())
         all_ok = all_ok and ok
         if diag:
@@ -6139,19 +6345,8 @@ def handle_update_component_command(
         # restart to take effect. Dev mode returns ok with a "skipped"
         # diagnostic and must not restart.
         runtime_needs_restart = ok and not _dev_mode()
-
-    # These handlers run inside the heartbeat thread. Blocking that thread
-    # through the restart/readiness wait is intentional: the update result
-    # must reflect whether the updated gateway process actually loaded and
-    # reconnected Telegram. The Phase D monitor suppresses its inactive
-    # gateway counter while this marker is set so restart failures can be
-    # reported here rather than racing the broken-state path.
-    if gateway_restart_needed and not runtime_needs_restart:
-        try:
-            _restart_gateway_for_component_update(binding)
-        except Exception as exc:  # noqa: BLE001 - report the failed update
-            all_ok = False
-            diagnostics.append(f"gateway restart after component update failed: {exc}")
+    elif runtime_requested:
+        diagnostics.append("runtime update skipped because an earlier component failed")
 
     status = "applied" if all_ok else "failed"
     diagnostic = "; ".join(diagnostics) if diagnostics else None
