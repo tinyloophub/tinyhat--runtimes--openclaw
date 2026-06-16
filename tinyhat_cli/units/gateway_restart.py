@@ -139,6 +139,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
                 log.info("OpenClaw gateway readiness probe succeeded")
                 sup._mark_lifecycle("gateway_ready_at_unix")
                 sup.note_gateway_ready()
+                sup.log_gateway_readiness_split(started_at)
                 return
             if sup._is_openclaw_gateway_startup_failure(detail):
                 raise RuntimeError("openclaw gateway failed to start: " + detail)
@@ -156,6 +157,7 @@ def wait_for_openclaw_start(started_at: float) -> None:
             log.info("OpenClaw gateway readiness probe succeeded")
             sup._mark_lifecycle("gateway_ready_at_unix")
             sup.note_gateway_ready()
+            sup.log_gateway_readiness_split(started_at)
             return
         if sup._is_openclaw_gateway_startup_failure(detail):
             raise RuntimeError("openclaw gateway failed to start: " + detail)
