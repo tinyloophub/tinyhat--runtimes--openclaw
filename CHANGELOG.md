@@ -7,6 +7,11 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.3
+
+Patch release for activating repaired legacy ChatGPT/Codex subscription auth
+after one-Computer admin repair.
+
 ### Fixed
 
 - Re-enter the OpenClaw binding cycle after a successful ChatGPT/Codex auth
