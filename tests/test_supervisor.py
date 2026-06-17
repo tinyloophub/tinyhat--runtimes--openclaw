@@ -10709,7 +10709,20 @@ class CleanShutdownGatewayTeardownTests(unittest.TestCase):
         self._old_stop_holder = dict(supervisor._stop_holder)
         supervisor._stop_holder.update({"stop": False, "rebind": False})
 
+        class _NoopThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        self._thread_patcher = patch.object(
+            supervisor.threading, "Thread", _NoopThread
+        )
+        self._thread_patcher.start()
+
     def tearDown(self) -> None:
+        self._thread_patcher.stop()
         supervisor._stop_holder.clear()
         supervisor._stop_holder.update(self._old_stop_holder)
 
