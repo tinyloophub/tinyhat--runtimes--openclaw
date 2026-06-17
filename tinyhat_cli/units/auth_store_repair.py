@@ -63,6 +63,17 @@ def _spool_auth_store_repair_result(
         log.warning("auth-store repair result spool failed: %s", exc)
 
 
+def _request_binding_reapply_after_repair() -> None:
+    """Re-enter the normal binding cycle so repaired auth becomes active."""
+    sup = _sup()
+    try:
+        sup._stop_holder["rebind"] = True
+        sup._stop_holder["stop"] = True
+        sup.notify_watchdog_checkpoint("phase-d-auth-store-repair-rebind")
+    except Exception as exc:  # noqa: BLE001 - result already reported
+        log.warning("auth-store repair rebind request failed: %s", exc)
+
+
 def handle_repair_openclaw_auth_store_command(command: dict) -> None:
     """Run OpenClaw doctor auth migration and report the bounded result."""
     sup = _sup()
@@ -125,3 +136,6 @@ def handle_repair_openclaw_auth_store_command(command: dict) -> None:
             revision,
             exc,
         )
+    else:
+        if status == "applied" and profile_present:
+            _request_binding_reapply_after_repair()
