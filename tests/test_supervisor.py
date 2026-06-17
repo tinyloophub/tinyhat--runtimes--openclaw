@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -6953,10 +6954,133 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             'npm install -g --no-fund --no-audit "${install_spec}"',
             script,
         )
+        self.assertIn("verify_openclaw_cli", script)
+        self.assertIn("openclaw --version", script)
+        self.assertIn("npm cache clean --force", script)
+        self.assertIn("retrying clean OpenClaw framework install", script)
         self.assertIn(
             "restored previous OpenClaw framework package after failed install",
             script,
         )
+
+    def test_bootstrap_hard_reset_restores_only_user_state(self) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "copy_path_if_present",
+            "hard_reset_openclaw_user_state_layout",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            config_dir = os.path.join(tmpdir, "config")
+            backup_root = os.path.join(tmpdir, "backups")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(os.path.join(state_dir, "platform-plugins", "tinyhat"))
+            os.makedirs(os.path.join(state_dir, "extensions", "codex"))
+            os.makedirs(os.path.join(state_dir, "workspace"))
+            os.makedirs(config_dir)
+            os.makedirs(bin_dir)
+            with open(
+                os.path.join(state_dir, "platform-plugins", "tinyhat", "install.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("old plugin")
+            with open(
+                os.path.join(state_dir, "extensions", "codex", "install.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("old extension")
+            with open(
+                os.path.join(state_dir, "workspace", "memory.md"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("user memory")
+            with open(
+                os.path.join(state_dir, "auth-profiles.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write('{"profiles":[]}')
+            with open(
+                os.path.join(config_dir, "tinyhat-secrets.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write('{"OPENAI_API_KEY":"redacted"}')
+            with open(
+                os.path.join(config_dir, "openclaw.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write('{"generated":"old"}')
+
+            fake_systemctl = os.path.join(bin_dir, "systemctl")
+            with open(fake_systemctl, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n")
+            os.chmod(fake_systemctl, 0o755)
+            systemctl_log = os.path.join(tmpdir, "systemctl.log")
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join(
+                        [
+                            f"OPENCLAW_STATE_DIR={shlex.quote(state_dir)}",
+                            f"OPENCLAW_CONFIG_DIR={shlex.quote(config_dir)}",
+                            f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
+                            "HARD_RESET_USER_STATE_MIGRATION=1",
+                            'SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"',
+                            'GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"',
+                            helper_script,
+                            "hard_reset_openclaw_user_state_layout",
+                        ]
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "SYSTEMCTL_LOG": systemctl_log,
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                os.path.exists(os.path.join(state_dir, "workspace", "memory.md"))
+            )
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        state_dir, "agents", "main", "agent", "auth-profiles.json"
+                    )
+                )
+            )
+            self.assertTrue(os.path.exists(os.path.join(config_dir, "tinyhat-secrets.json")))
+            self.assertFalse(os.path.exists(os.path.join(config_dir, "openclaw.json")))
+            self.assertFalse(os.path.exists(os.path.join(state_dir, "platform-plugins")))
+            self.assertFalse(os.path.exists(os.path.join(state_dir, "extensions")))
+            self.assertTrue(
+                os.path.exists(os.path.join(state_dir, "hard-reset-restore.env"))
+            )
+            backup_entries = os.listdir(backup_root)
+            self.assertEqual(len(backup_entries), 1)
+            backup = os.path.join(backup_root, backup_entries[0])
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(backup, "state", "platform-plugins", "tinyhat")
+                )
+            )
+            with open(systemctl_log, encoding="utf-8") as fh:
+                self.assertIn(
+                    "stop tinyhat-openclaw.service tinyhat-openclaw-gateway.service",
+                    fh.read(),
+                )
 
     def test_bootstrap_framework_install_restores_backup_on_npm_failure(
         self,
@@ -7024,6 +7148,175 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
             self.assertFalse(os.path.exists(backup_dir))
             self.assertFalse(os.path.exists(stale_temp))
+
+    def test_bootstrap_hard_reset_discards_bad_framework_on_npm_failure(
+        self,
+    ) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "cleanup_stale_openclaw_npm_temp_dirs",
+            "repair_or_cleanup_openclaw_backups",
+            "install_openclaw_framework_package",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_root = os.path.join(tmpdir, "npm-root")
+            package_dir = os.path.join(global_root, "openclaw")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(package_dir)
+            os.makedirs(bin_dir)
+            with open(os.path.join(package_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+            fake_npm = os.path.join(bin_dir, "npm")
+            with open(fake_npm, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then\n"
+                    "  printf '%s\\n' \"$FAKE_NPM_ROOT\"\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [ \"$1\" = install ]; then\n"
+                    "  mkdir -p \"$FAKE_NPM_ROOT/openclaw\"\n"
+                    "  printf partial > \"$FAKE_NPM_ROOT/openclaw/partial.txt\"\n"
+                    "  printf 'npm error code ENOENT\\n' >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "if [ \"$1\" = cache ]; then exit 0; fi\n"
+                    "exit 2\n"
+                )
+            os.chmod(fake_npm, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "HARD_RESET_USER_STATE_MIGRATION=1\n"
+                    + helper_script
+                    + "\ninstall_openclaw_framework_package openclaw@1.5.0",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "FAKE_NPM_ROOT": global_root,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertIn(
+                "discarded previous OpenClaw framework package",
+                result.stderr,
+            )
+
+    def test_bootstrap_framework_install_retries_when_cli_smoke_fails(
+        self,
+    ) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "cleanup_stale_openclaw_npm_temp_dirs",
+            "verify_openclaw_cli",
+            "repair_or_cleanup_openclaw_backups",
+            "install_openclaw_framework_package",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_root = os.path.join(tmpdir, "npm-root")
+            package_dir = os.path.join(global_root, "openclaw")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(package_dir)
+            os.makedirs(bin_dir)
+            with open(
+                os.path.join(package_dir, "old.txt"), "w", encoding="utf-8"
+            ) as fh:
+                fh.write("old")
+
+            fake_npm = os.path.join(bin_dir, "npm")
+            with open(fake_npm, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then\n"
+                    "  printf '%s\\n' \"$FAKE_NPM_ROOT\"\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [ \"$1\" = install ]; then\n"
+                    "  count_file=\"$FAKE_NPM_ROOT/install-count\"\n"
+                    "  count=0\n"
+                    "  if [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); fi\n"
+                    "  count=$((count + 1))\n"
+                    "  printf '%s' \"$count\" > \"$count_file\"\n"
+                    "  rm -rf \"$FAKE_NPM_ROOT/openclaw\"\n"
+                    "  mkdir -p \"$FAKE_NPM_ROOT/openclaw/dist\"\n"
+                    "  if [ \"$count\" -eq 1 ]; then\n"
+                    "    printf broken > \"$FAKE_NPM_ROOT/openclaw/install-state\"\n"
+                    "  else\n"
+                    "    printf ok > \"$FAKE_NPM_ROOT/openclaw/install-state\"\n"
+                    "    printf good > \"$FAKE_NPM_ROOT/openclaw/dist/good.txt\"\n"
+                    "  fi\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [ \"$1\" = cache ] && [ \"$2\" = clean ]; then\n"
+                    "  printf cleaned > \"$FAKE_NPM_ROOT/cache-cleaned\"\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "exit 2\n"
+                )
+            fake_openclaw = os.path.join(bin_dir, "openclaw")
+            with open(fake_openclaw, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "state_file=\"$FAKE_NPM_ROOT/openclaw/install-state\"\n"
+                    "if [ ! -f \"$state_file\" ] || "
+                    "[ \"$(cat \"$state_file\")\" != ok ]; then\n"
+                    "  printf '%s\\n' \"Error [ERR_MODULE_NOT_FOUND]: "
+                    "Cannot find module "
+                    "'/usr/lib/node_modules/openclaw/dist/argv-BulIeC99.js'\" >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "printf '2026.6.8\\n'\n"
+                    "exit 0\n"
+                )
+            os.chmod(fake_npm, 0o755)
+            os.chmod(fake_openclaw, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    helper_script
+                    + "\ninstall_openclaw_framework_package openclaw@2026.6.8",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "FAKE_NPM_ROOT": global_root,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(
+                os.path.join(global_root, "install-count"), encoding="utf-8"
+            ) as fh:
+                self.assertEqual(fh.read(), "2")
+            self.assertTrue(
+                os.path.exists(os.path.join(package_dir, "dist", "good.txt"))
+            )
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertTrue(os.path.exists(os.path.join(global_root, "cache-cleaned")))
+            self.assertFalse(
+                any(
+                    name.startswith(".tinyhat-openclaw-backup-")
+                    for name in os.listdir(global_root)
+                )
+            )
+            self.assertIn("openclaw CLI smoke failed", result.stderr)
+            self.assertIn("retrying clean OpenClaw framework install", result.stderr)
 
     def test_workload_slice_is_bounded_for_hold_down_sampling(self) -> None:
         unit = _bootstrap_unit_block("WORKLOAD_SLICE_UNIT")
@@ -7802,7 +8095,9 @@ class UpdateComponentCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as global_root:
             package_dir = os.path.join(global_root, "openclaw")
             os.makedirs(package_dir)
-            with open(os.path.join(package_dir, "old.txt"), "w", encoding="utf-8") as fh:
+            with open(
+                os.path.join(package_dir, "old.txt"), "w", encoding="utf-8"
+            ) as fh:
                 fh.write("old")
 
             real_replace = os.replace
@@ -7948,6 +8243,70 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self.assertTrue(os.path.exists(old_marker))
             self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
             self.assertFalse(os.path.exists(stale_temp))
+
+    def test_framework_npm_tar_failure_retries_clean_install(self) -> None:
+        with tempfile.TemporaryDirectory() as global_root:
+            package_dir = os.path.join(global_root, "openclaw")
+            os.makedirs(package_dir)
+            with open(os.path.join(package_dir, "old.txt"), "w", encoding="utf-8") as fh:
+                fh.write("old")
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(list(cmd))
+                if cmd[:3] == ["npm", "cache", "clean"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                install_attempt = sum(1 for prior in calls if prior[:2] == ["npm", "install"])
+                os.makedirs(package_dir, exist_ok=True)
+                if install_attempt == 1:
+                    with open(
+                        os.path.join(package_dir, "partial.txt"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fh:
+                        fh.write("partial")
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr=(
+                            "npm warn tar TAR_ENTRY_ERROR ENOENT: no such "
+                            "file or directory, lstat "
+                            "'/usr/lib/node_modules/openclaw/node_modules/"
+                            "@mistralai/mistralai/esm/models/components'"
+                        ),
+                    )
+                with open(
+                    os.path.join(package_dir, "new.txt"), "w", encoding="utf-8"
+                ) as fh:
+                    fh.write("new")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(supervisor, "_npm_global_root", return_value=global_root),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    supervisor,
+                    "_read_openclaw_framework_version",
+                    return_value="1.5.0",
+                ),
+            ):
+                transaction = supervisor._prepare_framework_install_transaction(
+                    "1.5.0"
+                )
+
+            self.assertEqual(
+                [cmd[:2] for cmd in calls].count(["npm", "install"]),
+                2,
+            )
+            self.assertIn(["npm", "cache", "clean", "--force"], calls)
+            self.assertTrue(os.path.exists(os.path.join(package_dir, "new.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "partial.txt")))
+            self.assertFalse(os.path.exists(os.path.join(package_dir, "old.txt")))
+            self.assertTrue(
+                os.path.exists(os.path.join(transaction["backup_dir"], "old.txt"))
+            )
+            supervisor._commit_framework_install_transaction(transaction)
+            self.assertFalse(os.path.exists(str(transaction["backup_dir"])))
 
     def test_framework_retry_restores_interrupted_backup(self) -> None:
         with tempfile.TemporaryDirectory() as global_root:
