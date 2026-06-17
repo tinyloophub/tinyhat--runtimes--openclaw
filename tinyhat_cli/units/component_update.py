@@ -341,9 +341,14 @@ def _committed_framework_backup_dir(backup_dir: str) -> str:
 def _commit_framework_install_transaction(transaction: dict[str, object]) -> None:
     """Discard the saved tree only after the gateway smoke has passed."""
     sup = _sup()
+
+    def mark_committed() -> None:
+        transaction["committed"] = True
+        sup._openclaw_version_cache = False
+
     backup_dir = str(transaction.get("backup_dir") or "")
     if not backup_dir:
-        transaction["committed"] = True
+        mark_committed()
         return
     try:
         if os.path.lexists(backup_dir):
@@ -353,9 +358,9 @@ def _commit_framework_install_transaction(transaction: dict[str, object]) -> Non
                 backup_dir = committed_dir
                 transaction["backup_dir"] = committed_dir
         sup._remove_filesystem_entry(backup_dir)
-        transaction["committed"] = True
+        mark_committed()
     except Exception as exc:  # noqa: BLE001 - stale backup is non-fatal
-        transaction["committed"] = True
+        mark_committed()
         transaction["commit_cleanup_failed"] = True
         log.warning(
             "component update: could not remove framework install backup %s: %s",

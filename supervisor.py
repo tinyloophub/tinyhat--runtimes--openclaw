@@ -146,6 +146,8 @@ CHATGPT_SUBSCRIPTION_PROFILE_PREFIXES = ("openai:", "openai-codex:")
 CHATGPT_SUBSCRIPTION_PROFILE_PROVIDERS = frozenset(
     {"openai", "openai-codex"}
 )
+OPENCLAW_SQLITE_AUTH_STORE_MIN_VERSION = (2026, 6, 6)
+OPENCLAW_AUTH_STORE_MIGRATION_TIMEOUT_SECONDS = 120
 CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_ENV = (
     "TINYHAT_CHATGPT_DEVICE_CODE_URL_EMIT_TIMEOUT_S"
 )
@@ -474,11 +476,17 @@ _last_watchdog_checkpoint_ts = 0.0
 # second live implementation in this file is a guard failure.
 from tinyhat_cli.adapters.openclaw import (  # noqa: E402,F401
     _OPENCLAW_VERSION_RE,
+    _current_openclaw_requires_sqlite_auth_store,
+    _current_openclaw_version_tuple,
+    _has_legacy_auth_store,
     _inspect_openclaw_plugin,
+    _legacy_auth_store_paths,
     _openclaw_cli_env,
     _openclaw_plugin_from_inspect_payload,
+    _parse_openclaw_version_tuple,
     _read_openclaw_framework_version,
     openclaw_plugin_registry_entry,
+    repair_openclaw_auth_store_for_upgrade,
 )
 from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
     CAPABILITIES_MISSING_MAX_NAMES,
@@ -504,6 +512,12 @@ from tinyhat_cli.units.capability_check import (  # noqa: E402,F401
 from tinyhat_cli.units.command_lock import (  # noqa: E402,F401
     CommandLockBusy,
     active_transaction as _active_command_lock_transaction,
+)
+from tinyhat_cli.units import command_spool  # noqa: E402
+from tinyhat_cli.units.auth_store_repair import (  # noqa: E402,F401
+    _post_auth_store_repair_result,
+    _spool_auth_store_repair_result,
+    handle_repair_openclaw_auth_store_command,
 )
 from tinyhat_cli.units.component_update import (  # noqa: E402,F401
     _cleanup_stale_openclaw_npm_temp_dirs,
@@ -1442,6 +1456,10 @@ def _run_required_platform_setup(
     raise RuntimeError(f"{label} unavailable")
 
 
+_openclaw_version_cache: tuple[int, int, int] | None | bool = False
+_auth_store_migration_attempted: set[str] = set()
+
+
 def _binding_requires_chatgpt_subscription_provider(binding: dict) -> bool:
     if str(binding.get("llm_auth_mode") or "platform_credits") != (
         "chatgpt_subscription"
@@ -1465,6 +1483,7 @@ def _try_check_codex_subscription_plugin() -> bool:
 def prepare_platform_runtime_setup(binding: dict) -> dict[str, bool]:
     """Prepare required OpenClaw platform capabilities before gateway start."""
     wait_for_openclaw_cli_available()
+    repair_openclaw_auth_store_for_upgrade()
     requires_chatgpt_subscription = _binding_requires_chatgpt_subscription_provider(
         binding
     )
@@ -3351,23 +3370,31 @@ def read_chatgpt_subscription_profile(
 ) -> dict | None:
     """Return the ChatGPT/Codex subscription profile entry, if present.
 
-    Returns the first matching profile dict from OpenClaw's current
-    SQLite auth store, or from the legacy ``auth-profiles.json`` store
-    for older images. OpenClaw 2026.6.x writes ChatGPT/Codex
-    subscription credentials under the ``openai`` provider, while older
-    runtimes used ``openai-codex``. Returns ``None`` when the store is
-    missing, malformed, or has no subscription credential.
+    Returns the first matching profile dict from OpenClaw's current SQLite auth
+    store. If an older Computer still has legacy JSON auth state, run OpenClaw's
+    own doctor migration first so the current OpenClaw runtime can use the
+    profile for generation. Only older OpenClaw builds that do not require the
+    SQLite store fall back to reading the legacy JSON directly.
 
     The OAuth token fields (``access``, ``refresh``, ``id``) ARE present
     in the returned dict — callers must NOT log them. The supervisor's
     own use of this function is metadata-only (presence check + email
     for logging); the actual OAuth refresh is OpenClaw's own concern.
     """
+    repair_openclaw_auth_store_for_upgrade(agent_id=agent_id)
     sqlite_profile = _read_chatgpt_subscription_profile_from_sqlite(
         agent_id=agent_id
     )
     if sqlite_profile is not None:
         return sqlite_profile
+
+    if _current_openclaw_requires_sqlite_auth_store():
+        if _has_legacy_auth_store(agent_id=agent_id):
+            log.warning(
+                "legacy ChatGPT subscription auth JSON remains after OpenClaw "
+                "auth-store migration; treating subscription auth as not ready"
+            )
+        return None
 
     migrated = normalize_chatgpt_subscription_profile_store(agent_id=agent_id)
     if migrated:
@@ -3639,16 +3666,6 @@ def write_openclaw_config(
         fallbacks = openrouter_model_fallbacks(model_package)
         if fallbacks:
             text_model_config["fallbacks"] = fallbacks
-    elif use_chatgpt_subscription and openrouter_enabled:
-        # Cross-provider fallback when the platform-credits OpenRouter
-        # rail is still available on the binding — covers the case
-        # where the subscription hits a per-account rate window
-        # (5h / weekly) and the agent should keep replying via the
-        # funded path instead of going dark. Tinyloop's preflight
-        # spike confirmed OpenClaw's `models.*.fallbacks` accepts
-        # cross-provider refs as a pure config field, no runtime
-        # controller required.
-        text_model_config["fallbacks"] = [openrouter_model_ref(openrouter_model)]
 
     def media_audio_model_entries() -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
@@ -3664,7 +3681,7 @@ def write_openclaw_config(
                     "model": OPENAI_AUDIO_TRANSCRIPTION_MODEL,
                 }
             )
-        if openrouter_enabled:
+        if openrouter_enabled and not use_chatgpt_subscription:
             entries.append(
                 {
                     "provider": "openrouter",
@@ -3782,9 +3799,7 @@ def write_openclaw_config(
         _sync_openai_api_key_ref(config, current_secrets)
     # Seed binding-managed env entries first so they are preserved when
     # runtime secrets are layered on top — see _apply_runtime_secret_env_block.
-    if openrouter_enabled:
-        # Keep OPENROUTER_API_KEY in env even in subscription mode so
-        # the cross-provider fallback above has a working auth path.
+    if openrouter_enabled and not use_chatgpt_subscription:
         config["env"] = {TINYHAT_OPENROUTER_API_KEY_NAME: openrouter_key}
     _apply_runtime_secret_env_block(config, current_secrets)
     _atomic_write_json(config_path, config, runtime_owned=True)
@@ -6438,6 +6453,8 @@ def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None
         handle_update_component_command(command, binding=binding)
     elif cmd_type == "apply_packages":
         handle_apply_packages_command(command, binding=binding)
+    elif cmd_type == "repair_openclaw_auth_store":
+        handle_repair_openclaw_auth_store_command(command)
     else:
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 
