@@ -7,6 +7,13 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Fixed
+
+- Migrate legacy ChatGPT/Codex OpenClaw auth stores with the official
+  `openclaw doctor --fix --non-interactive --yes` path, fail closed when
+  modern OpenClaw cannot read a subscription profile, and report the result
+  back to Tinyloop for one-Computer admin repairs.
+
 ## 0.15.1
 
 Patch release for upgraded Computers that hit corrupt OpenClaw framework

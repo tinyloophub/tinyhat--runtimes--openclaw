@@ -8618,6 +8618,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
                 transaction = supervisor._prepare_framework_install_transaction(
                     "1.5.0"
                 )
+                supervisor._openclaw_version_cache = (2026, 5, 28)
                 supervisor._commit_framework_install_transaction(transaction)
 
             self.assertTrue(os.path.isdir(old_package))
@@ -8625,6 +8626,7 @@ class UpdateComponentCommandTests(unittest.TestCase):
             self.assertFalse(os.path.exists(stale_committed))
             self.assertFalse(os.path.exists(stale_copying))
             self.assertFalse(os.path.exists(transaction["backup_dir"]))
+            self.assertIs(supervisor._openclaw_version_cache, False)
 
     def test_framework_prepare_handles_cross_device_backup_move(self) -> None:
         with tempfile.TemporaryDirectory() as global_root:
