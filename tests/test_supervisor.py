@@ -4393,6 +4393,30 @@ def _seed_legacy_auth_profile(state_dir: str) -> None:
         )
 
 
+def _seed_legacy_auth_state(state_dir: str) -> str:
+    """Drop a production-shaped pre-SQLite OpenClaw auth-state file."""
+    path = os.path.join(state_dir, "agents", "main", "agent", "auth-state.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": 1,
+                "profiles": {
+                    "openai:owner@example.com": {
+                        "type": "oauth",
+                        "provider": "openai",
+                        "access": "redacted-access",
+                        "refresh": "redacted-refresh",
+                        "expires": 9999999999999,
+                        "email": "owner@example.com",
+                    }
+                },
+            },
+            fh,
+        )
+    return path
+
+
 def _seed_other_provider_profile(state_dir: str) -> None:
     """Drop a non-subscription profile to test the wipe preserves it."""
     path = os.path.join(state_dir, "agents", "main", "agent", "auth-profiles.json")
@@ -5038,6 +5062,14 @@ class BindingCycleManualRecoveryTests(unittest.TestCase):
 class ChatgptSubscriptionBranchTests(unittest.TestCase):
     """Issue #23 — supervisor branches on auth-profile presence."""
 
+    def setUp(self) -> None:
+        supervisor._openclaw_version_cache = False
+        supervisor._auth_store_migration_attempted.clear()
+
+    def tearDown(self) -> None:
+        supervisor._openclaw_version_cache = False
+        supervisor._auth_store_migration_attempted.clear()
+
     def test_subscription_runtime_verification_reports_openai_model(self) -> None:
         posts: list[tuple[str, dict]] = []
 
@@ -5121,10 +5153,12 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertEqual(posts[0][1]["observed_model_ref"], "openrouter/deepseek/v4")
 
     def test_opted_in_with_profile_writes_subscription_config(self) -> None:
-        """auth-profile present + llm_auth_mode=chatgpt_subscription on
-        binding → openai/gpt-5.5, no provider runtime pin for OpenAI,
-        no openai SecretRef, cross-provider fallback to OpenRouter when
-        its key is present."""
+        """Current auth profile + chatgpt_subscription binding routes to OpenAI.
+
+        Modern OpenClaw reads subscription auth from the SQLite auth store. A
+        binding-managed OpenRouter key may still exist, but subscription mode
+        must not silently include it as a fallback.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
                 "TINYHAT_DEV_RUNTIME": "1",
@@ -5132,7 +5166,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
             }
             with patch.dict(os.environ, env, clear=False):
-                _seed_auth_profile(supervisor.openclaw_state_dir())
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
                 supervisor.write_openclaw_config(
                     _subscription_binding(with_openrouter=True),
                 )
@@ -5150,30 +5184,17 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertNotIn("apiKey", providers.get("openai", {}))
         self.assertNotIn("agentRuntime", providers.get("openai", {}))
         _assert_no_provider_runtime_pin(self, config, "openrouter")
-        # Cross-provider fallback to OpenRouter for rate-window relief.
-        self.assertEqual(
-            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
-        )
-        # OpenRouter env stays set so the fallback has an auth path.
-        self.assertEqual(
-            config.get("env", {}).get("OPENROUTER_API_KEY"), "sk-or-v1-child"
-        )
+        self.assertNotIn("fallbacks", defaults["model"])
+        self.assertNotIn("OPENROUTER_API_KEY", config.get("env", {}))
         self.assertEqual(
             config["tools"]["media"]["audio"],
             {
                 "enabled": True,
                 "models": [
                     {"provider": "openai", "model": "gpt-4o-transcribe"},
-                    {
-                        "provider": "openrouter",
-                        "model": "openai/whisper-large-v3-turbo",
-                    },
                 ],
             },
         )
-        # Automated coverage stops at configuring OpenAI first plus OpenRouter
-        # fallback; the HTTP 500-to-fallback recovery is OpenClaw runtime
-        # behavior and is covered by live Telegram E2E.
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertEqual(config["plugins"]["entries"]["codex"], {"enabled": True})
         self.assertEqual(
@@ -5183,13 +5204,13 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
             config["auth"],
             {
                 "profiles": {
-                    "openai:default": {
+                    "openai:owner@example.com": {
                         "provider": "openai",
                         "mode": "oauth",
                         "email": "owner@example.com",
                     },
                 },
-                "order": {"openai": ["openai:default"]},
+                "order": {"openai": ["openai:owner@example.com"]},
             },
         )
 
@@ -5202,7 +5223,14 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 "TINYHAT_RUNTIME_HOME": tmpdir,
                 "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
             }
-            with patch.dict(os.environ, env, clear=False):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    supervisor,
+                    "_current_openclaw_requires_sqlite_auth_store",
+                    return_value=False,
+                ),
+            ):
                 _seed_legacy_auth_profile(supervisor.openclaw_state_dir())
                 supervisor.write_openclaw_config(
                     _subscription_binding(with_openrouter=True),
@@ -5288,9 +5316,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
         self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
-        self.assertEqual(
-            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
-        )
+        self.assertNotIn("fallbacks", defaults["model"])
         self.assertEqual(
             config["auth"],
             {
@@ -5351,7 +5377,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
             }
             with patch.dict(os.environ, env, clear=False):
-                _seed_auth_profile(supervisor.openclaw_state_dir())
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
                 supervisor.write_openclaw_config(
                     _subscription_binding(with_openrouter=True),
                     enable_chatgpt_subscription_provider=False,
@@ -5383,7 +5409,7 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
                 "TINYHAT_SECRETS_PATH": os.path.join(tmpdir, "tinyhat-secrets.json"),
             }
             with patch.dict(os.environ, env, clear=False):
-                _seed_auth_profile(supervisor.openclaw_state_dir())
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
                 supervisor.write_openclaw_config(
                     _subscription_binding(with_openrouter=True),
                     enable_chatgpt_subscription_provider=True,
@@ -5396,12 +5422,116 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         defaults = config["agents"]["defaults"]
         self.assertEqual(defaults["model"]["primary"], "openai/gpt-5.5")
         self.assertEqual(defaults["imageModel"], {"primary": "openai/gpt-5.5"})
-        self.assertEqual(
-            defaults["model"].get("fallbacks"), ["openrouter/openai/gpt-5.5"]
-        )
+        self.assertNotIn("fallbacks", defaults["model"])
         self.assertEqual(config["plugins"]["entries"]["openai"], {"enabled": True})
         self.assertNotIn("codex", config["plugins"]["entries"])
         self.assertNotIn("codex-supervisor", config["plugins"]["entries"])
+
+    def test_legacy_profile_is_migrated_before_profile_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                state_dir = supervisor.openclaw_state_dir()
+                legacy_path = _seed_legacy_auth_state(state_dir)
+                calls: list[list[str]] = []
+
+                def fake_run(cmd, **_kwargs):
+                    calls.append(list(cmd))
+                    if list(cmd)[:2] == ["openclaw", "doctor"]:
+                        _seed_sqlite_auth_profile(state_dir)
+                        os.remove(legacy_path)
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+                    if list(cmd) == ["openclaw", "--version"]:
+                        return SimpleNamespace(
+                            returncode=0,
+                            stdout="OpenClaw 2026.6.8",
+                            stderr="",
+                        )
+                    raise AssertionError(f"unexpected command: {cmd}")
+
+                with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+                    profile = supervisor.read_chatgpt_subscription_profile()
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["__profile_id"], "openai:owner@example.com")
+        self.assertIn(
+            ["openclaw", "doctor", "--fix", "--non-interactive", "--yes"],
+            calls,
+        )
+
+    def test_modern_openclaw_does_not_trust_legacy_json_if_migration_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+
+                def fake_run(cmd, **_kwargs):
+                    if list(cmd)[:2] == ["openclaw", "doctor"]:
+                        return SimpleNamespace(
+                            returncode=1,
+                            stdout="",
+                            stderr="doctor failed",
+                        )
+                    if list(cmd) == ["openclaw", "--version"]:
+                        return SimpleNamespace(
+                            returncode=0,
+                            stdout="OpenClaw 2026.6.8",
+                            stderr="",
+                        )
+                    raise AssertionError(f"unexpected command: {cmd}")
+
+                with patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+                    self.assertIsNone(supervisor.read_chatgpt_subscription_profile())
+
+    def test_repair_auth_store_command_posts_and_spools_result(self) -> None:
+        posts: list[tuple[str, dict]] = []
+        spooled: list[dict] = []
+        with (
+            patch.object(supervisor, "_has_legacy_auth_store", return_value=True),
+            patch.object(
+                supervisor,
+                "repair_openclaw_auth_store_for_upgrade",
+                return_value=True,
+            ) as repair,
+            patch.object(
+                supervisor,
+                "read_chatgpt_subscription_profile",
+                return_value={"__profile_id": "openai:owner@example.com"},
+            ),
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=lambda path, body: posts.append((path, body)) or {},
+            ),
+            patch.object(
+                supervisor.command_spool,
+                "append_result",
+                side_effect=lambda record: spooled.append(dict(record)) or "/tmp/x",
+            ),
+        ):
+            supervisor.handle_repair_openclaw_auth_store_command(
+                {"type": "repair_openclaw_auth_store", "revision": 3}
+            )
+
+        repair.assert_called_once_with(force=True)
+        self.assertEqual(
+            posts[0][0],
+            "/hapi/v1/computers/me/auth-store-repair/apply-result",
+        )
+        self.assertEqual(posts[0][1]["revision"], 3)
+        self.assertEqual(posts[0][1]["status"], "applied")
+        self.assertTrue(posts[0][1]["migrated"])
+        self.assertTrue(posts[0][1]["profile_present"])
+        self.assertEqual(spooled[0]["name"], "openclaw auth-store repair")
+        self.assertEqual(spooled[0]["outcome"], "succeeded")
 
     def test_platform_credit_route_configures_openrouter_audio_stt(self) -> None:
         """Fresh Computers should use provider STT instead of local CLI audio.
@@ -5728,7 +5858,7 @@ class StaleProfileCarryoverGuardTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env, clear=False):
                 # Phase 1: previous owner had a linked subscription.
-                _seed_auth_profile(supervisor.openclaw_state_dir())
+                _seed_sqlite_auth_profile(supervisor.openclaw_state_dir())
                 self.assertIsNotNone(
                     supervisor.read_chatgpt_subscription_profile()
                 )
