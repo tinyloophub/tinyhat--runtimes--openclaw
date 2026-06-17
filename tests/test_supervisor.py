@@ -2211,6 +2211,11 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                     "_runtime_state_recent_log_excerpts",
                     return_value={"bootstrap": [], "supervisor": [], "gateway": []},
                 ),
+                patch.object(
+                    supervisor,
+                    "_post_runtime_state_to_platform",
+                    return_value=False,
+                ),
                 patch.object(supervisor, "_plugin_load_check", return_value={}),
                 patch.object(
                     supervisor,
