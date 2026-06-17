@@ -7,12 +7,20 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.2
+
+Patch release for migrating legacy ChatGPT/Codex subscription auth stores during
+Computer upgrades and one-Computer admin repair.
+
 ### Fixed
 
 - Migrate legacy ChatGPT/Codex OpenClaw auth stores with the official
   `openclaw doctor --fix --non-interactive --yes` path, fail closed when
   modern OpenClaw cannot read a subscription profile, and report the result
   back to Tinyloop for one-Computer admin repairs.
+- Refresh the OpenClaw auth version probe after framework updates so upgraded
+  Computers decide whether doctor migration is needed from the current
+  framework install instead of stale pre-update data.
 
 ## 0.15.1
 
