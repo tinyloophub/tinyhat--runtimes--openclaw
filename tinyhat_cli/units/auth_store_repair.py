@@ -14,7 +14,7 @@ from tinyhat_cli._facade import supervisor_module as _sup
 
 log = logging.getLogger("tinyhat-supervisor")
 
-UNIT_CATEGORY = "auth-store-repair"
+UNIT_CATEGORY = "release-update-lifecycle"
 
 
 def _post_auth_store_repair_result(
