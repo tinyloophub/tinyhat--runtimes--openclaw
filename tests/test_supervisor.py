@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -2438,12 +2439,19 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
                 "reason": "gateway-cgroup-unavailable",
             }
             clock = {"now": 100}
+            main_thread = threading.current_thread()
+            recovery_sleeps: list[float] = []
+            real_sleep = supervisor.time.sleep
 
             def _time() -> float:
                 return float(clock["now"])
 
             def _sleep(seconds: float) -> None:
-                clock["now"] += seconds
+                if threading.current_thread() is main_thread:
+                    recovery_sleeps.append(seconds)
+                    clock["now"] += seconds
+                    return
+                real_sleep(min(max(float(seconds), 0.0), 0.01))
 
             with (
                 patch.dict(
@@ -2526,7 +2534,7 @@ class SupervisorWatchdogContractTests(unittest.TestCase):
             // supervisor.GATEWAY_RECOVERY_MEMORY_SAMPLE_INTERVAL_SECONDS
         )
         self.assertEqual(
-            sleep.call_count,
+            len(recovery_sleeps),
             expected_sampling_sleeps + expected_hold_down_sleeps,
         )
         self.assertEqual(state["state"], "unrecoverable_manual")
