@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 
@@ -25,6 +26,8 @@ from tinyhat_cli._facade import supervisor_module as _sup
 log = logging.getLogger("tinyhat-supervisor")
 
 _OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
+OPENCLAW_SQLITE_AUTH_STORE_MIN_VERSION = (2026, 6, 6)
+OPENCLAW_AUTH_STORE_MIGRATION_TIMEOUT_SECONDS = 120
 
 
 def _openclaw_cli_env() -> dict[str, str]:
@@ -66,6 +69,138 @@ def _read_openclaw_framework_version() -> str:
     if match:
         return match.group(1)
     return output.splitlines()[0].strip() if output else ""
+
+
+def _parse_openclaw_version_tuple(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"\bOpenClaw\s+(\d{4})\.(\d{1,2})\.(\d{1,2})\b", text or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _current_openclaw_version_tuple() -> tuple[int, int, int] | None:
+    sup = _sup()
+    if sup._openclaw_version_cache is not False:
+        return sup._openclaw_version_cache
+    try:
+        result = subprocess.run(
+            ["openclaw", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=sup.OPENCLAW_CLI_VERSION_TIMEOUT_SECONDS,
+            env=sup._openclaw_cli_env(),
+        )
+    except Exception as exc:  # noqa: BLE001 - version only gates compatibility
+        log.warning("OpenClaw version check for auth migration failed: %s", exc)
+        sup._openclaw_version_cache = None
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        log.warning(
+            "OpenClaw version check for auth migration exited %s: %s",
+            result.returncode,
+            sup._sanitize_runtime_state_text(detail, limit=255),
+        )
+        sup._openclaw_version_cache = None
+        return None
+    parsed = sup._parse_openclaw_version_tuple(result.stdout or result.stderr or "")
+    sup._openclaw_version_cache = parsed
+    return parsed
+
+
+def _current_openclaw_requires_sqlite_auth_store() -> bool:
+    sup = _sup()
+    version = sup._current_openclaw_version_tuple()
+    return bool(version and version >= sup.OPENCLAW_SQLITE_AUTH_STORE_MIN_VERSION)
+
+
+def _legacy_auth_store_paths(
+    *, agent_id: str | None = None
+) -> list[str]:
+    sup = _sup()
+    resolved_agent_id = agent_id or sup.DEFAULT_OPENCLAW_AGENT_ID
+    state_dir = sup.openclaw_state_dir()
+    candidates = [
+        sup.openclaw_auth_profiles_path(agent_id=resolved_agent_id),
+        os.path.join(
+            sup.openclaw_agent_state_dir(agent_id=resolved_agent_id),
+            "auth-state.json",
+        ),
+        os.path.join(state_dir, "auth-profiles.json"),
+    ]
+    out: list[str] = []
+    for path in candidates:
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def _has_legacy_auth_store(
+    *, agent_id: str | None = None
+) -> bool:
+    sup = _sup()
+    resolved_agent_id = agent_id or sup.DEFAULT_OPENCLAW_AGENT_ID
+    return any(
+        os.path.exists(path)
+        for path in sup._legacy_auth_store_paths(agent_id=resolved_agent_id)
+    )
+
+
+def repair_openclaw_auth_store_for_upgrade(
+    *,
+    agent_id: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Let OpenClaw migrate legacy auth JSON into its canonical store."""
+    sup = _sup()
+    resolved_agent_id = agent_id or sup.DEFAULT_OPENCLAW_AGENT_ID
+    if not force:
+        if not sup._has_legacy_auth_store(agent_id=resolved_agent_id):
+            return False
+        if not sup._current_openclaw_requires_sqlite_auth_store():
+            return False
+    key = sup.openclaw_agent_state_dir(agent_id=resolved_agent_id)
+    if not force and key in sup._auth_store_migration_attempted:
+        return False
+    if not force:
+        sup._auth_store_migration_attempted.add(key)
+
+    log.info(
+        "running OpenClaw auth-store migration doctor for agent %s",
+        resolved_agent_id,
+    )
+    try:
+        result = subprocess.run(
+            [
+                "openclaw",
+                "doctor",
+                "--fix",
+                "--non-interactive",
+                "--yes",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=sup.OPENCLAW_AUTH_STORE_MIGRATION_TIMEOUT_SECONDS,
+            env=sup._openclaw_cli_env(),
+            **sup._runtime_user_subprocess_kwargs(),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed below
+        log.warning(
+            "OpenClaw auth-store migration doctor failed to run: %s",
+            sup._sanitize_runtime_state_text(str(exc), limit=255),
+        )
+        return False
+    sup._prepare_openclaw_agent_auth_store_ownership(agent_id=resolved_agent_id)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        log.warning(
+            "OpenClaw auth-store migration doctor exited %s: %s",
+            result.returncode,
+            sup._sanitize_runtime_state_text(detail, limit=255),
+        )
+        return False
+    log.info("OpenClaw auth-store migration doctor completed")
+    return True
 
 
 def _openclaw_plugin_from_inspect_payload(plugin_id: str, payload) -> dict | None:
