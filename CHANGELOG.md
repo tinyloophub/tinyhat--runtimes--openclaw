@@ -7,6 +7,13 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Fixed
+
+- Re-enter the OpenClaw binding cycle after a successful ChatGPT/Codex auth
+  store repair even if the best-effort platform result POST fails, so repaired
+  subscription auth can become active instead of leaving the gateway on fallback
+  auth until command redelivery.
+
 ## 0.15.2
 
 Patch release for migrating legacy ChatGPT/Codex subscription auth stores during

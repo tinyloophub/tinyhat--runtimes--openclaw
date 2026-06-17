@@ -5624,6 +5624,56 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         self.assertTrue(rebind_requested)
         self.assertEqual(checkpoints, ["phase-d-auth-store-repair-rebind"])
 
+    def test_repair_auth_store_command_rebinds_after_result_post_failure(self) -> None:
+        spooled: list[dict] = []
+        checkpoints: list[str] = []
+        stop_holder_before = dict(supervisor._stop_holder)
+        supervisor._stop_holder["stop"] = False
+        supervisor._stop_holder["rebind"] = False
+        with (
+            patch.object(supervisor, "_has_legacy_auth_store", return_value=True),
+            patch.object(
+                supervisor,
+                "repair_openclaw_auth_store_for_upgrade",
+                return_value=True,
+            ),
+            patch.object(
+                supervisor,
+                "read_chatgpt_subscription_profile",
+                return_value={"__profile_id": "openai:owner@example.com"},
+            ),
+            patch.object(
+                supervisor,
+                "post_json",
+                side_effect=RuntimeError("platform unavailable"),
+            ),
+            patch.object(
+                supervisor.command_spool,
+                "append_result",
+                side_effect=lambda record: spooled.append(dict(record)) or "/tmp/x",
+            ),
+            patch.object(
+                supervisor,
+                "notify_watchdog_checkpoint",
+                side_effect=lambda name: checkpoints.append(name),
+            ),
+        ):
+            try:
+                supervisor.handle_repair_openclaw_auth_store_command(
+                    {"type": "repair_openclaw_auth_store", "revision": 4}
+                )
+            finally:
+                stop_requested = bool(supervisor._stop_holder["stop"])
+                rebind_requested = bool(supervisor._stop_holder["rebind"])
+                supervisor._stop_holder.clear()
+                supervisor._stop_holder.update(stop_holder_before)
+
+        self.assertEqual(spooled[0]["idempotency_key"], "auth-store-repair:4")
+        self.assertEqual(spooled[0]["outcome"], "succeeded")
+        self.assertTrue(stop_requested)
+        self.assertTrue(rebind_requested)
+        self.assertEqual(checkpoints, ["phase-d-auth-store-repair-rebind"])
+
     def test_platform_credit_route_configures_openrouter_audio_stt(self) -> None:
         """Fresh Computers should use provider STT instead of local CLI audio.
 

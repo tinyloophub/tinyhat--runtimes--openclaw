@@ -136,6 +136,5 @@ def handle_repair_openclaw_auth_store_command(command: dict) -> None:
             revision,
             exc,
         )
-    else:
-        if status == "applied" and profile_present:
-            _request_binding_reapply_after_repair()
+    if status == "applied" and profile_present:
+        _request_binding_reapply_after_repair()
