@@ -25,9 +25,7 @@ from tinyhat_cli._facade import supervisor_module as _sup
 
 log = logging.getLogger("tinyhat-supervisor")
 
-_OPENCLAW_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
-OPENCLAW_SQLITE_AUTH_STORE_MIN_VERSION = (2026, 6, 6)
-OPENCLAW_AUTH_STORE_MIGRATION_TIMEOUT_SECONDS = 120
+_OPENCLAW_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)")
 
 
 def _openclaw_cli_env() -> dict[str, str]:
@@ -72,38 +70,31 @@ def _read_openclaw_framework_version() -> str:
 
 
 def _parse_openclaw_version_tuple(text: str) -> tuple[int, int, int] | None:
-    match = re.search(r"\bOpenClaw\s+(\d{4})\.(\d{1,2})\.(\d{1,2})\b", text or "")
+    match = _OPENCLAW_VERSION_RE.search(text or "")
     if not match:
         return None
-    return tuple(int(part) for part in match.groups())
+    core = re.split(r"[-+]", match.group(1), maxsplit=1)[0]
+    try:
+        return tuple(int(part) for part in core.split(".")[:3])
+    except (TypeError, ValueError):
+        return None
 
 
 def _current_openclaw_version_tuple() -> tuple[int, int, int] | None:
     sup = _sup()
     if sup._openclaw_version_cache is not False:
         return sup._openclaw_version_cache
-    try:
-        result = subprocess.run(
-            ["openclaw", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=sup.OPENCLAW_CLI_VERSION_TIMEOUT_SECONDS,
-            env=sup._openclaw_cli_env(),
-        )
-    except Exception as exc:  # noqa: BLE001 - version only gates compatibility
-        log.warning("OpenClaw version check for auth migration failed: %s", exc)
-        sup._openclaw_version_cache = None
+    version_text = sup._read_openclaw_framework_version()
+    if not version_text:
+        log.warning("OpenClaw version check for auth migration returned no version")
         return None
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+    parsed = sup._parse_openclaw_version_tuple(version_text)
+    if parsed is None:
         log.warning(
-            "OpenClaw version check for auth migration exited %s: %s",
-            result.returncode,
-            sup._sanitize_runtime_state_text(detail, limit=255),
+            "OpenClaw version check for auth migration could not parse: %s",
+            sup._sanitize_runtime_state_text(version_text, limit=255),
         )
-        sup._openclaw_version_cache = None
         return None
-    parsed = sup._parse_openclaw_version_tuple(result.stdout or result.stderr or "")
     sup._openclaw_version_cache = parsed
     return parsed
 
@@ -117,6 +108,10 @@ def _current_openclaw_requires_sqlite_auth_store() -> bool:
 def _legacy_auth_store_paths(
     *, agent_id: str | None = None
 ) -> list[str]:
+    # Boundary exception: these are legacy OpenClaw internal paths used only to
+    # detect whether the official `openclaw doctor --fix` migration should run.
+    # Tinyhat never edits these JSON stores directly; the internal-state audit
+    # should delete this list once OpenClaw exposes a stable migration signal.
     sup = _sup()
     resolved_agent_id = agent_id or sup.DEFAULT_OPENCLAW_AGENT_ID
     state_dir = sup.openclaw_state_dir()
@@ -162,8 +157,7 @@ def repair_openclaw_auth_store_for_upgrade(
     key = sup.openclaw_agent_state_dir(agent_id=resolved_agent_id)
     if not force and key in sup._auth_store_migration_attempted:
         return False
-    if not force:
-        sup._auth_store_migration_attempted.add(key)
+    sup._auth_store_migration_attempted.add(key)
 
     log.info(
         "running OpenClaw auth-store migration doctor for agent %s",

@@ -5070,6 +5070,79 @@ class ChatgptSubscriptionBranchTests(unittest.TestCase):
         supervisor._openclaw_version_cache = False
         supervisor._auth_store_migration_attempted.clear()
 
+    def test_openclaw_version_parser_accepts_cli_format_variants(self) -> None:
+        variants = {
+            "OpenClaw 2026.6.8": (2026, 6, 8),
+            "2026.6.8": (2026, 6, 8),
+            "openclaw/2026.6.8": (2026, 6, 8),
+            "v2026.7.0": (2026, 7, 0),
+            "OpenClaw 2026.6.8-beta.1": (2026, 6, 8),
+        }
+        for text, expected in variants.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    supervisor._parse_openclaw_version_tuple(text),
+                    expected,
+                )
+
+    def test_openclaw_version_negative_lookup_is_not_cached(self) -> None:
+        reads = iter(["", "2026.6.8"])
+
+        def fake_read_version() -> str:
+            return next(reads)
+
+        with patch.object(
+            supervisor,
+            "_read_openclaw_framework_version",
+            side_effect=fake_read_version,
+        ):
+            self.assertIsNone(supervisor._current_openclaw_version_tuple())
+            self.assertIs(supervisor._openclaw_version_cache, False)
+            self.assertEqual(
+                supervisor._current_openclaw_version_tuple(),
+                (2026, 6, 8),
+            )
+            self.assertEqual(supervisor._openclaw_version_cache, (2026, 6, 8))
+
+    def test_force_auth_store_repair_marks_attempted_for_profile_read(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+            }
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(supervisor.subprocess, "run", side_effect=fake_run),
+            ):
+                key = supervisor.openclaw_agent_state_dir()
+                self.assertTrue(
+                    supervisor.repair_openclaw_auth_store_for_upgrade(force=True)
+                )
+                self.assertIn(key, supervisor._auth_store_migration_attempted)
+
+                with (
+                    patch.object(
+                        supervisor, "_has_legacy_auth_store", return_value=True
+                    ),
+                    patch.object(
+                        supervisor,
+                        "_current_openclaw_requires_sqlite_auth_store",
+                        return_value=True,
+                    ),
+                ):
+                    self.assertFalse(supervisor.repair_openclaw_auth_store_for_upgrade())
+
+        self.assertEqual(
+            calls,
+            [["openclaw", "doctor", "--fix", "--non-interactive", "--yes"]],
+        )
+
     def test_subscription_runtime_verification_reports_openai_model(self) -> None:
         posts: list[tuple[str, dict]] = []
 
