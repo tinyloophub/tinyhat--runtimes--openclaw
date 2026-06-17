@@ -6972,6 +6972,12 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
         helper_script = _bootstrap_function_definitions(
             "remove_path_if_present",
             "copy_path_if_present",
+            "hard_reset_safe_token",
+            "hard_reset_user_state_marker_path",
+            "hard_reset_backup_contains_expected_user_state",
+            "hard_reset_count_preserved_expected_user_state",
+            "hard_reset_remove_disposable_install_paths",
+            "hard_reset_prune_old_backups",
             "hard_reset_openclaw_user_state_layout",
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6982,6 +6988,7 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             os.makedirs(os.path.join(state_dir, "platform-plugins", "tinyhat"))
             os.makedirs(os.path.join(state_dir, "extensions", "codex"))
             os.makedirs(os.path.join(state_dir, "workspace"))
+            os.makedirs(os.path.join(state_dir, "custom-user-data"))
             os.makedirs(config_dir)
             os.makedirs(bin_dir)
             with open(
@@ -7009,6 +7016,18 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             ) as fh:
                 fh.write('{"profiles":[]}')
             with open(
+                os.path.join(state_dir, "openclaw-agent.sqlite"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("sqlite")
+            with open(
+                os.path.join(state_dir, "custom-user-data", "notes.txt"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("unknown user data")
+            with open(
                 os.path.join(config_dir, "tinyhat-secrets.json"),
                 "w",
                 encoding="utf-8",
@@ -7034,9 +7053,12 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
                     "\n".join(
                         [
                             f"OPENCLAW_STATE_DIR={shlex.quote(state_dir)}",
+                            f"OPENCLAW_CONFIG_PATH={shlex.quote(os.path.join(config_dir, 'openclaw.json'))}",
                             f"OPENCLAW_CONFIG_DIR={shlex.quote(config_dir)}",
                             f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
                             "HARD_RESET_USER_STATE_MIGRATION=1",
+                            "HARD_RESET_USER_STATE_MIGRATION_TOKEN=default",
+                            "HARD_RESET_BACKUP_RETENTION=3",
                             'SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"',
                             'GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"',
                             helper_script,
@@ -7061,8 +7083,20 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             )
             self.assertTrue(
                 os.path.exists(
+                    os.path.join(state_dir, "custom-user-data", "notes.txt")
+                )
+            )
+            self.assertTrue(
+                os.path.exists(
                     os.path.join(
                         state_dir, "agents", "main", "agent", "auth-profiles.json"
+                    )
+                )
+            )
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        state_dir, "agents", "main", "agent", "openclaw-agent.sqlite"
                     )
                 )
             )
@@ -7073,7 +7107,26 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             self.assertTrue(
                 os.path.exists(os.path.join(state_dir, "hard-reset-restore.env"))
             )
-            backup_entries = os.listdir(backup_root)
+            with open(
+                os.path.join(state_dir, "hard-reset-restore.env"),
+                encoding="utf-8",
+            ) as fh:
+                restore_env = fh.read()
+            self.assertIn("layout_warning=", restore_env)
+            self.assertIn("migrated_count=2", restore_env)
+            self.assertIn("restored_count=", restore_env)
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        backup_root, ".hard-reset-user-state-migration-default.done"
+                    )
+                )
+            )
+            backup_entries = [
+                entry
+                for entry in os.listdir(backup_root)
+                if entry.startswith("hard-reset-")
+            ]
             self.assertEqual(len(backup_entries), 1)
             backup = os.path.join(backup_root, backup_entries[0])
             self.assertTrue(
@@ -7086,6 +7139,272 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
                     "stop tinyhat-openclaw.service tinyhat-openclaw-gateway.service",
                     fh.read(),
                 )
+
+    def test_bootstrap_hard_reset_skips_after_one_shot_marker(self) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "copy_path_if_present",
+            "hard_reset_safe_token",
+            "hard_reset_user_state_marker_path",
+            "hard_reset_backup_contains_expected_user_state",
+            "hard_reset_count_preserved_expected_user_state",
+            "hard_reset_remove_disposable_install_paths",
+            "hard_reset_prune_old_backups",
+            "hard_reset_openclaw_user_state_layout",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            config_dir = os.path.join(tmpdir, "config")
+            backup_root = os.path.join(tmpdir, "backups")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(os.path.join(state_dir, "platform-plugins", "tinyhat"))
+            os.makedirs(os.path.join(state_dir, "workspace"))
+            os.makedirs(config_dir)
+            os.makedirs(bin_dir)
+            with open(
+                os.path.join(state_dir, "workspace", "memory.md"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("user memory")
+            fake_systemctl = os.path.join(bin_dir, "systemctl")
+            with open(fake_systemctl, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_systemctl, 0o755)
+
+            script = "\n".join(
+                [
+                    f"OPENCLAW_STATE_DIR={shlex.quote(state_dir)}",
+                    f"OPENCLAW_CONFIG_PATH={shlex.quote(os.path.join(config_dir, 'openclaw.json'))}",
+                    f"OPENCLAW_CONFIG_DIR={shlex.quote(config_dir)}",
+                    f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
+                    "HARD_RESET_USER_STATE_MIGRATION=1",
+                    "HARD_RESET_USER_STATE_MIGRATION_TOKEN=default",
+                    "HARD_RESET_BACKUP_RETENTION=3",
+                    'SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"',
+                    'GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"',
+                    helper_script,
+                    "hard_reset_openclaw_user_state_layout",
+                    "mkdir -p \"$OPENCLAW_STATE_DIR/platform-plugins/tinyhat\"",
+                    "printf second > \"$OPENCLAW_STATE_DIR/platform-plugins/tinyhat/install.txt\"",
+                    "hard_reset_openclaw_user_state_layout",
+                ]
+            )
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(state_dir, "platform-plugins", "tinyhat", "install.txt")
+                )
+            )
+            backup_entries = [
+                entry
+                for entry in os.listdir(backup_root)
+                if entry.startswith("hard-reset-")
+            ]
+            self.assertEqual(len(backup_entries), 1)
+            self.assertIn("already completed", result.stdout)
+
+    def test_bootstrap_hard_reset_warns_when_expected_user_state_absent(self) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "copy_path_if_present",
+            "hard_reset_safe_token",
+            "hard_reset_user_state_marker_path",
+            "hard_reset_backup_contains_expected_user_state",
+            "hard_reset_count_preserved_expected_user_state",
+            "hard_reset_remove_disposable_install_paths",
+            "hard_reset_prune_old_backups",
+            "hard_reset_openclaw_user_state_layout",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            config_dir = os.path.join(tmpdir, "config")
+            backup_root = os.path.join(tmpdir, "backups")
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(os.path.join(state_dir, "platform-plugins", "tinyhat"))
+            os.makedirs(config_dir)
+            os.makedirs(bin_dir)
+            fake_systemctl = os.path.join(bin_dir, "systemctl")
+            with open(fake_systemctl, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_systemctl, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join(
+                        [
+                            f"OPENCLAW_STATE_DIR={shlex.quote(state_dir)}",
+                            f"OPENCLAW_CONFIG_PATH={shlex.quote(os.path.join(config_dir, 'openclaw.json'))}",
+                            f"OPENCLAW_CONFIG_DIR={shlex.quote(config_dir)}",
+                            f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
+                            "HARD_RESET_USER_STATE_MIGRATION=1",
+                            "HARD_RESET_USER_STATE_MIGRATION_TOKEN=warning-case",
+                            "HARD_RESET_BACKUP_RETENTION=3",
+                            'SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"',
+                            'GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"',
+                            helper_script,
+                            "hard_reset_openclaw_user_state_layout",
+                        ]
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("WARNING: hard reset backup did not contain", result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(state_dir, "platform-plugins")))
+            with open(
+                os.path.join(state_dir, "hard-reset-restore.env"),
+                encoding="utf-8",
+            ) as fh:
+                restore_env = fh.read()
+            self.assertIn(
+                "layout_warning=no_expected_openclaw_user_state_paths_found",
+                restore_env,
+            )
+            self.assertIn("migrated_count=0", restore_env)
+
+    def test_bootstrap_hard_reset_keeps_existing_default_agent_auth(self) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "copy_path_if_present",
+            "hard_reset_safe_token",
+            "hard_reset_user_state_marker_path",
+            "hard_reset_backup_contains_expected_user_state",
+            "hard_reset_count_preserved_expected_user_state",
+            "hard_reset_remove_disposable_install_paths",
+            "hard_reset_prune_old_backups",
+            "hard_reset_openclaw_user_state_layout",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            config_dir = os.path.join(tmpdir, "config")
+            backup_root = os.path.join(tmpdir, "backups")
+            bin_dir = os.path.join(tmpdir, "bin")
+            agent_dir = os.path.join(state_dir, "agents", "main", "agent")
+            os.makedirs(agent_dir)
+            os.makedirs(config_dir)
+            os.makedirs(bin_dir)
+            with open(
+                os.path.join(state_dir, "auth-profiles.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("legacy")
+            with open(
+                os.path.join(agent_dir, "auth-profiles.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                fh.write("canonical")
+            fake_systemctl = os.path.join(bin_dir, "systemctl")
+            with open(fake_systemctl, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_systemctl, 0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join(
+                        [
+                            f"OPENCLAW_STATE_DIR={shlex.quote(state_dir)}",
+                            f"OPENCLAW_CONFIG_PATH={shlex.quote(os.path.join(config_dir, 'openclaw.json'))}",
+                            f"OPENCLAW_CONFIG_DIR={shlex.quote(config_dir)}",
+                            f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
+                            "HARD_RESET_USER_STATE_MIGRATION=1",
+                            "HARD_RESET_USER_STATE_MIGRATION_TOKEN=canonical-case",
+                            "HARD_RESET_BACKUP_RETENTION=3",
+                            'SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"',
+                            'GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"',
+                            helper_script,
+                            "hard_reset_openclaw_user_state_layout",
+                        ]
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                },
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(
+                os.path.join(agent_dir, "auth-profiles.json"),
+                encoding="utf-8",
+            ) as fh:
+                self.assertEqual(fh.read(), "canonical")
+
+    def test_bootstrap_hard_reset_prunes_old_backups(self) -> None:
+        helper_script = _bootstrap_function_definitions(
+            "remove_path_if_present",
+            "hard_reset_prune_old_backups",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backup_root = os.path.join(tmpdir, "backups")
+            os.makedirs(backup_root)
+            for name in (
+                "hard-reset-20260617T000000Z-1",
+                "hard-reset-20260617T000001Z-1",
+                "hard-reset-20260617T000002Z-1",
+                "hard-reset-20260617T000003Z-1",
+            ):
+                os.makedirs(os.path.join(backup_root, name))
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join(
+                        [
+                            f"OPENCLAW_USER_STATE_BACKUP_ROOT={shlex.quote(backup_root)}",
+                            "HARD_RESET_BACKUP_RETENTION=2",
+                            helper_script,
+                            "hard_reset_prune_old_backups",
+                        ]
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            remaining = sorted(os.listdir(backup_root))
+            self.assertEqual(
+                remaining,
+                [
+                    "hard-reset-20260617T000002Z-1",
+                    "hard-reset-20260617T000003Z-1",
+                ],
+            )
 
     def test_bootstrap_framework_install_restores_backup_on_npm_failure(
         self,
