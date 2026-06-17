@@ -19,6 +19,11 @@
 #   TINYHAT_PLATFORM_PLUGIN_REPO_URL — public Tinyhat OpenClaw plugin repo
 #   TINYHAT_PLATFORM_PLUGIN_REPO_REF — public Tinyhat plugin ref/SHA to install
 #   TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH — public cache hit/miss status file
+#   TINYHAT_HARD_RESET_USER_STATE_MIGRATION — when 1, back up old OpenClaw
+#       state/config, clean install-layout paths, and migrate old user data
+#   TINYHAT_HARD_RESET_USER_STATE_MIGRATION_TOKEN — optional one-shot token;
+#       change this value to intentionally run another hard-reset migration
+#   TINYHAT_HARD_RESET_BACKUP_RETENTION — number of hard-reset backups to keep
 #
 # Optional private-access material is passed by the platform startup
 # script through env and consumed here:
@@ -45,6 +50,7 @@ RUNTIME_ENV_FILE="/etc/tinyhat/runtime.env"
 OPENCLAW_CONFIG_PATH="/etc/openclaw/openclaw.json"
 OPENCLAW_CONFIG_DIR="$(dirname "${OPENCLAW_CONFIG_PATH}")"
 OPENCLAW_STATE_DIR="/var/lib/tinyhat-openclaw"
+OPENCLAW_USER_STATE_BACKUP_ROOT="/var/lib/tinyhat-openclaw-backups"
 RUNTIME_BOOTSTRAP_STATUS_PATH="${OPENCLAW_STATE_DIR}/bootstrap-status.json"
 OPENCLAW_GATEWAY_PORT="18789"
 OPENCLAW_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-}"
@@ -52,6 +58,9 @@ CODEX_SUBSCRIPTION_PLUGIN_PACKAGE="@openclaw/codex"
 PRIVATE_ACCESS_PROVIDER="${TINYHAT_PRIVATE_ACCESS_PROVIDER:-disabled}"
 TINYHAT_RUNTIME_USER="${TINYHAT_OPENCLAW_RUNTIME_USER:-tinyhat}"
 TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"
+HARD_RESET_USER_STATE_MIGRATION="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION:-0}"
+HARD_RESET_USER_STATE_MIGRATION_TOKEN="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION_TOKEN:-default}"
+HARD_RESET_BACKUP_RETENTION="${TINYHAT_HARD_RESET_BACKUP_RETENTION:-3}"
 
 echo "[tinyhat-runtime] bootstrap starting from ${RUNTIME_DIR}"
 
@@ -101,6 +110,215 @@ remove_path_if_present() {
   fi
 }
 
+copy_path_if_present() {
+  local source_path="$1"
+  local target_path="$2"
+  if [[ -e "${source_path}" || -L "${source_path}" ]]; then
+    if ! mkdir -p "$(dirname "${target_path}")"; then
+      echo "[tinyhat-runtime] ERROR: failed to create restore target parent for ${target_path}" >&2
+      exit 1
+    fi
+    if ! cp -a -- "${source_path}" "${target_path}"; then
+      echo "[tinyhat-runtime] ERROR: failed to restore ${source_path} to ${target_path}" >&2
+      exit 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
+hard_reset_safe_token() {
+  printf '%s' "${HARD_RESET_USER_STATE_MIGRATION_TOKEN}" \
+    | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+hard_reset_user_state_marker_path() {
+  printf '%s/.hard-reset-user-state-migration-%s.done\n' \
+    "${OPENCLAW_USER_STATE_BACKUP_ROOT}" \
+    "$(hard_reset_safe_token)"
+}
+
+hard_reset_backup_contains_expected_user_state() {
+  local state_backup="$1"
+  local config_backup="$2"
+  local relative_path
+  for relative_path in \
+    agents \
+    workspace \
+    memory \
+    memories \
+    credentials \
+    auth \
+    auth-store \
+    sessions \
+    stores \
+    data \
+    auth-profiles.json \
+    openclaw-agent.sqlite; do
+    if [[ -e "${state_backup}/${relative_path}" || -L "${state_backup}/${relative_path}" ]]; then
+      return 0
+    fi
+  done
+  if [[ -e "${config_backup}/tinyhat-secrets.json" || -L "${config_backup}/tinyhat-secrets.json" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+hard_reset_count_preserved_expected_user_state() {
+  local count=0
+  local relative_path
+  for relative_path in \
+    agents \
+    workspace \
+    memory \
+    memories \
+    credentials \
+    auth \
+    auth-store \
+    sessions \
+    stores \
+    data \
+    auth-profiles.json \
+    openclaw-agent.sqlite; do
+    if [[ -e "${OPENCLAW_STATE_DIR}/${relative_path}" || -L "${OPENCLAW_STATE_DIR}/${relative_path}" ]]; then
+      count=$((count + 1))
+    fi
+  done
+  if [[ -e "${OPENCLAW_CONFIG_DIR}/tinyhat-secrets.json" || -L "${OPENCLAW_CONFIG_DIR}/tinyhat-secrets.json" ]]; then
+    count=$((count + 1))
+  fi
+  printf '%s\n' "${count}"
+}
+
+hard_reset_remove_disposable_install_paths() {
+  # Keep unknown OpenClaw user data in place. Only the runtime-owned install and
+  # generated paths are cleaned so old broken package layouts cannot survive.
+  remove_path_if_present "${OPENCLAW_STATE_DIR}/platform-plugins"
+  remove_path_if_present "${OPENCLAW_STATE_DIR}/extensions"
+  remove_path_if_present "${OPENCLAW_STATE_DIR}/bootstrap-status.json"
+  remove_path_if_present "${OPENCLAW_STATE_DIR}/hard-reset-restore.env"
+  remove_path_if_present "${OPENCLAW_CONFIG_PATH}"
+}
+
+hard_reset_prune_old_backups() {
+  local retention="${HARD_RESET_BACKUP_RETENTION}"
+  local backup
+  local backups=()
+  if ! [[ "${retention}" =~ ^[0-9]+$ ]]; then
+    retention=3
+  fi
+  if [[ "${retention}" -lt 1 ]]; then
+    retention=1
+  fi
+  shopt -s nullglob
+  backups=("${OPENCLAW_USER_STATE_BACKUP_ROOT}"/hard-reset-*)
+  shopt -u nullglob
+  if [[ "${#backups[@]}" -le "${retention}" ]]; then
+    return 0
+  fi
+  for backup in "${backups[@]:0:$((${#backups[@]} - retention))}"; do
+    echo "[tinyhat-runtime] pruning old hard-reset backup: ${backup}"
+    remove_path_if_present "${backup}"
+  done
+}
+
+hard_reset_openclaw_user_state_layout() {
+  if [[ "${HARD_RESET_USER_STATE_MIGRATION}" != "1" ]]; then
+    return 0
+  fi
+
+  local reset_id
+  local backup_root
+  local state_backup
+  local config_backup
+  local migration_marker
+  local layout_warning=""
+  local migrated_count=0
+  local preserved_count=0
+  local restored_count=0
+
+  mkdir -p "${OPENCLAW_USER_STATE_BACKUP_ROOT}"
+  migration_marker="$(hard_reset_user_state_marker_path)"
+  if [[ -f "${migration_marker}" ]]; then
+    echo "[tinyhat-runtime] hard reset: user-state migration already completed for token ${HARD_RESET_USER_STATE_MIGRATION_TOKEN}; skipping"
+    return 0
+  fi
+
+  reset_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  backup_root="${OPENCLAW_USER_STATE_BACKUP_ROOT}/hard-reset-${reset_id}"
+  state_backup="${backup_root}/state"
+  config_backup="${backup_root}/config"
+
+  echo "[tinyhat-runtime] hard reset: backing up OpenClaw user state to ${backup_root}"
+  systemctl stop "${SUPERVISOR_UNIT_NAME}" "${GATEWAY_UNIT_NAME}" >/dev/null 2>&1 || true
+  mkdir -p "${backup_root}"
+  if [[ -e "${OPENCLAW_STATE_DIR}" || -L "${OPENCLAW_STATE_DIR}" ]]; then
+    cp -a -- "${OPENCLAW_STATE_DIR}" "${state_backup}"
+  fi
+  if [[ -e "${OPENCLAW_CONFIG_DIR}" || -L "${OPENCLAW_CONFIG_DIR}" ]]; then
+    cp -a -- "${OPENCLAW_CONFIG_DIR}" "${config_backup}"
+  fi
+
+  mkdir -p "${OPENCLAW_STATE_DIR}" "${OPENCLAW_CONFIG_DIR}"
+
+  if ! hard_reset_backup_contains_expected_user_state "${state_backup}" "${config_backup}"; then
+    layout_warning="no_expected_openclaw_user_state_paths_found"
+    echo "[tinyhat-runtime] WARNING: hard reset backup did not contain expected OpenClaw user-state paths; preserved unknown paths in place and kept full backup at ${backup_root}" >&2
+  fi
+
+  # Boundary exception: OpenClaw does not yet expose an official export/import
+  # command for local auth, memory, and credential state. Keep this narrow and
+  # tracked by the internal-state audit called out in AGENTS.md; prefer official
+  # OpenClaw commands once they exist.
+  hard_reset_remove_disposable_install_paths
+
+  # Some pre-2026.6 layouts stored auth material at the state root. Move those
+  # into the canonical default-agent location when that location is still empty.
+  if [[ -f "${state_backup}/auth-profiles.json" \
+    && ! -f "${OPENCLAW_STATE_DIR}/agents/main/agent/auth-profiles.json" ]]; then
+    copy_path_if_present \
+      "${state_backup}/auth-profiles.json" \
+      "${OPENCLAW_STATE_DIR}/agents/main/agent/auth-profiles.json"
+    migrated_count=$((migrated_count + 1))
+  fi
+  if [[ -f "${state_backup}/openclaw-agent.sqlite" \
+    && ! -f "${OPENCLAW_STATE_DIR}/agents/main/agent/openclaw-agent.sqlite" ]]; then
+    copy_path_if_present \
+      "${state_backup}/openclaw-agent.sqlite" \
+      "${OPENCLAW_STATE_DIR}/agents/main/agent/openclaw-agent.sqlite"
+    migrated_count=$((migrated_count + 1))
+  fi
+
+  if [[ -f "${config_backup}/tinyhat-secrets.json" \
+    && ! -f "${OPENCLAW_CONFIG_DIR}/tinyhat-secrets.json" ]]; then
+    copy_path_if_present \
+      "${config_backup}/tinyhat-secrets.json" \
+      "${OPENCLAW_CONFIG_DIR}/tinyhat-secrets.json"
+    chmod 0600 "${OPENCLAW_CONFIG_DIR}/tinyhat-secrets.json" || true
+    migrated_count=$((migrated_count + 1))
+  fi
+
+  preserved_count="$(hard_reset_count_preserved_expected_user_state)"
+  restored_count=$((preserved_count + migrated_count))
+  {
+    printf 'mode=hard_reset_user_state_migration\n'
+    printf 'backup_root=%s\n' "${backup_root}"
+    printf 'migration_marker=%s\n' "${migration_marker}"
+    printf 'layout_warning=%s\n' "${layout_warning}"
+    printf 'preserved_count=%s\n' "${preserved_count}"
+    printf 'migrated_count=%s\n' "${migrated_count}"
+    printf 'restored_count=%s\n' "${restored_count}"
+  } > "${OPENCLAW_STATE_DIR}/hard-reset-restore.env"
+  {
+    printf 'completed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'backup_root=%s\n' "${backup_root}"
+    printf 'layout_warning=%s\n' "${layout_warning}"
+  } > "${migration_marker}"
+  hard_reset_prune_old_backups
+  echo "[tinyhat-runtime] hard reset: preserved ${preserved_count} and migrated ${migrated_count} user-state paths"
+}
+
 cleanup_stale_openclaw_npm_temp_dirs() {
   local global_root="$1"
   local path
@@ -110,6 +328,19 @@ cleanup_stale_openclaw_npm_temp_dirs() {
     remove_path_if_present "${path}"
   done
   shopt -u nullglob
+}
+
+verify_openclaw_cli() {
+  local verify_log
+  verify_log="$(mktemp /tmp/tinyhat-openclaw-smoke.XXXXXX.log)"
+  if openclaw --version >"${verify_log}" 2>&1; then
+    rm -f "${verify_log}"
+    return 0
+  fi
+  echo "[tinyhat-runtime] ERROR: openclaw CLI smoke failed" >&2
+  tail -n 20 "${verify_log}" >&2 || true
+  rm -f "${verify_log}"
+  return 1
 }
 
 repair_or_cleanup_openclaw_backups() {
@@ -153,21 +384,37 @@ install_openclaw_framework_package() {
     backup_dir="${global_root}/.tinyhat-openclaw-backup-$(date +%s)-$$"
     mv -- "${package_dir}" "${backup_dir}"
   fi
-  install_log="$(mktemp /tmp/tinyhat-openclaw-npm.XXXXXX.log)"
-  if npm install -g --no-fund --no-audit "${install_spec}" >"${install_log}" 2>&1; then
-    remove_path_if_present "${backup_dir}"
+  for attempt in 1 2; do
+    install_log="$(mktemp /tmp/tinyhat-openclaw-npm.XXXXXX.log)"
+    if npm install -g --no-fund --no-audit "${install_spec}" >"${install_log}" 2>&1; then
+      if verify_openclaw_cli; then
+        remove_path_if_present "${backup_dir}"
+        rm -f "${install_log}"
+        echo "[tinyhat-runtime] installed framework package: ${install_spec}"
+        return 0
+      fi
+      echo "[tinyhat-runtime] ERROR: ${install_spec} installed but OpenClaw CLI is not runnable (attempt ${attempt})" >&2
+    else
+      echo "[tinyhat-runtime] ERROR: npm install failed for ${install_spec} (attempt ${attempt})" >&2
+      tail -n 20 "${install_log}" >&2 || true
+    fi
     rm -f "${install_log}"
-    echo "[tinyhat-runtime] installed framework package: ${install_spec}"
-    return 0
-  fi
-  echo "[tinyhat-runtime] ERROR: npm install failed for ${install_spec}" >&2
-  tail -n 20 "${install_log}" >&2 || true
-  remove_path_if_present "${package_dir}"
+    remove_path_if_present "${package_dir}"
+    cleanup_stale_openclaw_npm_temp_dirs "${global_root}" || true
+    if [[ "${attempt}" == "1" ]]; then
+      echo "[tinyhat-runtime] retrying clean OpenClaw framework install after failed attempt" >&2
+      npm cache clean --force >/dev/null 2>&1 || true
+    fi
+  done
   if [[ -n "${backup_dir}" && ( -e "${backup_dir}" || -L "${backup_dir}" ) ]]; then
-    mv -- "${backup_dir}" "${package_dir}"
-    echo "[tinyhat-runtime] restored previous OpenClaw framework package after failed install" >&2
+    if [[ "${HARD_RESET_USER_STATE_MIGRATION}" == "1" ]]; then
+      remove_path_if_present "${backup_dir}"
+      echo "[tinyhat-runtime] hard reset: discarded previous OpenClaw framework package after failed fresh install" >&2
+    else
+      mv -- "${backup_dir}" "${package_dir}"
+      echo "[tinyhat-runtime] restored previous OpenClaw framework package after failed install" >&2
+    fi
   fi
-  rm -f "${install_log}"
   return 1
 }
 
@@ -188,6 +435,7 @@ npm --version
 git --version
 
 ensure_runtime_user
+hard_reset_openclaw_user_state_layout
 mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access
 chown_runtime_paths
 
@@ -245,11 +493,11 @@ if [[ -n "${OPENCLAW_INSTALL_SPEC}" ]]; then
 else
   echo "[tinyhat-runtime] WARNING: TINYHAT_FRAMEWORK_INSTALL_SPEC is unset; using existing openclaw binary from platform bootstrap"
 fi
-if command -v openclaw >/dev/null 2>&1; then
-  write_runtime_bootstrap_status "ready" "openclaw binary available"
+if verify_openclaw_cli; then
+  write_runtime_bootstrap_status "ready" "openclaw CLI available"
 else
-  write_runtime_bootstrap_status "error" "openclaw binary missing"
-  echo "[tinyhat-runtime] ERROR: openclaw binary is missing after bootstrap" >&2
+  write_runtime_bootstrap_status "error" "openclaw CLI failed after bootstrap"
+  echo "[tinyhat-runtime] ERROR: openclaw CLI failed after bootstrap" >&2
   exit 1
 fi
 

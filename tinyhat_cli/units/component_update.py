@@ -298,6 +298,35 @@ def _rollback_framework_install_transaction(transaction: dict[str, object]) -> s
         return f"framework rollback failed: {exc}"
 
 
+def _clean_framework_install_retry_artifacts(
+    *,
+    global_root: str,
+    package_dir: str,
+) -> None:
+    """Remove only disposable OpenClaw npm install artifacts before retrying.
+
+    The user's OpenClaw state, auth profiles, memory/workspace, and Tinyhat
+    credentials live under the configured OpenClaw state/config directories,
+    not in npm's global ``openclaw`` package tree. A failed framework install
+    may leave that package tree internally inconsistent, so retries must start
+    from a clean package path without touching user data.
+    """
+    sup = _sup()
+    if os.path.lexists(package_dir):
+        sup._remove_filesystem_entry(package_dir)
+    sup._cleanup_stale_openclaw_npm_temp_dirs(global_root)
+    try:
+        subprocess.run(
+            ["npm", "cache", "clean", "--force"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - cache cleanup is best effort
+        log.warning("component update: npm cache clean failed before retry: %s", exc)
+
+
 def _committed_framework_backup_dir(backup_dir: str) -> str:
     parent, name = os.path.split(backup_dir)
     prefix = ".tinyhat-openclaw-backup-"
@@ -360,36 +389,61 @@ def _prepare_framework_install_transaction(version: str) -> dict[str, object]:
         "rolled_back": False,
         "restored_previous": False,
     }
-    try:
-        install = subprocess.run(
-            ["npm", "install", "-g", "--no-fund", "--no-audit", f"openclaw@{version}"],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        rollback = sup._rollback_framework_install_transaction(transaction)
-        raise RuntimeError(
-            f"framework npm install of openclaw@{version} timed out; {rollback}"
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        rollback = sup._rollback_framework_install_transaction(transaction)
-        raise RuntimeError(f"framework npm install raised: {exc}; {rollback}") from exc
-    if install.returncode != 0:
-        detail = sup._sanitize_runtime_state_text(
-            (install.stderr or install.stdout or "").strip(),
-            limit=500,
-        )
-        rollback = sup._rollback_framework_install_transaction(transaction)
-        raise RuntimeError(
-            f"framework npm install failed: {detail or install.returncode}; {rollback}"
-        )
-    installed = sup._read_openclaw_framework_version()
-    if installed != version:
-        rollback = sup._rollback_framework_install_transaction(transaction)
-        raise RuntimeError(
-            "framework version mismatch after install: "
-            f"wanted {version}, got {installed or 'unknown'}; {rollback}"
-        )
-    return transaction
+    last_error = ""
+    last_exception: BaseException | None = None
+    for attempt in range(1, 3):
+        last_exception = None
+        try:
+            install = subprocess.run(
+                [
+                    "npm",
+                    "install",
+                    "-g",
+                    "--no-fund",
+                    "--no-audit",
+                    f"openclaw@{version}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_exception = exc
+            last_error = f"framework npm install of openclaw@{version} timed out"
+        except Exception as exc:  # noqa: BLE001
+            last_exception = exc
+            last_error = f"framework npm install raised: {exc}"
+        else:
+            if install.returncode == 0:
+                installed = sup._read_openclaw_framework_version()
+                if installed == version:
+                    return transaction
+                last_error = (
+                    "framework version mismatch after install: "
+                    f"wanted {version}, got {installed or 'unknown'}"
+                )
+            else:
+                detail = sup._sanitize_runtime_state_text(
+                    (install.stderr or install.stdout or "").strip(),
+                    limit=500,
+                )
+                last_error = (
+                    f"framework npm install failed: {detail or install.returncode}"
+                )
+        if attempt < 2:
+            log.warning(
+                "component update: %s; retrying clean OpenClaw framework install",
+                last_error,
+            )
+            _clean_framework_install_retry_artifacts(
+                global_root=global_root,
+                package_dir=package_dir,
+            )
+            continue
+
+    rollback = sup._rollback_framework_install_transaction(transaction)
+    message = f"{last_error}; {rollback}"
+    if last_exception is not None:
+        raise RuntimeError(message) from last_exception
+    raise RuntimeError(message)
