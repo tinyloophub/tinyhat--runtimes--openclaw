@@ -7,6 +7,24 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.1
+
+Patch release for upgraded Computers that hit corrupt OpenClaw framework
+installs or old on-disk layout drift during in-place software recovery.
+
+### Fixed
+
+- Retry failed OpenClaw framework installs from a clean package path after npm
+  tar/ENOENT extraction failures, while preserving rollback to the previous
+  working framework tree until the new CLI verifies successfully.
+- Smoke-test `openclaw --version` after bootstrap framework installs so a
+  partially extracted global package fails fast instead of surfacing later as a
+  missing module during plugin setup.
+- Harden the hard-reset migration path: back up first, preserve unknown user
+  state in place, clean only runtime-owned install/generated paths, write a
+  one-shot marker, warn on layout drift, prune old backups, and fail loudly if
+  a restore copy cannot complete.
+
 ## 0.15.0
 
 This release aligns the public OpenClaw runtime with the Tinyloop `v0.15.0`
