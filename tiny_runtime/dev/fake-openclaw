@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$*" in
+  "plugins inspect tinyhat --json")
+    printf '%s\n' '{"plugin":{"id":"tinyhat","enabled":true,"status":"loaded"}}'
+    ;;
+  "gateway health --json")
+    printf '%s\n' '{"status":"healthy"}'
+    ;;
+  "gateway run")
+    printf '%s\n' "fake openclaw gateway run"
+    ;;
+  "models status --json")
+    printf '%s\n' '{"models":[]}'
+    ;;
+  "secrets reload --json")
+    printf '%s\n' '{"reloaded":true}'
+    ;;
+  "--version")
+    printf '%s\n' "openclaw 2026.6.8"
+    ;;
+  *)
+    printf 'unsupported fake openclaw command: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac

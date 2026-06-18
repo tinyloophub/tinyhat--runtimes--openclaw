@@ -20,9 +20,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Shell syntax
-        run: bash -n bootstrap.sh dev/entrypoint.sh
+        run: bash -n bootstrap.sh dev/entrypoint.sh tiny_runtime/install.sh tiny_runtime/bake/assemble-bundle.sh tiny_runtime/bake/verify-bundle.sh tiny_runtime/dev/entrypoint.sh tiny_runtime/dev/fake-openclaw
       - name: Byte-compile
-        run: python -m compileall -q supervisor.py tinyhat_cli
+        run: python -m compileall -q supervisor.py tinyhat_cli tiny_runtime
       - name: Characterization net
         run: python -m unittest tests.test_supervisor -v
       - name: CLI unit + proof-gate tests
@@ -31,3 +31,5 @@ jobs:
         run: python -m unittest tests.test_command_lock -v
       - name: Capability verification + unit-category allowlist
         run: python -m unittest tests.test_capability_check -v
+      - name: tiny_runtime M1 substrate tests
+        run: python -m unittest tests.test_tiny_runtime -v

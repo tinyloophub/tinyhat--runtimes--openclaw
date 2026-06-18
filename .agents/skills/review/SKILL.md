@@ -27,4 +27,9 @@ python -m unittest tests.test_supervisor -v
 docker build -f dev/Dockerfile -t tinyhat-openclaw-runtime:<topic> .
 ```
 
+Review command output as text evidence: fenced logs, summaries, or committed
+Markdown evidence files. Do not ask authors to screenshot terminal output.
+Reserve screenshots or recordings for changed admin, Telegram, browser, or
+other user-visible surfaces.
+
 Post GitHub reviews under the Codex bot when acting as Codex, and end with `— posted by Codex`.

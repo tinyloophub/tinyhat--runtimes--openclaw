@@ -1,0 +1,16 @@
+{
+  "schema": "tiny_runtime_bundle_lock_v1",
+  "dependencies": {
+    "openclaw": {
+      "type": "npm",
+      "package": "openclaw",
+      "ref": "2026.6.8",
+      "resolved": "openclaw@2026.6.8"
+    },
+    "tinyhat_openclaw_plugin": {
+      "type": "git",
+      "repo": "https://github.com/tinyhat-ai/tinyhat.git",
+      "ref": "9e564878f6057a6c66fa2047b265caa3389314e2"
+    }
+  }
+}

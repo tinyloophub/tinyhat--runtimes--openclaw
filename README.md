@@ -44,6 +44,7 @@ environment-specific.
 | `supervisor.py` | The platform-communication supervisor (state, binding, heartbeat, gateway monitor, OpenClaw config writer). Reads `tinyhat-backend-audience` and `tinyhat-platform-base-url` from instance metadata. |
 | `bootstrap.sh` | The runtime's install command. Installs generic Computer dependencies, optional private access, the requested framework package, and the supervisor + gateway systemd units after the VM's thin startup script clones this repo. |
 | `VERSION` | The runtime version published by this repo; recorded per Computer alongside the resolved commit SHA. |
+| `tiny_runtime/` | Greenfield M1 runtime substrate: content-addressed bundle assembly, install/activation shims, systemd units rooted at `/opt/tinyhat/current`, identity/attestation, and the single OpenClaw adapter boundary. |
 | `dev/` | Local-development container that runs the supervisor + real OpenClaw against a dev backend without GCE provisioning. See [`dev/README.md`](dev/README.md). |
 | `CHANGELOG.md` | What changed between published versions. |
 

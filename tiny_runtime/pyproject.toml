@@ -1,0 +1,10 @@
+[project]
+name = "tinyhat-runtime"
+version = "0.1.0"
+description = "Greenfield Tinyhat Computer runtime substrate"
+requires-python = ">=3.10"
+
+[project.scripts]
+tinyhat-runtime = "tinyhat_runtime.main:main"
+tinyhat-launcher = "tinyhat_runtime.main:launcher_main"
+tinyhat-attest = "tinyhat_runtime.main:attest_main"

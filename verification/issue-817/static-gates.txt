@@ -1,0 +1,12 @@
+$ git diff --check
+[exit=0]
+
+$ python3 scripts/check_dev_skills.py
+dev-skills: ok (parent skill root not mounted; standalone mode)
+[exit=0]
+
+$ bash -n bootstrap.sh dev/entrypoint.sh tiny_runtime/install.sh tiny_runtime/bake/assemble-bundle.sh tiny_runtime/bake/verify-bundle.sh tiny_runtime/dev/entrypoint.sh tiny_runtime/dev/fake-openclaw
+[exit=0]
+
+$ python -m compileall -q supervisor.py tinyhat_cli tiny_runtime
+[exit=0]
