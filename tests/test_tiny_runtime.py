@@ -152,6 +152,16 @@ class PlatformClientTests(unittest.TestCase):
 
 
 class SystemdUnitTests(unittest.TestCase):
+    def test_install_normalizes_root_owned_bundle_copy(self) -> None:
+        install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        chown_pos = install_script.index('chown -R 0:0 "${tmp_target}"')
+        verify_pos = install_script.index(
+            'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"'
+        )
+        self.assertLess(chown_pos, verify_pos)
+
     def test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot(self) -> None:
         unit = (_REPO_ROOT / "tiny_runtime" / "systemd" / "tinyhat-runtime-gateway.service").read_text(
             encoding="utf-8"

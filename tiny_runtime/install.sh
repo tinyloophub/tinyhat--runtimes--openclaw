@@ -26,6 +26,10 @@ mkdir -p "${bundles_dir}"
 rm -rf -- "${tmp_target}"
 cp -a -- "${bundle_source}" "${tmp_target}"
 chmod +x "${tmp_target}"/bin/tinyhat-*
+if [[ "$(id -u)" -eq 0 ]]; then
+  # OpenClaw refuses root-managed plugin paths owned by the unpacking user.
+  chown -R 0:0 "${tmp_target}"
+fi
 rm -rf -- "${target}"
 mv -- "${tmp_target}" "${target}"
 PYTHONPATH="${target}${PYTHONPATH:+:${PYTHONPATH}}" \
