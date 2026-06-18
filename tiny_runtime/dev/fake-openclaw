@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$*" == gateway\ diagnostics\ export* ]]; then
+  output=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --output)
+        output="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "${output}" ]]; then
+    printf 'missing --output\n' >&2
+    exit 64
+  fi
+  python3 - "${output}" <<'PY'
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+output = Path(sys.argv[1])
+output.parent.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(output, "w") as zf:
+    zf.writestr("summary.md", "# Fake diagnostics\nsecret=sk-test-secret-value\n")
+    zf.writestr(
+        "diagnostics.json",
+        json.dumps({"state": "healthy", "token": "secret-token-value"}),
+    )
+    zf.writestr("manifest.json", json.dumps({"schema": "fake"}))
+    zf.writestr("health/gateway.json", json.dumps({"status": "healthy"}))
+    zf.writestr("stability/latest.json", json.dumps({"status": "stable"}))
+print(json.dumps({"ok": True, "output": str(output)}))
+PY
+  exit 0
+fi
+
 case "$*" in
   "plugins inspect tinyhat --json")
     printf '%s\n' '{"plugin":{"id":"tinyhat","enabled":true,"status":"loaded"}}'

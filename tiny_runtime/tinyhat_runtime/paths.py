@@ -24,6 +24,13 @@ CURRENT_LINK = _path_from_env(
 )
 STATE_ROOT = _path_from_env("TINYHAT_RUNTIME_STATE_ROOT", "/var/lib/tinyhat/runtime")
 CONFIG_ROOT = _path_from_env("TINYHAT_RUNTIME_CONFIG_ROOT", "/etc/tinyhat")
+LOG_ROOT = _path_from_env("TINYHAT_RUNTIME_LOG_ROOT", "/var/log/tinyhat")
+COMMANDS_LOG_DIR = _path_from_env(
+    "TINYHAT_RUNTIME_COMMANDS_LOG_DIR", str(LOG_ROOT / "commands")
+)
+DIAGNOSTICS_DIR = _path_from_env(
+    "TINYHAT_RUNTIME_DIAGNOSTICS_DIR", str(LOG_ROOT / "diagnostics")
+)
 IDENTITY_FILE = _path_from_env(
     "TINYHAT_RUNTIME_IDENTITY_FILE", str(STATE_ROOT / "identity.json")
 )
