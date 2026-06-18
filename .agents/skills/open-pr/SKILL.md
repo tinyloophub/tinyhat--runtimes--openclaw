@@ -46,6 +46,10 @@ The PR body should include:
 - What changed and why.
 - Runtime-vs-plugin boundary notes when plugin install behavior changes.
 - Exact verification commands and results.
+- Terminal/command evidence as fenced, sanitized text or a committed Markdown
+  evidence file. Do not convert terminal output into screenshots.
+- Screenshots or recordings only for changed user-visible, admin, Telegram, or
+  other real visual surfaces.
 - Critical-path evidence for subscription/update/restart changes: runtime and
   plugin SHAs or versions, dev Computer id, ordered runtime log lines, and
   Telegram driver/chat used.
