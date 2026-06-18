@@ -1,0 +1,57 @@
+$ docker run --rm tinyhat-openclaw-runtime:tiny-runtime-m1
+{
+  "bundle_id": "sha256:b6047b5ec6afe1d464883fd09568cb761d6ee5e2ad95a4a439f65fe18c3f30c1",
+  "components": {
+    "openclaw": {
+      "package": "openclaw",
+      "ref": "openclaw@2026.6.8"
+    },
+    "runtime": {
+      "ref": "docker-dev",
+      "repo": "https://github.com/tinyloophub/tinyhat--runtimes--openclaw.git"
+    },
+    "tinyhat_openclaw_plugin": {
+      "ref": "9e564878f6057a6c66fa2047b265caa3389314e2",
+      "repo": "https://github.com/tinyhat-ai/tinyhat.git"
+    }
+  },
+  "identity": {
+    "assignment_id": "dev-assignment",
+    "computer_id": "dev-computer",
+    "platform_base_url": "https://platform.example.invalid",
+    "runtime_ref": "tiny-runtime-m1"
+  },
+  "observed_at": "2026-06-18T15:48:20Z",
+  "openclaw": {
+    "gateway": {
+      "gateway": {
+        "status": "healthy"
+      },
+      "state": "healthy"
+    },
+    "models": {
+      "models": {
+        "models": []
+      },
+      "state": "ready"
+    },
+    "plugin": {
+      "plugin": {
+        "plugin": {
+          "enabled": true,
+          "id": "tinyhat",
+          "status": "loaded"
+        }
+      },
+      "state": "ready"
+    },
+    "schema": "openclaw_adapter_attestation_v1"
+  },
+  "paths": {
+    "current": "/opt/tinyhat/current",
+    "openclaw_state_dir": "/var/lib/tinyhat-openclaw",
+    "state_root": "/var/lib/tinyhat/runtime"
+  },
+  "runtime_generation": "tiny_runtime",
+  "schema": "tiny_runtime_attestation_v1"
+}

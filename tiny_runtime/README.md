@@ -16,6 +16,10 @@ runtime. The M1 contract is:
   tiny_runtime`;
 - keep every OpenClaw command behind `tinyhat_runtime/openclaw_adapter.py`.
 
+Bundle verification proves the local files match the declared manifest and
+bundle id. It is not a signature system; production promotion should still pin
+the expected bundle id from a trusted build.
+
 Non-goals:
 
 - no platform default flip;

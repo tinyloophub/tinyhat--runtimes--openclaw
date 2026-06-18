@@ -15,6 +15,10 @@ export PYTHONPATH="${bundle_source}${PYTHONPATH:+:${PYTHONPATH}}"
 python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${bundle_source}" >/dev/null
 bundle_id="$(python3 -m tinyhat_runtime.main bundle id --bundle-dir "${bundle_source}")"
 bundle_name="${bundle_id#sha256:}"
+if [[ "${bundle_id}" != sha256:* || "${#bundle_name}" -ne 64 || ! "${bundle_name}" =~ ^[0-9a-f]+$ ]]; then
+  echo "tiny_runtime install: malformed bundle id: ${bundle_id}" >&2
+  exit 1
+fi
 target="${bundles_dir}/${bundle_name}"
 tmp_target="${target}.tmp.$$"
 
@@ -24,6 +28,8 @@ cp -a -- "${bundle_source}" "${tmp_target}"
 chmod +x "${tmp_target}"/bin/tinyhat-*
 rm -rf -- "${target}"
 mv -- "${tmp_target}" "${target}"
+PYTHONPATH="${target}${PYTHONPATH:+:${PYTHONPATH}}" \
+  python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}" >/dev/null
 ln -sfn -- "${target}" "${current_link}"
 
 if [[ "${skip_systemd}" != "1" ]]; then

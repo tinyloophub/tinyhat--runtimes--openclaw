@@ -5,10 +5,23 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 runtime_root="${repo_root}/tiny_runtime"
 out_dir="${1:-${repo_root}/dist/tiny_runtime_bundle}"
+lock_file="${runtime_root}/bake/bundle.lock"
 
 runtime_ref="${TINYHAT_RUNTIME_REF:-$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || printf 'unknown')}"
-openclaw_ref="${TINYHAT_OPENCLAW_REF:-openclaw@2026.6.8}"
-plugin_ref="${TINYHAT_PLUGIN_REF:-9e564878f6057a6c66fa2047b265caa3389314e2}"
+openclaw_ref="$(python3 - "${lock_file}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["dependencies"]["openclaw"]["resolved"])
+PY
+)"
+plugin_ref="$(python3 - "${lock_file}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["dependencies"]["tinyhat_openclaw_plugin"]["ref"])
+PY
+)"
 
 rm -rf -- "${out_dir}"
 mkdir -p "${out_dir}"

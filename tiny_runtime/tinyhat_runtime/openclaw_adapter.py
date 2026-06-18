@@ -69,16 +69,20 @@ def run_openclaw(
     runner: Runner = subprocess.run,
     env: dict[str, str] | None = None,
 ) -> AdapterResult:
-    completed = runner(
-        ["openclaw", *tuple(args)],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=env or openclaw_env(),
-    )
+    argv = ("openclaw", *tuple(args))
+    try:
+        completed = runner(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env or openclaw_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return AdapterResult(command=argv, returncode=127, stdout="", stderr=str(exc))
     return AdapterResult(
-        command=("openclaw", *tuple(args)),
+        command=argv,
         returncode=int(completed.returncode),
         stdout=completed.stdout or "",
         stderr=completed.stderr or "",
@@ -100,7 +104,11 @@ def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
 
 
 def gateway_run() -> int:
-    return subprocess.call(["openclaw", "gateway", "run"], env=openclaw_env())
+    try:
+        return subprocess.call(["openclaw", "gateway", "run"], env=openclaw_env())
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(redact_text(str(exc)), flush=True)
+        return 127
 
 
 def models_status(*, runner: Runner = subprocess.run) -> dict[str, Any]:

@@ -16,8 +16,8 @@ RUN chmod +x \
       python3 -m tinyhat_runtime.main bundle write \
         --bundle-dir /opt/tinyhat/current \
         --runtime-ref "${TINYHAT_RUNTIME_REF:-docker-dev}" \
-        --openclaw-ref openclaw@2026.6.8 \
-        --plugin-ref 9e564878f6057a6c66fa2047b265caa3389314e2 >/dev/null \
+        --openclaw-ref "$(python3 -c 'import json; print(json.load(open("/opt/tinyhat/current/bake/bundle.lock", encoding="utf-8"))["dependencies"]["openclaw"]["resolved"])')" \
+        --plugin-ref "$(python3 -c 'import json; print(json.load(open("/opt/tinyhat/current/bake/bundle.lock", encoding="utf-8"))["dependencies"]["tinyhat_openclaw_plugin"]["ref"])')" >/dev/null \
     && /opt/tinyhat/current/bake/verify-bundle.sh /opt/tinyhat/current
 
 ENV TINYHAT_RUNTIME_BUNDLE_DIR=/opt/tinyhat/current

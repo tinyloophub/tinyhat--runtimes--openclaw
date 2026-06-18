@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
 from pathlib import Path
 from typing import Any, Iterable
@@ -123,18 +122,3 @@ def verify_manifest(root: Path, manifest: dict[str, Any] | None = None) -> bool:
         if manifest.get(key) != expected.get(key):
             raise BundleVerificationError(f"bundle manifest {key} does not match content")
     return True
-
-
-def safe_bundle_dir_name(bundle_id: str) -> str:
-    if not bundle_id.startswith("sha256:"):
-        raise BundleVerificationError("bundle_id must use sha256:<hex>")
-    return bundle_id.split(":", 1)[1]
-
-
-def chmod_executable_bins(root: Path) -> None:
-    bin_dir = root / "bin"
-    if not bin_dir.exists():
-        return
-    for path in bin_dir.iterdir():
-        if path.is_file():
-            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

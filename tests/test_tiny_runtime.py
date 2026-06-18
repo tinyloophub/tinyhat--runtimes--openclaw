@@ -62,6 +62,18 @@ class BundleManifestTests(unittest.TestCase):
         self.assertRegex(plugin_ref, r"^[0-9a-f]{40}$")
         self.assertNotIn(plugin_ref, {"main", "latest"})
 
+    def test_dev_dockerfile_reads_component_refs_from_bundle_lock(self) -> None:
+        dockerfile = (_REPO_ROOT / "tiny_runtime" / "dev" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("bundle.lock", dockerfile)
+        self.assertNotIn("--openclaw-ref openclaw@2026.6.8", dockerfile)
+        self.assertNotIn(
+            "--plugin-ref 9e564878f6057a6c66fa2047b265caa3389314e2",
+            dockerfile,
+        )
+
 
 class LauncherTests(unittest.TestCase):
     def test_activation_flips_current_symlink(self) -> None:
@@ -160,6 +172,8 @@ _SUBPROCESS_CALL_NAMES = frozenset({"run", "Popen", "check_output", "check_call"
 
 
 def _scan_source_for_openclaw_literal(source: str) -> bool:
+    # This catches literal command heads. It is a boundary tripwire for this
+    # small M1 package, not a general shell-flow proof engine.
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -235,6 +249,18 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertTrue(env["PATH"].split(os.pathsep)[0].endswith("/vendor/openclaw/bin"))
         self.assertTrue(env["OPENCLAW_BUNDLE_DIR"].endswith("/vendor/openclaw"))
 
+    def test_adapter_reports_missing_openclaw_without_raising(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        def missing_runner(*_args, **_kwargs):
+            raise FileNotFoundError("openclaw")
+
+        payload = openclaw_adapter.adapter_attestation(runner=missing_runner)
+        self.assertEqual(payload["schema"], "openclaw_adapter_attestation_v1")
+        self.assertEqual(payload["plugin"]["state"], "unavailable")
+        self.assertEqual(payload["gateway"]["state"], "unhealthy")
+        self.assertEqual(payload["models"]["state"], "unavailable")
+
 
 class BakeScriptTests(unittest.TestCase):
     def test_assemble_bundle_round_trip(self) -> None:
@@ -249,7 +275,20 @@ class BakeScriptTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             manifest = bundle.load_manifest(out_dir)
+            lock = json.loads(
+                (_REPO_ROOT / "tiny_runtime" / "bake" / "bundle.lock").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertTrue(bundle.verify_manifest(out_dir, manifest))
+            self.assertEqual(
+                manifest["components"]["openclaw"]["ref"],
+                lock["dependencies"]["openclaw"]["resolved"],
+            )
+            self.assertEqual(
+                manifest["components"]["tinyhat_openclaw_plugin"]["ref"],
+                lock["dependencies"]["tinyhat_openclaw_plugin"]["ref"],
+            )
 
 
 if __name__ == "__main__":

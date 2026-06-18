@@ -1,0 +1,806 @@
+$ python -m unittest tests.test_supervisor tests.test_tinyhat_cli tests.test_extraction_guards tests.test_command_lock tests.test_capability_check tests.test_tiny_runtime -v
+test_dev_mode_defaults_state_paths_to_runtime_home (tests.test_supervisor.ApplyPackagesCommandTests.test_dev_mode_defaults_state_paths_to_runtime_home) ... ok
+test_gateway_restart_failure_reports_package_apply_failed (tests.test_supervisor.ApplyPackagesCommandTests.test_gateway_restart_failure_reports_package_apply_failed) ... 2026-06-18 10:47:59,843 INFO tinyhat-supervisor: heartbeat command: applying Tinyhat packages revision=9
+2026-06-18 10:47:59,843 INFO tinyhat-supervisor: package apply: Tinyhat plugin/default skills now at ref=v0.4.5 sha=abc123
+ok
+test_malformed_command_is_ignored (tests.test_supervisor.ApplyPackagesCommandTests.test_malformed_command_is_ignored) ... 2026-06-18 10:47:59,844 WARNING tinyhat-supervisor: ignoring malformed apply_packages command: {'type': 'apply_packages'}
+ok
+test_missing_default_skill_names_reads_extension_skill_layout (tests.test_supervisor.ApplyPackagesCommandTests.test_missing_default_skill_names_reads_extension_skill_layout) ... ok
+test_missing_default_skill_reports_failed_without_override_or_restart (tests.test_supervisor.ApplyPackagesCommandTests.test_missing_default_skill_reports_failed_without_override_or_restart) ... 2026-06-18 10:47:59,846 INFO tinyhat-supervisor: heartbeat command: applying Tinyhat packages revision=8
+ok
+test_package_install_failure_reports_failed_without_restart (tests.test_supervisor.ApplyPackagesCommandTests.test_package_install_failure_reports_failed_without_restart) ... 2026-06-18 10:47:59,847 INFO tinyhat-supervisor: heartbeat command: applying Tinyhat packages revision=7
+ok
+test_post_failure_restarts_once_then_redelivery_reposts_only (tests.test_supervisor.ApplyPackagesCommandTests.test_post_failure_restarts_once_then_redelivery_reposts_only) ... 2026-06-18 10:47:59,849 INFO tinyhat-supervisor: heartbeat command: applying Tinyhat packages revision=6
+2026-06-18 10:47:59,849 INFO tinyhat-supervisor: package apply: Tinyhat plugin/default skills now at ref=v0.4.5 sha=abc123
+2026-06-18 10:47:59,849 WARNING tinyhat-supervisor: failed to post package apply result for revision=6: transient 503
+2026-06-18 10:47:59,849 INFO tinyhat-supervisor: apply_packages revision=6 already applied (status=applied) but unreported; reposting cached result
+ok
+test_success_installs_packages_reports_and_restarts_gateway (tests.test_supervisor.ApplyPackagesCommandTests.test_success_installs_packages_reports_and_restarts_gateway) ... 2026-06-18 10:47:59,850 INFO tinyhat-supervisor: heartbeat command: applying Tinyhat packages revision=5
+2026-06-18 10:47:59,850 INFO tinyhat-supervisor: package apply: Tinyhat plugin/default skills now at ref=v0.4.5 sha=abc123
+ok
+test_manual_recovery_returns_nonzero_to_avoid_outer_loop_spin (tests.test_supervisor.BindingCycleManualRecoveryTests.test_manual_recovery_returns_nonzero_to_avoid_outer_loop_spin) ... 2026-06-18 10:47:59,851 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,851 WARNING tinyhat-supervisor: runtime_state ready mirror failed: [Errno 13] Permission denied: '/var/lib/tinyhat-control'
+2026-06-18 10:47:59,851 ERROR tinyhat-supervisor: OpenClaw gateway automatic recovery blocked: manual recovery required; automatic gateway recovery blocked
+ok
+test_binding_cycle_uses_long_poll_and_reports_phase_timings (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_binding_cycle_uses_long_poll_and_reports_phase_timings) ... 2026-06-18 10:47:59,851 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,865 INFO tinyhat-supervisor: platform base URL = https://dev.example.test (metadata=None fallback='https://dev.example.test')
+2026-06-18 10:47:59,865 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2026-06-18T15:47:59Z
+2026-06-18 10:47:59,865 INFO tinyhat-supervisor: reported state=active
+2026-06-18 10:47:59,865 INFO tinyhat-supervisor: phase D: binding signature locked (bot=@Tinychattestbot owner=123456)
+ok
+test_binding_get_failures_use_error_backoff (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_binding_get_failures_use_error_backoff) ... 2026-06-18 10:47:59,866 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,866 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2026-06-18T15:47:59Z
+2026-06-18 10:47:59,866 WARNING tinyhat-supervisor: /me/binding GET failed: platform down
+2026-06-18 10:47:59,866 WARNING tinyhat-supervisor: /me/binding GET failed: platform down
+ok
+test_binding_poll_path_keeps_watchdog_immediate (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_binding_poll_path_keeps_watchdog_immediate) ... ok
+test_phase_gate_metric_samples_derive_from_spans (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_phase_gate_metric_samples_derive_from_spans)
+_phase_span_duration_ms + _phase_gate_metric_sample build the two ... ok
+test_platform_setup_failure_fails_closed_before_config_apply (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_platform_setup_failure_fails_closed_before_config_apply) ... 2026-06-18 10:47:59,867 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,867 WARNING tinyhat-supervisor: runtime_state ready mirror failed: [Errno 13] Permission denied: '/var/lib/tinyhat-control'
+2026-06-18 10:47:59,867 ERROR tinyhat-supervisor: OpenClaw platform setup/gateway start failed: Tinyhat platform plugin unavailable
+Traceback (most recent call last):
+  File "/Users/farid/.codex/worktrees/6aa3/tinyhat--runtimes--openclaw-817/supervisor.py", line 6721, in _run_one_binding_cycle
+    platform_setup = prepare_platform_runtime_setup(binding)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: Tinyhat platform plugin unavailable
+ok
+test_ready_phase_posts_runtime_state_before_binding (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_ready_phase_posts_runtime_state_before_binding) ... 2026-06-18 10:47:59,868 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,878 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2026-06-18T15:47:59Z
+2026-06-18 10:47:59,878 INFO tinyhat-supervisor: phase B cold-start: running owner-release path (supersedes any in-flight subscription workers, wipes any orphaned auth-profile)
+ok
+test_refused_ready_transition_still_posts_runtime_state_when_unbound (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_refused_ready_transition_still_posts_runtime_state_when_unbound) ... 2026-06-18 10:47:59,879 INFO tinyhat-supervisor: Phase A skipped: platform refused ready transition (status 400) — row is likely already past provisioning. Proceeding to Phase B.
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 400: 'already ready'>
+  _warnings.warn(self.warn_message, ResourceWarning)
+2026-06-18 10:47:59,889 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2026-06-18T15:47:59Z
+2026-06-18 10:47:59,889 INFO tinyhat-supervisor: phase B cold-start: running owner-release path (supersedes any in-flight subscription workers, wipes any orphaned auth-profile)
+ok
+test_unbound_phase_refreshes_ready_runtime_state_while_waiting (tests.test_supervisor.BindingCycleSubscriptionProviderWiringTests.test_unbound_phase_refreshes_ready_runtime_state_while_waiting) ... 2026-06-18 10:47:59,890 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:47:59,890 INFO tinyhat-supervisor: phase B cold-start: running owner-release path (supersedes any in-flight subscription workers, wipes any orphaned auth-profile)
+ok
+test_owner_signature_moves_on_owner_change (tests.test_supervisor.BindingSignatureSubscriptionFieldsTests.test_owner_signature_moves_on_owner_change) ... ok
+test_owner_signature_stable_across_mode_flip (tests.test_supervisor.BindingSignatureSubscriptionFieldsTests.test_owner_signature_stable_across_mode_flip)
+Mode flip for the same owner must NOT change the owner- ... ok
+test_signature_moves_when_subscription_model_ref_links (tests.test_supervisor.BindingSignatureSubscriptionFieldsTests.test_signature_moves_when_subscription_model_ref_links) ... ok
+test_signature_stays_stable_for_pending_subscription_flow (tests.test_supervisor.BindingSignatureSubscriptionFieldsTests.test_signature_stays_stable_for_pending_subscription_flow) ... ok
+test_bootstrap_creates_unprivileged_runtime_user (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_creates_unprivileged_runtime_user) ... ok
+test_bootstrap_framework_install_repairs_stale_global_tree (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_framework_install_repairs_stale_global_tree) ... ok
+test_bootstrap_framework_install_restores_backup_on_npm_failure (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_framework_install_restores_backup_on_npm_failure) ... ok
+test_bootstrap_framework_install_retries_when_cli_smoke_fails (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_framework_install_retries_when_cli_smoke_fails) ... ok
+test_bootstrap_hard_reset_discards_bad_framework_on_npm_failure (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_discards_bad_framework_on_npm_failure) ... ok
+test_bootstrap_hard_reset_keeps_existing_default_agent_auth (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_keeps_existing_default_agent_auth) ... ok
+test_bootstrap_hard_reset_prunes_old_backups (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_prunes_old_backups) ... ok
+test_bootstrap_hard_reset_restores_only_user_state (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_restores_only_user_state) ... ok
+test_bootstrap_hard_reset_skips_after_one_shot_marker (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_skips_after_one_shot_marker) ... ok
+test_bootstrap_hard_reset_warns_when_expected_user_state_absent (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_hard_reset_warns_when_expected_user_state_absent) ... ok
+test_bootstrap_queues_supervisor_start_after_gce_startup_scripts (tests.test_supervisor.BootstrapSystemdIsolationTests.test_bootstrap_queues_supervisor_start_after_gce_startup_scripts) ... ok
+test_gateway_unit_is_bounded_unprivileged_workload (tests.test_supervisor.BootstrapSystemdIsolationTests.test_gateway_unit_is_bounded_unprivileged_workload) ... ok
+test_supervisor_unit_is_protected_control_plane (tests.test_supervisor.BootstrapSystemdIsolationTests.test_supervisor_unit_is_protected_control_plane) ... ok
+test_workload_slice_is_bounded_for_hold_down_sampling (tests.test_supervisor.BootstrapSystemdIsolationTests.test_workload_slice_is_bounded_for_hold_down_sampling) ... ok
+test_default_binding_uses_provider_runtime_policy (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_default_binding_uses_provider_runtime_policy)
+Non-subscription Computers pin the provider runtime instead ... 2026-06-18 10:48:01,650 INFO tinyhat-supervisor: backend audience =
+2026-06-18 10:48:01,651 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpuy7xpbnm/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/openai/gpt-5.2 subscription=no openrouter=yes openai_ref=no)
+ok
+test_force_auth_store_repair_marks_attempted_for_profile_read (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_force_auth_store_repair_marks_attempted_for_profile_read) ... 2026-06-18 10:48:01,652 INFO tinyhat-supervisor: running OpenClaw auth-store migration doctor for agent main
+2026-06-18 10:48:01,652 INFO tinyhat-supervisor: OpenClaw auth-store migration doctor completed
+ok
+test_legacy_profile_is_migrated_before_profile_read (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_legacy_profile_is_migrated_before_profile_read) ... 2026-06-18 10:48:01,653 INFO tinyhat-supervisor: running OpenClaw auth-store migration doctor for agent main
+2026-06-18 10:48:01,654 INFO tinyhat-supervisor: OpenClaw auth-store migration doctor completed
+ok
+test_legacy_profile_is_normalized_for_codex_native_auth (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_legacy_profile_is_normalized_for_codex_native_auth)
+OpenClaw 2026.6.x still writes some device-code profiles as ... 2026-06-18 10:48:01,656 INFO tinyhat-supervisor: normalized ChatGPT subscription auth profile ids: openai-codex:owner@example.com->openai:owner@example.com
+2026-06-18 10:48:01,656 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp9bbdr6kk/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.5 subscription=openai:owner@example.com openrouter=yes openai_ref=no)
+ok
+test_modern_openclaw_does_not_trust_legacy_json_if_migration_fails (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_modern_openclaw_does_not_trust_legacy_json_if_migration_fails) ... 2026-06-18 10:48:01,657 INFO tinyhat-supervisor: running OpenClaw auth-store migration doctor for agent main
+2026-06-18 10:48:01,657 WARNING tinyhat-supervisor: OpenClaw auth-store migration doctor exited 1: doctor failed
+2026-06-18 10:48:01,657 WARNING tinyhat-supervisor: legacy ChatGPT subscription auth JSON remains after OpenClaw auth-store migration; treating subscription auth as not ready
+ok
+test_openai_secret_prefers_openai_audio_without_image_pin (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_openai_secret_prefers_openai_audio_without_image_pin)
+BYO OpenAI key uses OpenAI STT without changing the image route. ... 2026-06-18 10:48:01,709 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpmomu_mgm/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/moonshotai/kimi-k2.6 subscription=no openrouter=yes openai_ref=yes)
+ok
+test_openclaw_version_negative_lookup_is_not_cached (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_openclaw_version_negative_lookup_is_not_cached) ... 2026-06-18 10:48:01,710 WARNING tinyhat-supervisor: OpenClaw version check for auth migration returned no version
+ok
+test_openclaw_version_parser_accepts_cli_format_variants (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_openclaw_version_parser_accepts_cli_format_variants) ... ok
+test_opted_in_with_profile_writes_subscription_config (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_opted_in_with_profile_writes_subscription_config)
+Current auth profile + chatgpt_subscription binding routes to OpenAI. ... 2026-06-18 10:48:01,712 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpxlzvvgvj/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.5 subscription=openai:owner@example.com openrouter=yes openai_ref=no)
+ok
+test_opted_in_without_profile_stays_on_default_config (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_opted_in_without_profile_stays_on_default_config)
+llm_auth_mode=chatgpt_subscription but NO auth-profile yet → ... 2026-06-18 10:48:01,765 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbl29bpe7/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/openai/gpt-5.5 subscription=no openrouter=yes openai_ref=no)
+ok
+test_platform_credit_route_configures_openrouter_audio_stt (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_platform_credit_route_configures_openrouter_audio_stt)
+Fresh Computers should use provider STT instead of local CLI audio. ... 2026-06-18 10:48:01,815 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpc5vmyil4/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/moonshotai/kimi-k2.6 subscription=no openrouter=yes openai_ref=no)
+ok
+test_profile_uses_subscription_route_when_codex_plugin_unavailable (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_profile_uses_subscription_route_when_codex_plugin_unavailable)
+The optional Codex plugin should not gate OpenAI model routing. ... 2026-06-18 10:48:01,817 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyg7018lt/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.5 subscription=openai:owner@example.com openrouter=yes openai_ref=no)
+ok
+test_profile_without_provider_stays_on_default_config (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_profile_without_provider_stays_on_default_config)
+A saved profile is not enough if the provider plugin is unavailable. ... 2026-06-18 10:48:01,819 WARNING tinyhat-supervisor: subscription profile is present but OpenAI provider plugin is unavailable; keeping platform-credit route
+2026-06-18 10:48:01,819 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpl8496oow/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/openai/gpt-5.5 subscription=no openrouter=yes openai_ref=no)
+ok
+test_repair_auth_store_command_posts_and_spools_result (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_repair_auth_store_command_posts_and_spools_result) ... ok
+test_repair_auth_store_command_rebinds_after_result_post_failure (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_repair_auth_store_command_rebinds_after_result_post_failure) ... 2026-06-18 10:48:01,820 WARNING tinyhat-supervisor: auth-store repair revision=4 result post failed: platform unavailable
+ok
+test_sqlite_profile_writes_subscription_config (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_sqlite_profile_writes_subscription_config)
+OpenClaw 2026.6.6 stores device-code auth in SQLite. ... 2026-06-18 10:48:01,822 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpu9hd5duw/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.5 subscription=openai:owner@example.com openrouter=yes openai_ref=no)
+ok
+test_subscription_runtime_verification_reports_model_mismatch (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_subscription_runtime_verification_reports_model_mismatch) ... 2026-06-18 10:48:01,823 INFO tinyhat-supervisor: subscription runtime verification reported verified=False expected=openai/gpt-5.5 observed=openrouter/deepseek/v4
+ok
+test_subscription_runtime_verification_reports_openai_model (tests.test_supervisor.ChatgptSubscriptionBranchTests.test_subscription_runtime_verification_reports_openai_model) ... 2026-06-18 10:48:01,823 INFO tinyhat-supervisor: subscription runtime verification reported verified=True expected=openai/gpt-5.5 observed=openai/gpt-5.5
+ok
+test_codex_subscription_plugin_install_failure_raises (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_codex_subscription_plugin_install_failure_raises) ... 2026-06-18 10:48:01,823 WARNING tinyhat-supervisor: OpenClaw plugin codex is not registered: Plugin not found: codex
+ok
+test_codex_subscription_plugin_install_runs_as_runtime_user (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_codex_subscription_plugin_install_runs_as_runtime_user) ... 2026-06-18 10:48:01,824 WARNING tinyhat-supervisor: OpenClaw plugin codex is not registered: Plugin not found: codex
+2026-06-18 10:48:01,824 INFO tinyhat-supervisor: installed OpenClaw Codex subscription plugin (@openclaw/codex)
+ok
+test_codex_subscription_plugin_installs_when_missing (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_codex_subscription_plugin_installs_when_missing) ... 2026-06-18 10:48:01,824 WARNING tinyhat-supervisor: OpenClaw plugin codex is not registered: Plugin not found: codex
+2026-06-18 10:48:01,824 INFO tinyhat-supervisor: installed OpenClaw Codex subscription plugin (@openclaw/codex)
+ok
+test_codex_subscription_plugin_skips_install_when_available (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_codex_subscription_plugin_skips_install_when_available) ... ok
+test_codex_subscription_plugin_verify_failure_raises (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_codex_subscription_plugin_verify_failure_raises) ... 2026-06-18 10:48:01,825 WARNING tinyhat-supervisor: OpenClaw plugin codex is not registered: Plugin not found: codex
+2026-06-18 10:48:01,825 WARNING tinyhat-supervisor: OpenClaw plugin codex is not registered: Plugin not found: codex
+ok
+test_device_code_login_command_uses_current_openai_provider (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_device_code_login_command_uses_current_openai_provider) ... ok
+test_provider_check_raises_when_current_and_legacy_are_missing (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_provider_check_raises_when_current_and_legacy_are_missing) ... 2026-06-18 10:48:01,825 WARNING tinyhat-supervisor: OpenClaw plugin openai is registered but does not expose provider openai or openai-codex
+ok
+test_provider_registry_accepts_current_openai_provider (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_provider_registry_accepts_current_openai_provider) ... ok
+test_provider_registry_accepts_legacy_openai_codex_provider (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_provider_registry_accepts_legacy_openai_codex_provider) ... ok
+test_subscription_model_refs_normalize_to_openai_provider (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_subscription_model_refs_normalize_to_openai_provider) ... ok
+test_subscription_profiles_accept_current_and_legacy_shapes (tests.test_supervisor.ChatgptSubscriptionProviderTests.test_subscription_profiles_accept_current_and_legacy_shapes) ... ok
+test_clean_stop_before_phase_d_stops_active_gateway (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_clean_stop_before_phase_d_stops_active_gateway) ... 2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor starting
+2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor exiting cleanly
+2026-06-18 10:48:01,826 INFO tinyhat-supervisor: clean shutdown: stopping active OpenClaw gateway
+ok
+test_clean_stop_with_no_active_gateway_does_not_call_stop (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_clean_stop_with_no_active_gateway_does_not_call_stop) ... 2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor starting
+2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor exiting cleanly
+ok
+test_error_exit_does_not_trigger_clean_shutdown_teardown (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_error_exit_does_not_trigger_clean_shutdown_teardown) ... 2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor starting
+ok
+test_guard_is_noop_when_stop_flag_not_set (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_guard_is_noop_when_stop_flag_not_set) ... ok
+test_interruptible_sleep_bails_when_stop_set (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_interruptible_sleep_bails_when_stop_set) ... ok
+test_phase_a_clean_stop_lets_main_stop_the_gateway (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_phase_a_clean_stop_lets_main_stop_the_gateway) ... 2026-06-18 10:48:01,826 INFO tinyhat-supervisor: supervisor starting
+2026-06-18 10:48:01,827 WARNING tinyhat-supervisor: initial /me/state ready POST failed (attempt 1): HTTP Error 503: platform down
+/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 503: 'platform down'>
+  _warnings.warn(self.warn_message, ResourceWarning)
+2026-06-18 10:48:01,827 INFO tinyhat-supervisor: supervisor exiting cleanly
+2026-06-18 10:48:01,827 INFO tinyhat-supervisor: clean shutdown: stopping active OpenClaw gateway
+ok
+test_phase_a_ready_retry_returns_promptly_on_clean_stop (tests.test_supervisor.CleanShutdownGatewayTeardownTests.test_phase_a_ready_retry_returns_promptly_on_clean_stop) ... 2026-06-18 10:48:01,827 WARNING tinyhat-supervisor: initial /me/state ready POST failed (attempt 1): HTTP Error 503: platform down
+ok
+test_phase_b_cancels_active_worker_even_when_no_profile_exists_yet (tests.test_supervisor.ColdStartOrphanProfileWipeTests.test_phase_b_cancels_active_worker_even_when_no_profile_exists_yet)
+PR #24 review at 01:32Z — Codex's exact reproduction. ... 2026-06-18 10:48:01,827 INFO tinyhat-supervisor: binding generation bumped to 1 (reason=cold-start-orphan)
+2026-06-18 10:48:01,827 INFO tinyhat-supervisor: subscription-link: SIGTERM in-flight CLI on owner release session_id=owner-A-session pid=424242
+ok
+test_phase_b_path_wipes_orphan_profile_on_unassigned_observation (tests.test_supervisor.ColdStartOrphanProfileWipeTests.test_phase_b_path_wipes_orphan_profile_on_unassigned_observation)
+Exercise the inline cold-start branch without driving Phase B ... 2026-06-18 10:48:01,879 INFO tinyhat-supervisor: binding generation bumped to 1 (reason=cold-start-orphan)
+2026-06-18 10:48:01,880 INFO tinyhat-supervisor: binding watchdog: wiped subscription auth-store on cold-start-orphan (profiles=['openai:default'])
+ok
+test_includes_all_three_components (tests.test_supervisor.CollectComponentVersionsTests.test_includes_all_three_components)
+All readers resolve → runtime + plugin carry their sha, the ... ok
+test_never_raises_when_a_reader_fails (tests.test_supervisor.CollectComponentVersionsTests.test_never_raises_when_a_reader_fails)
+A reader raising must not propagate: the failing component is ... 2026-06-18 10:48:01,881 WARNING tinyhat-supervisor: could not collect runtime component version: git exploded
+ok
+test_omits_components_with_no_resolvable_version_or_sha (tests.test_supervisor.CollectComponentVersionsTests.test_omits_components_with_no_resolvable_version_or_sha)
+A component whose version AND sha both come back empty is ... ok
+test_optional_sha_is_nulled_when_only_version_resolves (tests.test_supervisor.CollectComponentVersionsTests.test_optional_sha_is_nulled_when_only_version_resolves)
+A component with a version but no sha is still reported, with ... ok
+test_plugin_unknown_version_is_treated_as_unreported (tests.test_supervisor.CollectComponentVersionsTests.test_plugin_unknown_version_is_treated_as_unreported)
+An ``"unknown"`` plugin marker version (the installer's ... ok
+test_runtime_sha_falls_back_to_source_marker_when_not_git (tests.test_supervisor.CollectComponentVersionsTests.test_runtime_sha_falls_back_to_source_marker_when_not_git)
+Packaged/dev runtimes can report the platform-resolved runtime SHA. ... ok
+test_component_update_restart_keeps_success_when_state_mirror_fails (tests.test_supervisor.ComponentUpdateGatewayRestartTests.test_component_update_restart_keeps_success_when_state_mirror_fails) ... ok
+test_component_update_restart_propagates_readiness_failure (tests.test_supervisor.ComponentUpdateGatewayRestartTests.test_component_update_restart_propagates_readiness_failure) ... 2026-06-18 10:48:01,882 INFO tinyhat-supervisor: component update: restarting OpenClaw gateway so the updated plugin/framework package tree is picked up
+ok
+test_component_update_restart_waits_for_fresh_gateway_health (tests.test_supervisor.ComponentUpdateGatewayRestartTests.test_component_update_restart_waits_for_fresh_gateway_health) ... 2026-06-18 10:48:01,883 INFO tinyhat-supervisor: component update: restarting OpenClaw gateway so the updated plugin/framework package tree is picked up
+2026-06-18 10:48:01,883 INFO tinyhat-supervisor: component update: OpenClaw gateway restarted and healthy
+ok
+test_repost_after_restart_finds_record_when_cwd_changes (tests.test_supervisor.ComponentUpdateRepostUsesRealStatePathTests.test_repost_after_restart_finds_record_when_cwd_changes) ... 2026-06-18 10:48:01,883 INFO tinyhat-supervisor: heartbeat command: applying component update revision=9
+2026-06-18 10:48:01,883 WARNING tinyhat-supervisor: failed to post component update result for revision=9: net down
+2026-06-18 10:48:01,883 INFO tinyhat-supervisor: update_component revision=9 already applied (status=applied) but unreported; reposting cached result
+ok
+test_default_path_is_absolute (tests.test_supervisor.ComponentUpdateStatePathStabilityTests.test_default_path_is_absolute) ... ok
+test_default_path_stable_across_cwd_change (tests.test_supervisor.ComponentUpdateStatePathStabilityTests.test_default_path_stable_across_cwd_change) ... ok
+test_default_path_stable_across_runtime_recheckout (tests.test_supervisor.ComponentUpdateStatePathStabilityTests.test_default_path_stable_across_runtime_recheckout) ... ok
+test_override_inside_checkout_dir_falls_back_to_stable_default (tests.test_supervisor.ComponentUpdateStatePathStabilityTests.test_override_inside_checkout_dir_falls_back_to_stable_default) ... 2026-06-18 10:48:01,885 WARNING tinyhat-supervisor: TINYHAT_COMPONENT_UPDATE_STATE_PATH=/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpapw6wy29/state/component-update-state.json resolves inside the runtime checkout dir (/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpapw6wy29); a runtime self-update re-checks-out that dir in place, so the dedupe state would not survive the restart. Falling back to the restart-stable default /var/lib/tinyhat/component-update-state.json.
+ok
+test_override_outside_checkout_dir_is_honoured_and_absolutized (tests.test_supervisor.ComponentUpdateStatePathStabilityTests.test_override_outside_checkout_dir_is_honoured_and_absolutized) ... ok
+test_bump_generation_increments_monotonically (tests.test_supervisor.CrossOwnerCredentialLeakGuardTests.test_bump_generation_increments_monotonically) ... 2026-06-18 10:48:01,885 INFO tinyhat-supervisor: binding generation bumped to 1 (reason=test-1)
+2026-06-18 10:48:01,885 INFO tinyhat-supervisor: binding generation bumped to 2 (reason=test-2)
+ok
+test_late_worker_after_release_does_not_post_or_persist (tests.test_supervisor.CrossOwnerCredentialLeakGuardTests.test_late_worker_after_release_does_not_post_or_persist)
+The full race: a worker that has already posted `pending` keeps ... 2026-06-18 10:48:01,886 INFO tinyhat-supervisor: binding generation bumped to 1 (reason=reassign)
+2026-06-18 10:48:01,886 INFO tinyhat-supervisor: binding generation bumped to 2 (reason=reassign)
+2026-06-18 10:48:01,886 INFO tinyhat-supervisor: binding watchdog: wiped subscription auth-store on reassign (profiles=['openai:default'])
+2026-06-18 10:48:01,887 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp_rajchv6/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/openai/gpt-5.5 subscription=no openrouter=yes openai_ref=no)
+ok
+test_wipe_on_release_bumps_generation_and_cancels_workers (tests.test_supervisor.CrossOwnerCredentialLeakGuardTests.test_wipe_on_release_bumps_generation_and_cancels_workers) ... 2026-06-18 10:48:01,887 INFO tinyhat-supervisor: binding generation bumped to 1 (reason=reassign)
+2026-06-18 10:48:01,887 INFO tinyhat-supervisor: subscription-link: SIGTERM in-flight CLI on owner release session_id=fake-session pid=999999
+ok
+test_completion_marker_in_final_drain_posts_linked (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_completion_marker_in_final_drain_posts_linked)
+#92: the CLI prints the completion marker and exits while the ... 2026-06-18 10:48:01,889 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=drain-race-test starting_generation=1 attempt=1/3
+2026-06-18 10:48:02,052 INFO tinyhat-supervisor: subscription-link: parsed URL+code for session_id=drain-race-test; posting pending
+2026-06-18 10:48:02,406 INFO tinyhat-supervisor: subscription-link: detected device-code complete for session_id=drain-race-test; posting linked
+ok
+test_provider_check_failure_posts_terminal_failed (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_provider_check_failure_posts_terminal_failed) ... 2026-06-18 10:48:02,408 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=provider-missing-test starting_generation=1 attempt=1/3
+2026-06-18 10:48:02,408 WARNING tinyhat-supervisor: subscription-link: OpenAI provider plugin unavailable session_id=provider-missing-test: Provider not found: openai
+ok
+test_pty_child_drops_to_runtime_user_before_exec (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_pty_child_drops_to_runtime_user_before_exec) ... 2026-06-18 10:48:02,408 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=drop-before-exec-test starting_generation=1 attempt=1/3
+openclaw exec failed: exec failed after drop
+ok
+test_pty_fork_failure_posts_terminal_failed (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_pty_fork_failure_posts_terminal_failed)
+If we can't even allocate a PTY, the platform still hears ... 2026-06-18 10:48:02,410 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=pty-fail-test starting_generation=1 attempt=1/3
+2026-06-18 10:48:02,410 WARNING tinyhat-supervisor: pty.fork failed for session_id=pty-fail-test: no ptys
+ok
+test_quick_exit_posts_once_even_with_late_drain (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_quick_exit_posts_once_even_with_late_drain)
+No double-post: only ONE terminal status per invocation. ... 2026-06-18 10:48:02,410 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=dup-guard-test starting_generation=1 attempt=1/3
+2026-06-18 10:48:02,414 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=dup-guard-test exit_code=127
+2026-06-18 10:48:02,415 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 1/3 failed for session_id=dup-guard-test; retrying: The OpenClaw device-code login subprocess exited before issuing a code (exit code: 127). Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex), then ask to retry. Recent CLI output: openclaw exec failed: [Errno
+2026-06-18 10:48:02,415 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=dup-guard-test starting_generation=1 attempt=2/3
+2026-06-18 10:48:02,417 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=dup-guard-test exit_code=127
+2026-06-18 10:48:02,417 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 2/3 failed for session_id=dup-guard-test; retrying: The OpenClaw device-code login subprocess exited before issuing a code (exit code: 127). Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex), then ask to retry. Recent CLI output: openclaw exec failed: [Errno
+2026-06-18 10:48:02,417 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=dup-guard-test starting_generation=1 attempt=3/3
+2026-06-18 10:48:02,420 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=dup-guard-test exit_code=127
+ok
+test_quick_exit_posts_terminal_failed (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_quick_exit_posts_terminal_failed) ... 2026-06-18 10:48:02,420 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=quick-exit-test starting_generation=1 attempt=1/3
+2026-06-18 10:48:02,422 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=quick-exit-test exit_code=127
+2026-06-18 10:48:02,423 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 1/3 failed for session_id=quick-exit-test; retrying: The OpenClaw device-code login subprocess exited before issuing a code (exit code: 127). Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex), then ask to retry. Recent CLI output: openclaw exec failed: [Errno
+2026-06-18 10:48:02,423 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=quick-exit-test starting_generation=1 attempt=2/3
+2026-06-18 10:48:02,425 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=quick-exit-test exit_code=127
+2026-06-18 10:48:02,425 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 2/3 failed for session_id=quick-exit-test; retrying: The OpenClaw device-code login subprocess exited before issuing a code (exit code: 127). Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex), then ask to retry. Recent CLI output: openclaw exec failed: [Errno
+2026-06-18 10:48:02,425 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=quick-exit-test starting_generation=1 attempt=3/3
+2026-06-18 10:48:02,428 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=quick-exit-test exit_code=127
+ok
+test_quick_exit_retries_before_reporting_failure (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_quick_exit_retries_before_reporting_failure) ... 2026-06-18 10:48:02,429 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=retry-start-test starting_generation=1 attempt=1/2
+2026-06-18 10:48:02,660 WARNING tinyhat-supervisor: subscription-link: CLI exited before issuing URL/code session_id=retry-start-test exit_code=1
+2026-06-18 10:48:02,661 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 1/2 failed for session_id=retry-start-test; retrying: The OpenClaw device-code login subprocess exited before issuing a code (exit code: 1). Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex), then ask to retry. Recent CLI output: (empty)
+2026-06-18 10:48:02,661 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=retry-start-test starting_generation=1 attempt=2/2
+2026-06-18 10:48:02,670 INFO tinyhat-supervisor: subscription-link: parsed URL+code for session_id=retry-start-test; posting pending
+2026-06-18 10:48:02,670 INFO tinyhat-supervisor: subscription-link: detected device-code complete for session_id=retry-start-test; posting linked
+ok
+test_url_emit_timeout_retries_before_reporting_failure (tests.test_supervisor.DeviceCodeWorkerQuickExitTests.test_url_emit_timeout_retries_before_reporting_failure) ... 2026-06-18 10:48:02,671 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=retry-timeout-test starting_generation=1 attempt=1/2
+2026-06-18 10:48:03,178 WARNING tinyhat-supervisor: subscription-link: no URL/code from CLI after 1s session_id=retry-timeout-test attempt=1/2
+2026-06-18 10:48:03,178 WARNING tinyhat-supervisor: subscription-link: device-code URL/code startup attempt 1/2 failed for session_id=retry-timeout-test; retrying: openclaw did not return a device code. Check that device-code login is enabled in your ChatGPT security settings (Settings -> Security -> Enable device code authorization for Codex). Recent CLI output: (empty)
+2026-06-18 10:48:03,233 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=retry-timeout-test starting_generation=1 attempt=2/2
+2026-06-18 10:48:03,248 INFO tinyhat-supervisor: subscription-link: parsed URL+code for session_id=retry-timeout-test; posting pending
+2026-06-18 10:48:03,248 INFO tinyhat-supervisor: subscription-link: detected device-code complete for session_id=retry-timeout-test; posting linked
+ok
+test_dispatcher_passes_starting_generation_explicitly (tests.test_supervisor.DispatcherCapturesGenerationSynchronouslyTests.test_dispatcher_passes_starting_generation_explicitly)
+The handler must pass starting_generation as a kwarg, not let ... ok
+test_dispatcher_pre_registers_worker_before_thread_starts (tests.test_supervisor.DispatcherCapturesGenerationSynchronouslyTests.test_dispatcher_pre_registers_worker_before_thread_starts)
+The release path needs to see the worker registered even ... ok
+test_worker_pre_fork_check_exits_silently_on_supersession (tests.test_supervisor.DispatcherCapturesGenerationSynchronouslyTests.test_worker_pre_fork_check_exits_silently_on_supersession)
+If owner-release fires between dispatcher and the worker ... 2026-06-18 10:48:03,250 INFO tinyhat-supervisor: subscription-link: starting device-code login subprocess session_id=pre-fork-race starting_generation=5 attempt=1/3
+2026-06-18 10:48:03,250 INFO tinyhat-supervisor: subscription-link: superseded before fork — exiting session_id=pre-fork-race (starting=5 current=10)
+ok
+test_first_marker_epoch_parses_short_unix (tests.test_supervisor.GatewayReadinessSplitTests.test_first_marker_epoch_parses_short_unix) ... ok
+test_split_best_effort_on_journal_error (tests.test_supervisor.GatewayReadinessSplitTests.test_split_best_effort_on_journal_error) ... ok
+test_split_logged_from_journal (tests.test_supervisor.GatewayReadinessSplitTests.test_split_logged_from_journal) ... ok
+test_split_noop_when_marker_missing (tests.test_supervisor.GatewayReadinessSplitTests.test_split_noop_when_marker_missing) ... ok
+test_split_skipped_in_dev_mode (tests.test_supervisor.GatewayReadinessSplitTests.test_split_skipped_in_dev_mode) ... ok
+test_handler_applies_device_code_timing_env (tests.test_supervisor.HandleStartChatgptLinkCommandTests.test_handler_applies_device_code_timing_env) ... ok
+test_handler_is_idempotent_within_lifetime (tests.test_supervisor.HandleStartChatgptLinkCommandTests.test_handler_is_idempotent_within_lifetime) ... 2026-06-18 10:48:03,251 INFO tinyhat-supervisor: start_chatgpt_link: session_id=sess-xyz already in flight; ignoring re-delivery
+ok
+test_handler_rejects_malformed_command (tests.test_supervisor.HandleStartChatgptLinkCommandTests.test_handler_rejects_malformed_command) ... 2026-06-18 10:48:03,251 WARNING tinyhat-supervisor: ignoring malformed start_chatgpt_link command: {'type': 'start_chatgpt_link'}
+2026-06-18 10:48:03,251 WARNING tinyhat-supervisor: ignoring malformed start_chatgpt_link command: {'type': 'start_chatgpt_link', 'session_id': ''}
+2026-06-18 10:48:03,251 WARNING tinyhat-supervisor: ignoring malformed start_chatgpt_link command: {'type': 'start_chatgpt_link', 'session_id': '   '}
+ok
+test_dev_health_probe_ignores_logs_before_current_gateway_start (tests.test_supervisor.OpenClawGatewayHealthTests.test_dev_health_probe_ignores_logs_before_current_gateway_start) ... ok
+test_startup_failure_detail_ignores_benign_gateway_logs (tests.test_supervisor.OpenClawGatewayHealthTests.test_startup_failure_detail_ignores_benign_gateway_logs) ... ok
+test_startup_failure_detail_is_extracted_from_gateway_logs (tests.test_supervisor.OpenClawGatewayHealthTests.test_startup_failure_detail_is_extracted_from_gateway_logs) ... ok
+test_wait_keeps_90s_budget_and_checkpoints_while_openclaw_warms_up (tests.test_supervisor.OpenClawGatewayHealthTests.test_wait_keeps_90s_budget_and_checkpoints_while_openclaw_warms_up) ... 2026-06-18 10:48:03,252 INFO tinyhat-supervisor: OpenClaw gateway readiness probe succeeded
+ok
+test_wait_raises_inactive_startup_failure_without_timeout (tests.test_supervisor.OpenClawGatewayHealthTests.test_wait_raises_inactive_startup_failure_without_timeout) ... ok
+test_wait_raises_startup_failure_without_waiting_for_timeout (tests.test_supervisor.OpenClawGatewayHealthTests.test_wait_raises_startup_failure_without_waiting_for_timeout) ... ok
+test_active_not_ready_records_degradation_before_restart (tests.test_supervisor.OpenClawGatewayReattachTests.test_active_not_ready_records_degradation_before_restart) ... 2026-06-18 10:48:03,256 WARNING tinyhat-supervisor: OpenClaw gateway active but not ready; attempting bounded restart: waiting for OpenClaw telegram connected
+ok
+test_gateway_oom_baseline_preserves_reattach_fingerprint (tests.test_supervisor.OpenClawGatewayReattachTests.test_gateway_oom_baseline_preserves_reattach_fingerprint) ... ok
+test_healthy_gateway_with_config_mismatch_restarts (tests.test_supervisor.OpenClawGatewayReattachTests.test_healthy_gateway_with_config_mismatch_restarts) ... 2026-06-18 10:48:03,271 INFO tinyhat-supervisor: OpenClaw gateway is healthy but config fingerprint changed; restarting to apply current binding
+ok
+test_manual_recovery_marker_writes_unrecoverable_manual_first (tests.test_supervisor.OpenClawGatewayReattachTests.test_manual_recovery_marker_writes_unrecoverable_manual_first) ... ok
+test_reattach_keeps_healthy_matching_gateway_running (tests.test_supervisor.OpenClawGatewayReattachTests.test_reattach_keeps_healthy_matching_gateway_running) ... 2026-06-18 10:48:03,278 INFO tinyhat-supervisor: reattaching to healthy OpenClaw gateway without restart (bot=@Tinychattestbot owner=123456)
+ok
+test_unrecoverable_manual_blocks_restart_without_clear_marker (tests.test_supervisor.OpenClawGatewayReattachTests.test_unrecoverable_manual_blocks_restart_without_clear_marker) ... ok
+test_unrecoverable_manual_clear_marker_allows_recovery (tests.test_supervisor.OpenClawGatewayReattachTests.test_unrecoverable_manual_clear_marker_allows_recovery) ... 2026-06-18 10:48:03,284 INFO tinyhat-supervisor: manual recovery clear marker consumed; automatic recovery may resume (marker=/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpix0ahqd3/clear-unrecoverable-manual manual_marker=/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpix0ahqd3/unrecoverable-manual)
+ok
+test_binding_signature_changes_when_model_package_changes (tests.test_supervisor.OpenRouterModelPackageTests.test_binding_signature_changes_when_model_package_changes) ... ok
+test_missing_binding_model_uses_agentic_openrouter_default (tests.test_supervisor.OpenRouterModelPackageTests.test_missing_binding_model_uses_agentic_openrouter_default) ... 2026-06-18 10:48:03,286 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp0nwcoq4k/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/deepseek/deepseek-v4-pro subscription=no openrouter=yes openai_ref=no)
+ok
+test_no_credit_package_stays_on_free_demo_model (tests.test_supervisor.OpenRouterModelPackageTests.test_no_credit_package_stays_on_free_demo_model) ... 2026-06-18 10:48:03,287 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpz90qm4bp/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/deepseek/deepseek-v4-flash:free subscription=no openrouter=yes openai_ref=no)
+ok
+test_paid_package_writes_enabled_catalog_and_fallback (tests.test_supervisor.OpenRouterModelPackageTests.test_paid_package_writes_enabled_catalog_and_fallback) ... 2026-06-18 10:48:03,288 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp70wn74ew/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/deepseek/deepseek-v4-pro subscription=no openrouter=yes openai_ref=no)
+ok
+test_writes_compaction_reserve_floor (tests.test_supervisor.OpenRouterModelPackageTests.test_writes_compaction_reserve_floor) ... 2026-06-18 10:48:03,289 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmplzxqoflw/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/deepseek/deepseek-v4-flash subscription=no openrouter=yes openai_ref=no)
+ok
+test_binding_cycle_fails_closed_before_gateway_when_setup_fails (tests.test_supervisor.PlatformRuntimeSetupTests.test_binding_cycle_fails_closed_before_gateway_when_setup_fails) ... 2026-06-18 10:48:03,291 INFO tinyhat-supervisor: reported state=ready (attempt 1)
+2026-06-18 10:48:03,291 ERROR tinyhat-supervisor: OpenClaw platform setup/gateway start failed: Tinyhat platform plugin unavailable
+Traceback (most recent call last):
+  File "/Users/farid/.codex/worktrees/6aa3/tinyhat--runtimes--openclaw-817/supervisor.py", line 6721, in _run_one_binding_cycle
+    platform_setup = prepare_platform_runtime_setup(binding)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: Tinyhat platform plugin unavailable
+ok
+test_openclaw_cli_wait_fails_closed_after_timeout (tests.test_supervisor.PlatformRuntimeSetupTests.test_openclaw_cli_wait_fails_closed_after_timeout) ... ok
+test_openclaw_cli_wait_retries_until_cli_works (tests.test_supervisor.PlatformRuntimeSetupTests.test_openclaw_cli_wait_retries_until_cli_works) ... 2026-06-18 10:48:03,292 INFO tinyhat-supervisor: OpenClaw CLI available after 2 attempt(s): /usr/local/bin/openclaw
+ok
+test_prepare_platform_runtime_setup_keeps_codex_plugin_optional_for_platform_credits (tests.test_supervisor.PlatformRuntimeSetupTests.test_prepare_platform_runtime_setup_keeps_codex_plugin_optional_for_platform_credits) ... 2026-06-18 10:48:03,292 WARNING tinyhat-supervisor: Codex subscription plugin unavailable; continuing without auxiliary Codex plugin tools: codex registry unavailable
+2026-06-18 10:48:03,292 WARNING tinyhat-supervisor: ChatGPT subscription OpenAI provider unavailable; continuing with platform credits: openai provider unavailable
+ok
+test_prepare_platform_runtime_setup_requires_subscription_provider_when_profile_present (tests.test_supervisor.PlatformRuntimeSetupTests.test_prepare_platform_runtime_setup_requires_subscription_provider_when_profile_present) ... ok
+test_required_platform_setup_retries_and_sanitizes_diagnostics (tests.test_supervisor.PlatformRuntimeSetupTests.test_required_platform_setup_retries_and_sanitizes_diagnostics) ... 2026-06-18 10:48:03,292 WARNING tinyhat-supervisor: Tinyhat platform plugin unavailable on attempt 1/2; retrying: failed with api_key=[redacted]
+2026-06-18 10:48:03,292 INFO tinyhat-supervisor: Tinyhat platform plugin became ready on attempt 2
+ok
+test_beacon_version_mismatch_counts_as_not_loaded (tests.test_supervisor.PluginLoadDetectionTests.test_beacon_version_mismatch_counts_as_not_loaded) ... ok
+test_fresh_beacon_keeps_healthy_and_reports_loaded (tests.test_supervisor.PluginLoadDetectionTests.test_fresh_beacon_keeps_healthy_and_reports_loaded) ... ok
+test_inactive_gateway_reports_unknown_without_clock (tests.test_supervisor.PluginLoadDetectionTests.test_inactive_gateway_reports_unknown_without_clock) ... ok
+test_malformed_beacon_counts_as_missing (tests.test_supervisor.PluginLoadDetectionTests.test_malformed_beacon_counts_as_missing) ... ok
+test_matching_beacon_wins_even_for_pre_beacon_version_metadata (tests.test_supervisor.PluginLoadDetectionTests.test_matching_beacon_wins_even_for_pre_beacon_version_metadata)
+A build of a beacon-capable plugin can still carry older version ... ok
+test_missing_beacon_demotes_healthy_after_grace (tests.test_supervisor.PluginLoadDetectionTests.test_missing_beacon_demotes_healthy_after_grace) ... ok
+test_no_marker_attaches_no_plugin_block (tests.test_supervisor.PluginLoadDetectionTests.test_no_marker_attaches_no_plugin_block) ... ok
+test_non_healthy_states_are_never_demoted (tests.test_supervisor.PluginLoadDetectionTests.test_non_healthy_states_are_never_demoted) ... ok
+test_parse_plugin_version_edges (tests.test_supervisor.PluginLoadDetectionTests.test_parse_plugin_version_edges) ... ok
+test_plugin_update_resets_the_missing_beacon_clock (tests.test_supervisor.PluginLoadDetectionTests.test_plugin_update_resets_the_missing_beacon_clock)
+Review repro: a not_loaded verdict for one version must not ... ok
+test_pre_beacon_plugin_reports_unknown_and_stays_healthy (tests.test_supervisor.PluginLoadDetectionTests.test_pre_beacon_plugin_reports_unknown_and_stays_healthy) ... ok
+test_failed_carries_non_secret_reason (tests.test_supervisor.PostSubscriptionLinkResultShapeTests.test_failed_carries_non_secret_reason) ... ok
+test_linked_omits_url_code_keys (tests.test_supervisor.PostSubscriptionLinkResultShapeTests.test_linked_omits_url_code_keys) ... ok
+test_pending_with_url_and_code (tests.test_supervisor.PostSubscriptionLinkResultShapeTests.test_pending_with_url_and_code) ... ok
+test_post_failure_is_swallowed (tests.test_supervisor.PostSubscriptionLinkResultShapeTests.test_post_failure_is_swallowed)
+Network errors must not crash the worker thread. ... 2026-06-18 10:48:03,305 WARNING tinyhat-supervisor: subscription-link-result POST failed (session_id=abc status=pending): network down
+ok
+test_gateway_settle_retries_until_reload_succeeds (tests.test_supervisor.ReloadOpenClawSecretsTests.test_gateway_settle_retries_until_reload_succeeds) ... 2026-06-18 10:48:03,305 WARNING tinyhat-supervisor: openclaw secrets reload attempt 1 failed during gateway settle; retrying in 5s: Could not reload secrets because the Gateway did not respond: gateway closed.
+2026-06-18 10:48:03,305 WARNING tinyhat-supervisor: openclaw secrets reload attempt 2 failed during gateway settle; retrying in 10s: Could not reload secrets because the Gateway did not respond: gateway closed.
+2026-06-18 10:48:03,305 WARNING tinyhat-supervisor: openclaw secrets reload attempt 3 failed during gateway settle; retrying in 20s: Could not reload secrets because the Gateway did not respond: gateway closed.
+2026-06-18 10:48:03,305 WARNING tinyhat-supervisor: openclaw secrets reload attempt 4 failed during gateway settle; retrying in 30s: Could not reload secrets because the Gateway did not respond: gateway closed.
+ok
+test_inactive_initial_snapshot_is_synced (tests.test_supervisor.ReloadOpenClawSecretsTests.test_inactive_initial_snapshot_is_synced) ... 2026-06-18 10:48:03,305 INFO tinyhat-supervisor: openclaw secrets reload skipped because no active secret snapshot exists yet; file provider config is synced
+ok
+test_non_retryable_reload_failure_raises (tests.test_supervisor.ReloadOpenClawSecretsTests.test_non_retryable_reload_failure_raises) ... ok
+test_first_delivery_posts_exactly_what_it_persists (tests.test_supervisor.RepostSendsCachedAppliedVersionsTests.test_first_delivery_posts_exactly_what_it_persists) ... 2026-06-18 10:48:03,306 INFO tinyhat-supervisor: heartbeat command: applying component update revision=400
+ok
+test_repost_of_failed_component_sends_cached_pre_failure_versions (tests.test_supervisor.RepostSendsCachedAppliedVersionsTests.test_repost_of_failed_component_sends_cached_pre_failure_versions) ... 2026-06-18 10:48:03,307 INFO tinyhat-supervisor: update_component revision=300 already applied (status=failed) but unreported; reposting cached result
+ok
+test_repost_sends_cached_applied_versions_not_live (tests.test_supervisor.RepostSendsCachedAppliedVersionsTests.test_repost_sends_cached_applied_versions_not_live) ... 2026-06-18 10:48:03,307 INFO tinyhat-supervisor: heartbeat command: applying component update revision=200
+2026-06-18 10:48:03,308 WARNING tinyhat-supervisor: failed to post component update result for revision=200: transient 503
+2026-06-18 10:48:03,308 INFO tinyhat-supervisor: update_component revision=200 already applied (status=applied) but unreported; reposting cached result
+ok
+test_auth_store_ownership_repairs_sqlite_sidecars (tests.test_supervisor.RuntimeOwnershipTests.test_auth_store_ownership_repairs_sqlite_sidecars) ... ok
+test_drop_to_runtime_user_for_exec_noops_without_runtime_user (tests.test_supervisor.RuntimeOwnershipTests.test_drop_to_runtime_user_for_exec_noops_without_runtime_user) ... ok
+test_drop_to_runtime_user_for_exec_uses_gateway_uid_gid (tests.test_supervisor.RuntimeOwnershipTests.test_drop_to_runtime_user_for_exec_uses_gateway_uid_gid) ... ok
+test_runtime_owned_json_write_chowns_parent_and_temp_before_replace (tests.test_supervisor.RuntimeOwnershipTests.test_runtime_owned_json_write_chowns_parent_and_temp_before_replace) ... ok
+test_runtime_owned_json_write_does_not_chown_when_not_root (tests.test_supervisor.RuntimeOwnershipTests.test_runtime_owned_json_write_does_not_chown_when_not_root) ... ok
+test_runtime_owned_json_write_does_not_chown_without_runtime_user (tests.test_supervisor.RuntimeOwnershipTests.test_runtime_owned_json_write_does_not_chown_without_runtime_user) ... ok
+test_apply_runtime_secret_map_returns_env_block_changed (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_apply_runtime_secret_map_returns_env_block_changed) ... 2026-06-18 10:48:03,312 INFO tinyhat-supervisor: wrote Tinyhat runtime secrets file to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp2xxjvwpm/tinyhat-secrets.json (keys=1)
+2026-06-18 10:48:03,312 INFO tinyhat-supervisor: synced OpenClaw SecretRef config (provider=tinyhat openai_ref=no env_block_changed=yes env_keys=1)
+ok
+test_binding_openrouter_wins_over_user_runtime_secret (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_binding_openrouter_wins_over_user_runtime_secret) ... 2026-06-18 10:48:03,313 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpd_97xgl9/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/deepseek/deepseek-v4-pro subscription=no openrouter=yes openai_ref=no)
+ok
+test_deleting_runtime_secret_drops_it_from_env (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_deleting_runtime_secret_drops_it_from_env) ... 2026-06-18 10:48:03,314 INFO tinyhat-supervisor: synced OpenClaw SecretRef config (provider=tinyhat openai_ref=no env_block_changed=yes env_keys=1)
+ok
+test_handle_apply_config_signals_rebind_on_env_change (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_handle_apply_config_signals_rebind_on_env_change) ... 2026-06-18 10:48:03,315 INFO tinyhat-supervisor: heartbeat command: applying runtime config revision=5
+2026-06-18 10:48:03,315 INFO tinyhat-supervisor: apply_config revision=5 applied (keys=1 env_changed=yes)
+2026-06-18 10:48:03,315 INFO tinyhat-supervisor: runtime-secret env block changed; signaling gateway rebind so applyConfigEnvVars picks up the new keys
+ok
+test_handle_apply_config_skips_rebind_when_env_unchanged (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_handle_apply_config_skips_rebind_when_env_unchanged) ... 2026-06-18 10:48:03,315 INFO tinyhat-supervisor: heartbeat command: applying runtime config revision=6
+2026-06-18 10:48:03,315 INFO tinyhat-supervisor: apply_config revision=6 applied (keys=1 env_changed=no)
+ok
+test_openai_api_key_stays_on_secret_ref_not_in_env (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_openai_api_key_stays_on_secret_ref_not_in_env) ... 2026-06-18 10:48:03,316 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpdxc2bgqa/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.2 subscription=no openrouter=no openai_ref=yes)
+ok
+test_openrouter_binding_keeps_openai_secret_ref_without_runtime_pin (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_openrouter_binding_keeps_openai_secret_ref_without_runtime_pin) ... 2026-06-18 10:48:03,317 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpajwwcvtr/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openrouter/moonshotai/kimi-k2.6 subscription=no openrouter=yes openai_ref=yes)
+ok
+test_sync_secret_ref_config_openai_only_does_not_flag_change (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_sync_secret_ref_config_openai_only_does_not_flag_change) ... 2026-06-18 10:48:03,318 INFO tinyhat-supervisor: synced OpenClaw SecretRef config (provider=tinyhat openai_ref=yes env_block_changed=no env_keys=0)
+ok
+test_sync_secret_ref_config_updates_env_and_flags_change (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_sync_secret_ref_config_updates_env_and_flags_change) ... 2026-06-18 10:48:03,318 INFO tinyhat-supervisor: synced OpenClaw SecretRef config (provider=tinyhat openai_ref=yes env_block_changed=yes env_keys=2)
+ok
+test_write_config_mirrors_runtime_secrets_into_env (tests.test_supervisor.RuntimeSecretEnvBlockTests.test_write_config_mirrors_runtime_secrets_into_env) ... 2026-06-18 10:48:03,320 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpst90_wj8/openclaw/openclaw.json (bot=@Tinychattestbot owner=123456 model=openai/gpt-5.2 subscription=no openrouter=no openai_ref=no)
+ok
+test_control_plane_state_dir_chowns_root_when_running_as_root (tests.test_supervisor.RuntimeStateV1Tests.test_control_plane_state_dir_chowns_root_when_running_as_root) ... ok
+test_ready_runtime_state_mirror_is_best_effort (tests.test_supervisor.RuntimeStateV1Tests.test_ready_runtime_state_mirror_is_best_effort) ... ok
+test_ready_runtime_state_posts_again_before_platform_stale_window (tests.test_supervisor.RuntimeStateV1Tests.test_ready_runtime_state_posts_again_before_platform_stale_window) ... 2026-06-18 10:48:03,321 INFO tinyhat-supervisor: platform base URL = https://platform.test (metadata=None fallback='https://platform.test')
+2026-06-18 10:48:03,321 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2025-10-09T08:53:20Z
+2026-06-18 10:48:03,322 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2025-10-09T08:54:21Z
+ok
+test_ready_runtime_state_refresh_contract_fits_platform_stale_window (tests.test_supervisor.RuntimeStateV1Tests.test_ready_runtime_state_refresh_contract_fits_platform_stale_window) ... ok
+test_runtime_state_caches_stable_identity_fields (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_caches_stable_identity_fields) ... ok
+test_runtime_state_caps_last_error_category_for_platform_schema (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_caps_last_error_category_for_platform_schema) ... ok
+test_runtime_state_collapses_consecutive_same_type_events (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_collapses_consecutive_same_type_events) ... ok
+test_runtime_state_dev_mode_mirrors_gateway_log_file_excerpts (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_dev_mode_mirrors_gateway_log_file_excerpts) ... ok
+test_runtime_state_includes_bounded_redacted_log_excerpts (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_includes_bounded_redacted_log_excerpts) ... ok
+test_runtime_state_manual_health_sets_flag_and_error (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_manual_health_sets_flag_and_error) ... ok
+test_runtime_state_platform_post_failure_keeps_local_file (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_platform_post_failure_keeps_local_file) ... 2026-06-18 10:48:03,366 INFO tinyhat-supervisor: platform base URL = https://platform.test (metadata=None fallback='https://platform.test')
+2026-06-18 10:48:03,366 WARNING tinyhat-supervisor: runtime_state platform POST failed: boom
+ok
+test_runtime_state_platform_post_failure_retries_without_event_churn (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_platform_post_failure_retries_without_event_churn) ... 2026-06-18 10:48:03,376 INFO tinyhat-supervisor: platform base URL = https://platform.test (metadata=None fallback='https://platform.test')
+2026-06-18 10:48:03,377 WARNING tinyhat-supervisor: runtime_state platform POST failed: network down
+2026-06-18 10:48:03,377 WARNING tinyhat-supervisor: runtime_state platform POST failed: network down
+ok
+test_runtime_state_platform_post_marker_failure_is_best_effort (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_platform_post_marker_failure_is_best_effort) ... 2026-06-18 10:48:03,388 WARNING tinyhat-supervisor: metadata read for tinyhat-platform-base-url failed: <urlopen error [Errno 8] nodename nor servname provided, or not known>; using fallback
+2026-06-18 10:48:03,388 INFO tinyhat-supervisor: platform base URL = https://platform.test (metadata=None fallback='https://platform.test')
+2026-06-18 10:48:03,388 WARNING tinyhat-supervisor: runtime_state platform unreachable marker failed: disk full
+2026-06-18 10:48:03,388 WARNING tinyhat-supervisor: runtime_state platform POST failed: boom
+ok
+test_runtime_state_posts_changed_payload_inside_platform_throttle (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_posts_changed_payload_inside_platform_throttle) ... 2026-06-18 10:48:03,399 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=degraded_workload observed_at=1970-01-01T00:16:40Z
+2026-06-18 10:48:03,400 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=openclaw_not_ready observed_at=1970-01-01T00:16:45Z
+ok
+test_runtime_state_posts_payload_to_platform_best_effort (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_posts_payload_to_platform_best_effort) ... 2026-06-18 10:48:03,401 INFO tinyhat-supervisor: platform base URL = https://platform.test (metadata=None fallback='https://platform.test')
+2026-06-18 10:48:03,401 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2025-10-09T08:53:20Z
+ok
+test_runtime_state_posts_payload_with_metadata_only_base_url (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_posts_payload_with_metadata_only_base_url) ... 2026-06-18 10:48:03,415 INFO tinyhat-supervisor: platform base URL = https://metadata-platform.test (metadata='https://metadata-platform.test' fallback=None)
+2026-06-18 10:48:03,415 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=healthy observed_at=2026-06-18T15:48:03Z
+ok
+test_runtime_state_preserves_bounded_sanitized_typed_events (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_preserves_bounded_sanitized_typed_events) ... ok
+test_runtime_state_read_ignores_parse_failure_and_preserves_future_fields (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_read_ignores_parse_failure_and_preserves_future_fields) ... 2026-06-18 10:48:03,426 WARNING tinyhat-supervisor: failed to read runtime state from /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp2nlj48ns/runtime-state.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+ok
+test_runtime_state_reads_gce_instance_metadata_when_available (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_reads_gce_instance_metadata_when_available) ... ok
+test_runtime_state_redacts_sensitive_diagnostics (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_redacts_sensitive_diagnostics) ... ok
+test_runtime_state_retries_identity_misses_until_resolved (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_retries_identity_misses_until_resolved) ... ok
+test_runtime_state_sanitizer_redacts_freeform_log_secrets (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_sanitizer_redacts_freeform_log_secrets) ... ok
+test_runtime_state_skips_platform_post_without_base_url (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_skips_platform_post_without_base_url) ... ok
+test_runtime_state_skips_repeated_unchanged_platform_payloads (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_skips_repeated_unchanged_platform_payloads) ... 2026-06-18 10:48:03,481 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=degraded_workload observed_at=1970-01-01T00:16:40Z
+2026-06-18 10:48:03,481 INFO tinyhat-supervisor: runtime_state platform POST succeeded: health=degraded_workload observed_at=1970-01-01T00:17:50Z
+ok
+test_runtime_state_v1_payload_shape_permissions_and_read_back (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_v1_payload_shape_permissions_and_read_back) ... ok
+test_runtime_state_write_uses_tempfile_replace (tests.test_supervisor.RuntimeStateV1Tests.test_runtime_state_write_uses_tempfile_replace) ... ok
+test_unassign_clears_profile_so_next_binding_starts_clean (tests.test_supervisor.StaleProfileCarryoverGuardTests.test_unassign_clears_profile_so_next_binding_starts_clean) ... 2026-06-18 10:48:03,495 INFO tinyhat-supervisor: binding generation bumped to 11 (reason=unassign)
+2026-06-18 10:48:03,495 INFO tinyhat-supervisor: binding watchdog: wiped subscription auth-store on unassign (profiles=['openai:owner@example.com'])
+2026-06-18 10:48:03,496 INFO tinyhat-supervisor: platform base URL =  (metadata=None fallback=None)
+2026-06-18 10:48:03,496 INFO tinyhat-supervisor: wrote OpenClaw config to /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp9wsdfbh2/openclaw/openclaw.json (bot=@OtherTestbot owner=987654 model=openrouter/openai/gpt-5.2 subscription=no openrouter=yes openai_ref=no)
+ok
+test_normalizes_crlf_and_cr (tests.test_supervisor.StripAnsiForCliCaptureTests.test_normalizes_crlf_and_cr) ... ok
+test_strips_color_and_cursor_sequences (tests.test_supervisor.StripAnsiForCliCaptureTests.test_strips_color_and_cursor_sequences) ... ok
+test_gateway_cgroup_memory_snapshot_falls_back_to_workload_slice (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_cgroup_memory_snapshot_falls_back_to_workload_slice) ... ok
+test_gateway_cgroup_memory_snapshot_reads_cgroup_v2_files (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_cgroup_memory_snapshot_reads_cgroup_v2_files) ... ok
+test_gateway_cgroup_memory_snapshot_rejects_path_traversal (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_cgroup_memory_snapshot_rejects_path_traversal) ... ok
+test_gateway_oom_delta_enters_hold_down_after_threshold (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_oom_delta_enters_hold_down_after_threshold) ... ok
+test_gateway_recovery_after_two_hold_down_cycles_goes_manual (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_recovery_after_two_hold_down_cycles_goes_manual) ... ok
+test_gateway_recovery_wait_requires_memory_and_oom_stability (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_recovery_wait_requires_memory_and_oom_stability) ... ok
+test_gateway_recovery_wait_timeout_cycles_escalate_with_real_budget (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_recovery_wait_timeout_cycles_escalate_with_real_budget) ... ok
+test_gateway_recovery_wait_unavailable_samples_exhaust_to_manual (tests.test_supervisor.SupervisorWatchdogContractTests.test_gateway_recovery_wait_unavailable_samples_exhaust_to_manual) ... ok
+test_gce_identity_timeout_is_bounded (tests.test_supervisor.SupervisorWatchdogContractTests.test_gce_identity_timeout_is_bounded) ... ok
+test_me_state_post_sanitizes_detail_before_platform_send (tests.test_supervisor.SupervisorWatchdogContractTests.test_me_state_post_sanitizes_detail_before_platform_send) ... ok
+test_platform_http_timeouts_are_bounded (tests.test_supervisor.SupervisorWatchdogContractTests.test_platform_http_timeouts_are_bounded) ... ok
+test_progress_checkpoint_reads_locals_and_cgroup_before_notify (tests.test_supervisor.SupervisorWatchdogContractTests.test_progress_checkpoint_reads_locals_and_cgroup_before_notify) ... ok
+test_ready_notification_does_not_feed_watchdog (tests.test_supervisor.SupervisorWatchdogContractTests.test_ready_notification_does_not_feed_watchdog) ... ok
+test_sd_notify_supports_abstract_namespace_socket (tests.test_supervisor.SupervisorWatchdogContractTests.test_sd_notify_supports_abstract_namespace_socket) ... ok
+test_stable_healthy_window_resets_gateway_recovery_policy (tests.test_supervisor.SupervisorWatchdogContractTests.test_stable_healthy_window_resets_gateway_recovery_policy) ... ok
+test_systemctl_timeout_is_reported_without_hanging_inspection (tests.test_supervisor.SupervisorWatchdogContractTests.test_systemctl_timeout_is_reported_without_hanging_inspection) ... ok
+test_watchdog_checkpoint_sends_watchdog_after_sanitizing_status (tests.test_supervisor.SupervisorWatchdogContractTests.test_watchdog_checkpoint_sends_watchdog_after_sanitizing_status) ... ok
+test_watchdog_checkpoint_warns_when_gap_exceeds_target (tests.test_supervisor.SupervisorWatchdogContractTests.test_watchdog_checkpoint_warns_when_gap_exceeds_target) ... ok
+test_install_clones_public_repo_and_records_marker (tests.test_supervisor.TinyhatPluginInstallTests.test_install_clones_public_repo_and_records_marker) ... 2026-06-18 10:48:03,549 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=refs/tags/v0.5.0 sha=abc123def456 version=0.5.0)
+ok
+test_installed_marker_skips_openclaw_install_after_fetch (tests.test_supervisor.TinyhatPluginInstallTests.test_installed_marker_skips_openclaw_install_after_fetch) ... 2026-06-18 10:48:03,550 INFO tinyhat-supervisor: Tinyhat plugin already installed (ref=main sha=fedcba987654 version=0.5.0)
+ok
+test_plugin_source_prefers_component_update_override (tests.test_supervisor.TinyhatPluginInstallTests.test_plugin_source_prefers_component_update_override) ... ok
+test_public_runtime_cache_hit_normalizes_plugin_identity_fields (tests.test_supervisor.TinyhatPluginInstallTests.test_public_runtime_cache_hit_normalizes_plugin_identity_fields) ... 2026-06-18 10:48:03,551 INFO tinyhat-supervisor: Tinyhat plugin cache checkout verified (ref=refs/tags/v0.5.0 sha=1234567890ab cache=)
+ok
+test_public_runtime_cache_hit_requires_plugin_identity_fields (tests.test_supervisor.TinyhatPluginInstallTests.test_public_runtime_cache_hit_requires_plugin_identity_fields) ... ok
+test_public_runtime_cache_hit_skips_plugin_git_network (tests.test_supervisor.TinyhatPluginInstallTests.test_public_runtime_cache_hit_skips_plugin_git_network) ... 2026-06-18 10:48:03,553 INFO tinyhat-supervisor: Tinyhat plugin cache checkout verified (ref=refs/tags/v0.5.0 sha=1234567890ab cache=)
+2026-06-18 10:48:03,554 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=refs/tags/v0.5.0 sha=1234567890ab version=0.5.0)
+ok
+test_stale_marker_reinstalls_when_openclaw_registry_is_missing_plugin (tests.test_supervisor.TinyhatPluginInstallTests.test_stale_marker_reinstalls_when_openclaw_registry_is_missing_plugin) ... 2026-06-18 10:48:03,554 WARNING tinyhat-supervisor: OpenClaw plugin tinyhat is not registered: Plugin not found: tinyhat
+2026-06-18 10:48:03,555 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=main sha=fedcba987654 version=0.5.0)
+ok
+test_install_runs_under_lock_and_releases (tests.test_supervisor.TinyhatPluginPrewarmTests.test_install_runs_under_lock_and_releases) ... ok
+test_prewarm_installs_plugin_best_effort (tests.test_supervisor.TinyhatPluginPrewarmTests.test_prewarm_installs_plugin_best_effort) ... 2026-06-18 10:48:03,555 INFO tinyhat-supervisor: prewarm: Tinyhat plugin installed before binding
+ok
+test_prewarm_skips_install_when_cli_unavailable (tests.test_supervisor.TinyhatPluginPrewarmTests.test_prewarm_skips_install_when_cli_unavailable) ... 2026-06-18 10:48:03,555 INFO tinyhat-supervisor: prewarm: Tinyhat plugin pre-install deferred to bind: no cli
+ok
+test_prewarm_swallows_install_failure (tests.test_supervisor.TinyhatPluginPrewarmTests.test_prewarm_swallows_install_failure) ... 2026-06-18 10:48:03,555 INFO tinyhat-supervisor: prewarm: Tinyhat plugin pre-install deferred to bind: boom
+ok
+test_already_installed_path_repairs_ownership (tests.test_supervisor.TinyhatPluginRuntimeOwnershipTests.test_already_installed_path_repairs_ownership) ... 2026-06-18 10:48:03,557 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=refs/tags/v0.5.0 sha=abc123def456 version=0.5.0)
+2026-06-18 10:48:03,557 INFO tinyhat-supervisor: Tinyhat plugin already installed (ref=refs/tags/v0.5.0 sha=abc123def456 version=0.5.0)
+ok
+test_existing_checkout_repairs_ownership_before_git_commands (tests.test_supervisor.TinyhatPluginRuntimeOwnershipTests.test_existing_checkout_repairs_ownership_before_git_commands) ... 2026-06-18 10:48:03,559 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=refs/tags/v0.5.0 sha=abc123def456 version=0.5.0)
+ok
+test_install_hands_plugin_trees_to_runtime_user (tests.test_supervisor.TinyhatPluginRuntimeOwnershipTests.test_install_hands_plugin_trees_to_runtime_user) ... 2026-06-18 10:48:03,561 INFO tinyhat-supervisor: installed Tinyhat plugin (repo=https://example.com/tinyhat.git ref=refs/tags/v0.5.0 sha=abc123def456 version=0.5.0)
+ok
+test_no_runtime_user_keeps_current_behaviour (tests.test_supervisor.TinyhatPluginRuntimeOwnershipTests.test_no_runtime_user_keeps_current_behaviour) ... ok
+test_tree_chown_never_follows_symlinks (tests.test_supervisor.TinyhatPluginRuntimeOwnershipTests.test_tree_chown_never_follows_symlinks)
+A symlink inside the plugin tree must not chown its target. ... ok
+test_component_failure_reports_failed_without_crashing (tests.test_supervisor.UpdateComponentCommandTests.test_component_failure_reports_failed_without_crashing) ... 2026-06-18 10:48:03,562 INFO tinyhat-supervisor: heartbeat command: applying component update revision=6
+ok
+test_component_restart_failure_reports_failed_without_raising (tests.test_supervisor.UpdateComponentCommandTests.test_component_restart_failure_reports_failed_without_raising) ... 2026-06-18 10:48:03,563 INFO tinyhat-supervisor: heartbeat command: applying component update revision=32
+2026-06-18 10:48:03,563 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+ok
+test_dev_mode_runtime_self_update_is_relaxed (tests.test_supervisor.UpdateComponentCommandTests.test_dev_mode_runtime_self_update_is_relaxed) ... 2026-06-18 10:48:03,564 INFO tinyhat-supervisor: heartbeat command: applying component update revision=7
+2026-06-18 10:48:03,564 INFO tinyhat-supervisor: dev runtime: skipping runtime self-update (source is bind-mounted)
+ok
+test_dispatch_routes_apply_packages_to_handler (tests.test_supervisor.UpdateComponentCommandTests.test_dispatch_routes_apply_packages_to_handler) ... ok
+test_dispatch_routes_update_component_to_handler (tests.test_supervisor.UpdateComponentCommandTests.test_dispatch_routes_update_component_to_handler) ... ok
+test_framework_commit_cleanup_failure_does_not_repair_old_backup (tests.test_supervisor.UpdateComponentCommandTests.test_framework_commit_cleanup_failure_does_not_repair_old_backup) ... 2026-06-18 10:48:03,566 WARNING tinyhat-supervisor: component update: could not remove framework install backup /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp_crdj3v8/.tinyhat-openclaw-committed-backup-100-1: cleanup denied
+2026-06-18 10:48:03,566 WARNING tinyhat-supervisor: component update: removed stale framework backup artifacts: .tinyhat-openclaw-committed-backup-100-1
+ok
+test_framework_gateway_failure_rolls_back_and_reports_failed (tests.test_supervisor.UpdateComponentCommandTests.test_framework_gateway_failure_rolls_back_and_reports_failed) ... 2026-06-18 10:48:03,566 INFO tinyhat-supervisor: heartbeat command: applying component update revision=41
+ok
+test_framework_npm_enotempty_failure_restores_previous_tree (tests.test_supervisor.UpdateComponentCommandTests.test_framework_npm_enotempty_failure_restores_previous_tree) ... 2026-06-18 10:48:03,568 WARNING tinyhat-supervisor: component update: removed stale OpenClaw npm temp dirs: .openclaw-gX1GdeX9
+2026-06-18 10:48:03,568 WARNING tinyhat-supervisor: component update: framework npm install failed: npm error code ENOTEMPTY
+npm error path /usr/lib/node_modules/openclaw
+npm error dest /usr/lib/node_modules/.openclaw-gX1GdeX9; retrying clean OpenClaw framework install
+ok
+test_framework_npm_tar_failure_retries_clean_install (tests.test_supervisor.UpdateComponentCommandTests.test_framework_npm_tar_failure_retries_clean_install) ... 2026-06-18 10:48:03,569 WARNING tinyhat-supervisor: component update: framework npm install failed: npm warn tar TAR_ENTRY_ERROR ENOENT: no such file or directory, lstat '/usr/lib/node_modules/openclaw/node_modules/@mistralai/mistralai/esm/models/components'; retrying clean OpenClaw framework install
+ok
+test_framework_prepare_cleans_npm_temp_and_installs_exact_version (tests.test_supervisor.UpdateComponentCommandTests.test_framework_prepare_cleans_npm_temp_and_installs_exact_version) ... 2026-06-18 10:48:03,571 WARNING tinyhat-supervisor: component update: removed stale framework backup artifacts: .tinyhat-openclaw-committed-backup-100-1, .tinyhat-openclaw-copying-100-1
+2026-06-18 10:48:03,572 WARNING tinyhat-supervisor: component update: removed stale OpenClaw npm temp dirs: .openclaw-gX1GdeX9
+ok
+test_framework_prepare_handles_cross_device_backup_move (tests.test_supervisor.UpdateComponentCommandTests.test_framework_prepare_handles_cross_device_backup_move) ... ok
+test_framework_retry_restores_interrupted_backup (tests.test_supervisor.UpdateComponentCommandTests.test_framework_retry_restores_interrupted_backup) ... ok
+test_framework_target_commits_transaction_after_gateway_smoke (tests.test_supervisor.UpdateComponentCommandTests.test_framework_target_commits_transaction_after_gateway_smoke) ... 2026-06-18 10:48:03,574 INFO tinyhat-supervisor: heartbeat command: applying component update revision=4
+2026-06-18 10:48:03,574 INFO tinyhat-supervisor: component update: framework now at 1.5.0
+ok
+test_framework_version_mismatch_marks_failed (tests.test_supervisor.UpdateComponentCommandTests.test_framework_version_mismatch_marks_failed) ... 2026-06-18 10:48:03,575 INFO tinyhat-supervisor: heartbeat command: applying component update revision=5
+ok
+test_fully_reported_revision_is_deduped (tests.test_supervisor.UpdateComponentCommandTests.test_fully_reported_revision_is_deduped) ... 2026-06-18 10:48:03,576 INFO tinyhat-supervisor: update_component revision=100 already applied (status=applied) and reported; skipping
+ok
+test_legacy_state_without_reported_reposts_not_reattempts (tests.test_supervisor.UpdateComponentCommandTests.test_legacy_state_without_reported_reposts_not_reattempts) ... 2026-06-18 10:48:03,576 INFO tinyhat-supervisor: update_component revision=12 already applied (status=failed) but unreported; reposting cached result
+ok
+test_malformed_command_is_ignored (tests.test_supervisor.UpdateComponentCommandTests.test_malformed_command_is_ignored) ... 2026-06-18 10:48:03,577 WARNING tinyhat-supervisor: ignoring malformed update_component command: {'type': 'update_component'}
+2026-06-18 10:48:03,577 WARNING tinyhat-supervisor: ignoring malformed update_component command: {'type': 'update_component', 'revision': 1}
+2026-06-18 10:48:03,577 WARNING tinyhat-supervisor: ignoring malformed update_component command: {'type': 'update_component', 'targets': {}}
+ok
+test_plugin_and_framework_targets_restart_gateway_once (tests.test_supervisor.UpdateComponentCommandTests.test_plugin_and_framework_targets_restart_gateway_once) ... 2026-06-18 10:48:03,577 INFO tinyhat-supervisor: heartbeat command: applying component update revision=33
+2026-06-18 10:48:03,577 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+2026-06-18 10:48:03,577 INFO tinyhat-supervisor: component update: framework now at 1.5.0
+ok
+test_plugin_gateway_failure_rolls_back_previous_source (tests.test_supervisor.UpdateComponentCommandTests.test_plugin_gateway_failure_rolls_back_previous_source) ... 2026-06-18 10:48:03,578 INFO tinyhat-supervisor: heartbeat command: applying component update revision=42
+2026-06-18 10:48:03,579 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=newsha
+ok
+test_plugin_only_target_installs_ref_restarts_and_reports_applied (tests.test_supervisor.UpdateComponentCommandTests.test_plugin_only_target_installs_ref_restarts_and_reports_applied) ... 2026-06-18 10:48:03,580 INFO tinyhat-supervisor: heartbeat command: applying component update revision=3
+2026-06-18 10:48:03,580 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+ok
+test_plugin_update_persists_ref_for_later_rebind_without_mutating_env (tests.test_supervisor.UpdateComponentCommandTests.test_plugin_update_persists_ref_for_later_rebind_without_mutating_env) ... 2026-06-18 10:48:03,581 INFO tinyhat-supervisor: heartbeat command: applying component update revision=31
+2026-06-18 10:48:03,581 INFO tinyhat-supervisor: component update: plugin now at ref=v3.0.0 sha=
+ok
+test_repost_failure_leaves_reported_false_for_retry (tests.test_supervisor.UpdateComponentCommandTests.test_repost_failure_leaves_reported_false_for_retry) ... 2026-06-18 10:48:03,582 INFO tinyhat-supervisor: update_component revision=100 already applied (status=applied) but unreported; reposting cached result
+2026-06-18 10:48:03,582 WARNING tinyhat-supervisor: failed to post component update result for revision=100: still down
+ok
+test_runtime_checkout_failure_does_not_restart (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_checkout_failure_does_not_restart) ... 2026-06-18 10:48:03,582 INFO tinyhat-supervisor: heartbeat command: applying component update revision=9
+ok
+test_runtime_self_update_reposts_after_restart_when_post_failed (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_self_update_reposts_after_restart_when_post_failed)
+Runtime restart-safety: if the runtime self-update's POST fails, the ... 2026-06-18 10:48:03,583 INFO tinyhat-supervisor: heartbeat command: applying component update revision=102
+2026-06-18 10:48:03,583 WARNING tinyhat-supervisor: failed to post component update result for revision=102: post failed
+2026-06-18 10:48:03,583 INFO tinyhat-supervisor: update_component revision=102 already applied (status=applied) but unreported; reposting cached result
+ok
+test_runtime_success_posts_before_restart (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_success_posts_before_restart) ... 2026-06-18 10:48:03,584 INFO tinyhat-supervisor: heartbeat command: applying component update revision=8
+2026-06-18 10:48:03,584 INFO tinyhat-supervisor: component update: runtime checked out to ref=v0.10.2 (version=0.10.2 sha=unknown)
+ok
+test_runtime_success_with_plugin_smokes_gateway_before_restart (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_success_with_plugin_smokes_gateway_before_restart) ... 2026-06-18 10:48:03,585 INFO tinyhat-supervisor: heartbeat command: applying component update revision=34
+2026-06-18 10:48:03,585 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+2026-06-18 10:48:03,585 INFO tinyhat-supervisor: component update: runtime checked out to ref=v0.10.2 (version=0.10.2 sha=unknown)
+ok
+test_runtime_target_persists_expected_sha_in_dev_mode (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_target_persists_expected_sha_in_dev_mode) ... 2026-06-18 10:48:03,585 INFO tinyhat-supervisor: heartbeat command: applying component update revision=44
+2026-06-18 10:48:03,586 INFO tinyhat-supervisor: dev runtime: skipping runtime self-update (source is bind-mounted)
+ok
+test_runtime_with_framework_smokes_gateway_before_result_and_restart (tests.test_supervisor.UpdateComponentCommandTests.test_runtime_with_framework_smokes_gateway_before_result_and_restart) ... 2026-06-18 10:48:03,586 INFO tinyhat-supervisor: heartbeat command: applying component update revision=35
+ok
+test_state_write_defaults_to_unreported_with_empty_cache (tests.test_supervisor.UpdateComponentCommandTests.test_state_write_defaults_to_unreported_with_empty_cache) ... ok
+test_state_write_persists_reported_and_cached_result (tests.test_supervisor.UpdateComponentCommandTests.test_state_write_persists_reported_and_cached_result) ... ok
+test_successful_update_persists_reported_true (tests.test_supervisor.UpdateComponentCommandTests.test_successful_update_persists_reported_true) ... 2026-06-18 10:48:03,587 INFO tinyhat-supervisor: heartbeat command: applying component update revision=101
+2026-06-18 10:48:03,588 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+ok
+test_supervisor_restart_unit_matches_bootstrap_unit (tests.test_supervisor.UpdateComponentCommandTests.test_supervisor_restart_unit_matches_bootstrap_unit) ... ok
+test_transient_post_failure_then_redelivery_reposts (tests.test_supervisor.UpdateComponentCommandTests.test_transient_post_failure_then_redelivery_reposts)
+P1 regression (tinyloophub/tinyloop#562): a swallowed result-POST ... 2026-06-18 10:48:03,589 INFO tinyhat-supervisor: heartbeat command: applying component update revision=100
+2026-06-18 10:48:03,589 INFO tinyhat-supervisor: component update: plugin now at ref=v2.0.0 sha=abc123
+2026-06-18 10:48:03,589 WARNING tinyhat-supervisor: failed to post component update result for revision=100: transient 503
+2026-06-18 10:48:03,589 INFO tinyhat-supervisor: update_component revision=100 already applied (status=applied) but unreported; reposting cached result
+ok
+test_wipe_on_missing_file_is_noop (tests.test_supervisor.WipeChatgptSubscriptionProfileTests.test_wipe_on_missing_file_is_noop) ... ok
+test_wipe_removes_current_openai_profile_and_preserves_others (tests.test_supervisor.WipeChatgptSubscriptionProfileTests.test_wipe_removes_current_openai_profile_and_preserves_others) ... ok
+test_wipe_removes_legacy_openai_codex_profile (tests.test_supervisor.WipeChatgptSubscriptionProfileTests.test_wipe_removes_legacy_openai_codex_profile) ... ok
+test_wipe_removes_sqlite_openai_profile_and_preserves_others (tests.test_supervisor.WipeChatgptSubscriptionProfileTests.test_wipe_removes_sqlite_openai_profile_and_preserves_others) ... ok
+test_wipe_helper_is_safe_when_no_profile_exists (tests.test_supervisor.WipeOnOwnerReleaseTests.test_wipe_helper_is_safe_when_no_profile_exists) ... 2026-06-18 10:48:03,594 INFO tinyhat-supervisor: binding generation bumped to 12 (reason=unassign)
+ok
+test_wipe_helper_logs_removed_profiles (tests.test_supervisor.WipeOnOwnerReleaseTests.test_wipe_helper_logs_removed_profiles)
+``_wipe_on_owner_release`` must call into the actual wipe. ... 2026-06-18 10:48:03,595 INFO tinyhat-supervisor: binding generation bumped to 13 (reason=reassign)
+2026-06-18 10:48:03,595 INFO tinyhat-supervisor: binding watchdog: wiped subscription auth-store on reassign (profiles=['openai:default'])
+ok
+test_wipe_helper_swallows_unexpected_errors (tests.test_supervisor.WipeOnOwnerReleaseTests.test_wipe_helper_swallows_unexpected_errors)
+A flaky filesystem must not break the rebind path. ... 2026-06-18 10:48:03,595 INFO tinyhat-supervisor: binding generation bumped to 14 (reason=reassign)
+2026-06-18 10:48:03,596 WARNING tinyhat-supervisor: binding watchdog: subscription auth-store wipe failed on reassign: disk gremlin
+ok
+test_all_commands_json_schema_valid_and_redacted (tests.test_tinyhat_cli.EntrypointTests.test_all_commands_json_schema_valid_and_redacted) ... ok
+test_cli_quiets_supervisor_info_logging (tests.test_tinyhat_cli.EntrypointTests.test_cli_quiets_supervisor_info_logging) ... ok
+test_human_output_carries_freshness_and_redaction (tests.test_tinyhat_cli.EntrypointTests.test_human_output_carries_freshness_and_redaction) ... ok
+test_internal_error_is_typed (tests.test_tinyhat_cli.EntrypointTests.test_internal_error_is_typed) ... ok
+test_manifest_drift_json_contract_fields (tests.test_tinyhat_cli.EntrypointTests.test_manifest_drift_json_contract_fields) ... ok
+test_non_root_gets_typed_error_and_exit_77 (tests.test_tinyhat_cli.EntrypointTests.test_non_root_gets_typed_error_and_exit_77) ... ok
+test_schema_validator_can_fail (tests.test_tinyhat_cli.EntrypointTests.test_schema_validator_can_fail) ... ok
+test_result_record_shape (tests.test_tinyhat_cli.GatewayRestartSkeletonTests.test_result_record_shape) ... ok
+test_start_failure_classifies_failed (tests.test_tinyhat_cli.GatewayRestartSkeletonTests.test_start_failure_classifies_failed) ... ok
+test_success_path (tests.test_tinyhat_cli.GatewayRestartSkeletonTests.test_success_path) ... ok
+test_timeout_classifies_timed_out (tests.test_tinyhat_cli.GatewayRestartSkeletonTests.test_timeout_classifies_timed_out) ... ok
+test_webhook_failure_classifies_failed (tests.test_tinyhat_cli.GatewayRestartSkeletonTests.test_webhook_failure_classifies_failed) ... ok
+test_requires_phase_a_mark (tests.test_tinyhat_cli.LifecycleBlockTests.test_requires_phase_a_mark) ... ok
+test_spans_computed (tests.test_tinyhat_cli.LifecycleBlockTests.test_spans_computed) ... ok
+test_creation_specs_parse_known_keys_and_name_unknown_ones (tests.test_tinyhat_cli.ManifestUnitTests.test_creation_specs_parse_known_keys_and_name_unknown_ones) ... ok
+test_divergence_fixture_renders_honestly (tests.test_tinyhat_cli.ManifestUnitTests.test_divergence_fixture_renders_honestly)
+Admin-desired != last-acked on-box: the CLI must show divergence ... ok
+test_drift_in_sync_plugin_and_unknown_runtime_without_update (tests.test_tinyhat_cli.ManifestUnitTests.test_drift_in_sync_plugin_and_unknown_runtime_without_update) ... ok
+test_full_ref_normalization (tests.test_tinyhat_cli.ManifestUnitTests.test_full_ref_normalization) ... ok
+test_marker_repo_ref_matches_branch_shaped_desired_ref (tests.test_tinyhat_cli.ManifestUnitTests.test_marker_repo_ref_matches_branch_shaped_desired_ref)
+A desired ref that is neither version- nor sha-shaped still ... ok
+test_no_acked_update_means_creation_spec_staleness (tests.test_tinyhat_cli.ManifestUnitTests.test_no_acked_update_means_creation_spec_staleness) ... ok
+test_tag_pinned_plugin_is_in_sync (tests.test_tinyhat_cli.ManifestUnitTests.test_tag_pinned_plugin_is_in_sync)
+Codex review repro: creation spec ``refs/tags/v0.5.0`` + ... ok
+test_v_prefix_normalization (tests.test_tinyhat_cli.ManifestUnitTests.test_v_prefix_normalization) ... ok
+test_json_tree_sanitizer_redacts_nested_values (tests.test_tinyhat_cli.RedactionSentinelTests.test_json_tree_sanitizer_redacts_nested_values) ... ok
+test_path_key_allowlist_keeps_plain_paths_readable (tests.test_tinyhat_cli.RedactionSentinelTests.test_path_key_allowlist_keeps_plain_paths_readable) ... ok
+test_sanitizer_redacts_full_corpus (tests.test_tinyhat_cli.RedactionSentinelTests.test_sanitizer_redacts_full_corpus) ... ok
+test_sentinel_can_fail (tests.test_tinyhat_cli.RedactionSentinelTests.test_sentinel_can_fail)
+The deliberately-failing leg: an identity transform MUST leak. ... ok
+test_dead_supervisor_is_visible (tests.test_tinyhat_cli.SnapshotTests.test_dead_supervisor_is_visible) ... ok
+test_freshness_fields_from_state_file (tests.test_tinyhat_cli.SnapshotTests.test_freshness_fields_from_state_file) ... ok
+test_missing_state_file (tests.test_tinyhat_cli.SnapshotTests.test_missing_state_file) ... ok
+test_commands_ring_then_missing_list_levers (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_commands_ring_then_missing_list_levers) ... ok
+test_log_lines_trim_before_commands_ring (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_log_lines_trim_before_commands_ring) ... ok
+test_missing_list_trim_sets_flag (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_missing_list_trim_sets_flag) ... ok
+test_oldest_lines_drop_first (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_oldest_lines_drop_first) ... ok
+test_small_payload_returned_unchanged (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_small_payload_returned_unchanged) ... ok
+test_trim_is_deterministic (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_trim_is_deterministic) ... ok
+test_worst_case_fixture_trims_to_budget (tests.test_tinyhat_cli.StatePayloadBudgetTests.test_worst_case_fixture_trims_to_budget) ... ok
+test_adapter_itself_reaches_openclaw (tests.test_extraction_guards.AdapterBoundaryGuardTests.test_adapter_itself_reaches_openclaw)
+Sanity: the adapter is where the literals actually live. ... ok
+test_no_openclaw_access_outside_adapter (tests.test_extraction_guards.AdapterBoundaryGuardTests.test_no_openclaw_access_outside_adapter) ... ok
+test_scanner_flags_a_violation (tests.test_extraction_guards.AdapterBoundaryGuardTests.test_scanner_flags_a_violation)
+Deliberate red fixture: prove the boundary scan CAN fail. ... ok
+test_every_mapped_name_is_a_delegating_reexport (tests.test_extraction_guards.ExtractionMapGuardTests.test_every_mapped_name_is_a_delegating_reexport)
+supervisor.<name> must BE the destination object (no copy). ... ok
+test_map_exists_and_is_well_formed (tests.test_extraction_guards.ExtractionMapGuardTests.test_map_exists_and_is_well_formed) ... ok
+test_no_duplicate_constant_assignment_in_supervisor (tests.test_extraction_guards.ExtractionMapGuardTests.test_no_duplicate_constant_assignment_in_supervisor) ... ok
+test_no_duplicate_live_implementation_in_supervisor (tests.test_extraction_guards.ExtractionMapGuardTests.test_no_duplicate_live_implementation_in_supervisor)
+A moved function may not keep a second `def` in supervisor.py. ... ok
+test_entrypoint_budget (tests.test_extraction_guards.LineBudgetGuardTests.test_entrypoint_budget) ... ok
+test_registry_budget (tests.test_extraction_guards.LineBudgetGuardTests.test_registry_budget) ... ok
+test_supervisor_whole_file_checkpoint (tests.test_extraction_guards.LineBudgetGuardTests.test_supervisor_whole_file_checkpoint) ... ok
+test_gateway_restart_deadline_covers_its_phases (tests.test_extraction_guards.RegistryContractGuardTests.test_gateway_restart_deadline_covers_its_phases)
+Declared deadline ≥ readiness bound + the stop/start allowance. ... ok
+test_gateway_restart_is_the_only_operate_command (tests.test_extraction_guards.RegistryContractGuardTests.test_gateway_restart_is_the_only_operate_command)
+The v0.12 release-blocking operate bar is exactly one command. ... ok
+test_registry_is_static_root_only_and_categorized (tests.test_extraction_guards.RegistryContractGuardTests.test_registry_is_static_root_only_and_categorized) ... ok
+test_registry_rejects_product_category (tests.test_extraction_guards.RegistryContractGuardTests.test_registry_rejects_product_category) ... ok
+test_acquire_writes_contract_status_record (tests.test_command_lock.CommandLockTransactionTests.test_acquire_writes_contract_status_record) ... ok
+test_contender_gets_typed_busy_and_never_mutates (tests.test_command_lock.CommandLockTransactionTests.test_contender_gets_typed_busy_and_never_mutates) ... ok
+test_deadline_kills_the_child_process_group (tests.test_command_lock.CommandLockTransactionTests.test_deadline_kills_the_child_process_group) ... ok
+test_exit_without_terminal_normalizes_to_failed (tests.test_command_lock.CommandLockTransactionTests.test_exit_without_terminal_normalizes_to_failed) ... ok
+test_idempotency_store_roundtrip_and_caps (tests.test_command_lock.CommandLockTransactionTests.test_idempotency_store_roundtrip_and_caps) ... ok
+test_lock_unavailable_without_root_or_override (tests.test_command_lock.CommandLockTransactionTests.test_lock_unavailable_without_root_or_override) ... ok
+test_result_store_accepts_arbitrarily_long_keys (tests.test_command_lock.CommandLockTransactionTests.test_result_store_accepts_arbitrarily_long_keys)
+Review finding: a 300-char key must not fail AFTER the mutation. ... ok
+test_result_store_keys_never_collide_after_encoding (tests.test_command_lock.CommandLockTransactionTests.test_result_store_keys_never_collide_after_encoding)
+Review finding: `a/b` and `ab` must never replay each other. ... ok
+test_run_subprocess_records_pgid_and_inherits_fd (tests.test_command_lock.CommandLockTransactionTests.test_run_subprocess_records_pgid_and_inherits_fd) ... ok
+test_stale_takeover_exposes_previous_non_terminal_record (tests.test_command_lock.CommandLockTransactionTests.test_stale_takeover_exposes_previous_non_terminal_record) ... ok
+test_append_then_shared_reader_roundtrip (tests.test_command_lock.CommandSpoolTests.test_append_then_shared_reader_roundtrip) ... ok
+test_corrupt_records_quarantine_bounded (tests.test_command_lock.CommandSpoolTests.test_corrupt_records_quarantine_bounded) ... 2026-06-18 10:48:04,159 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000000-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,159 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000001-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000002-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000003-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000004-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000005-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000006-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000007-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000008-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000009-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000010-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,160 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000011-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-18 10:48:04,161 WARNING tinyhat-supervisor: quarantining corrupt spool record /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpbli5bh1e/command-results/spool/000000000012-corrupt.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+ok
+test_prune_folded_removes_only_named_paths (tests.test_command_lock.CommandSpoolTests.test_prune_folded_removes_only_named_paths) ... ok
+test_record_size_is_bounded (tests.test_command_lock.CommandSpoolTests.test_record_size_is_bounded) ... ok
+test_redaction_failure_is_fail_closed (tests.test_command_lock.CommandSpoolTests.test_redaction_failure_is_fail_closed) ... ok
+test_spool_prunes_oldest_first (tests.test_command_lock.CommandSpoolTests.test_spool_prunes_oldest_first) ... ok
+test_daemon_write_folds_ring_prunes_spool_and_mirrors_events (tests.test_command_lock.CommandsRingFoldTests.test_daemon_write_folds_ring_prunes_spool_and_mirrors_events) ... ok
+test_fold_merges_dedupes_and_caps_at_five (tests.test_command_lock.CommandsRingFoldTests.test_fold_merges_dedupes_and_caps_at_five) ... ok
+test_busy_lock_answers_typed_with_exit_75 (tests.test_command_lock.GatewayRestartOperateCliTests.test_busy_lock_answers_typed_with_exit_75) ... 2026-06-18 10:48:04,201 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpwr3jw5pv/command-lock: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpwr3jw5pv/command-lock'
+ok
+test_daemon_defers_then_acquires_when_holder_releases (tests.test_command_lock.GatewayRestartOperateCliTests.test_daemon_defers_then_acquires_when_holder_releases)
+Case-1 shape, CI-sized: the daemon path waits out a holder. ... ok
+test_dev_container_refused_typed (tests.test_command_lock.GatewayRestartOperateCliTests.test_dev_container_refused_typed) ... ok
+test_explicit_idempotency_key_replays_without_execution (tests.test_command_lock.GatewayRestartOperateCliTests.test_explicit_idempotency_key_replays_without_execution) ... ok
+test_non_root_refused_before_any_lock_or_mutation (tests.test_command_lock.GatewayRestartOperateCliTests.test_non_root_refused_before_any_lock_or_mutation) ... ok
+test_operate_success_envelope_schema_valid_and_spooled (tests.test_command_lock.GatewayRestartOperateCliTests.test_operate_success_envelope_schema_valid_and_spooled) ... 2026-06-18 10:48:06,223 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-lock: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-lock'
+2026-06-18 10:48:06,225 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-results'
+2026-06-18 10:48:06,225 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-results/spool: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-results/spool'
+2026-06-18 10:48:06,225 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-lock/results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpyu1uz4m8/command-lock/results'
+ok
+test_repeated_run_restarts_again_with_fresh_key (tests.test_command_lock.GatewayRestartOperateCliTests.test_repeated_run_restarts_again_with_fresh_key) ... 2026-06-18 10:48:06,232 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock'
+2026-06-18 10:48:06,233 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results'
+2026-06-18 10:48:06,233 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results/spool: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results/spool'
+2026-06-18 10:48:06,233 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock/results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock/results'
+2026-06-18 10:48:06,238 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock'
+2026-06-18 10:48:06,239 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results'
+2026-06-18 10:48:06,239 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results/spool: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-results/spool'
+2026-06-18 10:48:06,240 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock/results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmp83lxmqhu/command-lock/results'
+ok
+test_operate_outputs_spool_and_fold_leak_nothing (tests.test_command_lock.OperateRedactionSentinelTests.test_operate_outputs_spool_and_fold_leak_nothing) ... 2026-06-18 10:48:06,245 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-lock: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-lock'
+2026-06-18 10:48:06,246 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-results'
+2026-06-18 10:48:06,246 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-results/spool: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-results/spool'
+2026-06-18 10:48:06,247 WARNING tinyhat-supervisor: failed to chown control-plane state dir /var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-lock/results: [Errno 1] Operation not permitted: '/var/folders/1w/s_3gg13n7bl0x3jg6xc4rtlw0000gn/T/tmpagbp667i/command-lock/results'
+ok
+test_operate_sentinel_can_fail (tests.test_command_lock.OperateRedactionSentinelTests.test_operate_sentinel_can_fail)
+A spool write that bypasses append_result MUST be caught. ... ok
+test_fifty_record_spool_merge_still_caps_the_ring_at_five (tests.test_command_lock.WorstCaseSpoolMergeBudgetTests.test_fifty_record_spool_merge_still_caps_the_ring_at_five)
+The §-budget premise: a full spool can never bloat the ring. ... ok
+test_framework_violation_wins_and_uses_the_true_enum (tests.test_capability_check.CapabilityDemotionTests.test_framework_violation_wins_and_uses_the_true_enum) ... ok
+test_ok_capabilities_never_demote (tests.test_capability_check.CapabilityDemotionTests.test_ok_capabilities_never_demote) ... ok
+test_only_healthy_is_ever_demoted (tests.test_capability_check.CapabilityDemotionTests.test_only_healthy_is_ever_demoted) ... ok
+test_partial_shortfall_maps_to_capability_shortfall (tests.test_capability_check.CapabilityDemotionTests.test_partial_shortfall_maps_to_capability_shortfall) ... ok
+test_plugin_not_loaded_maps_to_degraded_workload (tests.test_capability_check.CapabilityDemotionTests.test_plugin_not_loaded_maps_to_degraded_workload) ... ok
+test_zero_registration_maps_to_plugin_not_loaded (tests.test_capability_check.CapabilityDemotionTests.test_zero_registration_maps_to_plugin_not_loaded) ... ok
+test_cache_invalidates_on_every_later_gateway_restart (tests.test_capability_check.CapabilityVerificationTests.test_cache_invalidates_on_every_later_gateway_restart)
+Codex P1 regression: the lifecycle mark records first-boot-wins ... ok
+test_cache_invalidates_when_readiness_lands_in_the_same_second (tests.test_capability_check.CapabilityVerificationTests.test_cache_invalidates_when_readiness_lands_in_the_same_second)
+Codex P1 regression: integer-second timestamps made a ... ok
+test_cache_reuses_within_ttl_and_invalidates_on_gateway_start (tests.test_capability_check.CapabilityVerificationTests.test_cache_reuses_within_ttl_and_invalidates_on_gateway_start) ... ok
+test_checkout_manifest_stands_in_for_missing_extension_copy (tests.test_capability_check.CapabilityVerificationTests.test_checkout_manifest_stands_in_for_missing_extension_copy) ... ok
+test_cli_unavailable_with_fresh_covering_beacon_is_ok (tests.test_capability_check.CapabilityVerificationTests.test_cli_unavailable_with_fresh_covering_beacon_is_ok) ... ok
+test_cli_unavailable_with_no_beacon_reports_counts_not_names (tests.test_capability_check.CapabilityVerificationTests.test_cli_unavailable_with_no_beacon_reports_counts_not_names)
+The fallback never invents missing names. ... ok
+test_cli_unavailable_with_stale_beacon_is_a_shortfall (tests.test_capability_check.CapabilityVerificationTests.test_cli_unavailable_with_stale_beacon_is_a_shortfall) ... ok
+test_framework_below_minimum_is_out_of_range (tests.test_capability_check.CapabilityVerificationTests.test_framework_below_minimum_is_out_of_range) ... ok
+test_framework_in_range (tests.test_capability_check.CapabilityVerificationTests.test_framework_in_range) ... ok
+test_inspect_full_registration_is_ok (tests.test_capability_check.CapabilityVerificationTests.test_inspect_full_registration_is_ok) ... ok
+test_inspect_partial_registration_names_the_missing_tools (tests.test_capability_check.CapabilityVerificationTests.test_inspect_partial_registration_names_the_missing_tools) ... ok
+test_manifest_with_no_declared_surface_is_unverifiable (tests.test_capability_check.CapabilityVerificationTests.test_manifest_with_no_declared_surface_is_unverifiable) ... ok
+test_missing_list_caps_at_ten_names_and_flags_truncation (tests.test_capability_check.CapabilityVerificationTests.test_missing_list_caps_at_ten_names_and_flags_truncation) ... ok
+test_no_manifest_anywhere_means_no_block (tests.test_capability_check.CapabilityVerificationTests.test_no_manifest_anywhere_means_no_block) ... ok
+test_old_beacon_without_declared_listing_covers_by_version (tests.test_capability_check.CapabilityVerificationTests.test_old_beacon_without_declared_listing_covers_by_version) ... ok
+test_pre_beacon_plugin_with_broken_skills_still_shortfalls (tests.test_capability_check.CapabilityVerificationTests.test_pre_beacon_plugin_with_broken_skills_still_shortfalls)
+The on-disk skills check is mechanism-independent observed ... ok
+test_pre_contracts_skills_manifest_enumerates_disk (tests.test_capability_check.CapabilityVerificationTests.test_pre_contracts_skills_manifest_enumerates_disk)
+Older manifests declare no contracts.skills; the shipped ... ok
+test_registry_entry_without_tool_names_falls_to_self_check (tests.test_capability_check.CapabilityVerificationTests.test_registry_entry_without_tool_names_falls_to_self_check)
+An entry whose toolNames is empty exposes no tool-level data; ... ok
+test_registry_miss_with_fresh_beacon_is_self_check_ok (tests.test_capability_check.CapabilityVerificationTests.test_registry_miss_with_fresh_beacon_is_self_check_ok)
+The bound-canary reality (OpenClaw 2026.6.6): the CLI-side ... ok
+test_registry_miss_without_beacon_on_beacon_capable_plugin_shortfalls (tests.test_capability_check.CapabilityVerificationTests.test_registry_miss_without_beacon_on_beacon_capable_plugin_shortfalls) ... ok
+test_registry_miss_without_beacon_on_pre_beacon_plugin_is_unverifiable (tests.test_capability_check.CapabilityVerificationTests.test_registry_miss_without_beacon_on_pre_beacon_plugin_is_unverifiable)
+A plugin generation that predates the beacon cannot be ... ok
+test_unparseable_installed_version_is_unknown_not_violation (tests.test_capability_check.CapabilityVerificationTests.test_unparseable_installed_version_is_unknown_not_violation) ... ok
+test_unreadable_extension_dir_hides_all_skills (tests.test_capability_check.CapabilityVerificationTests.test_unreadable_extension_dir_hides_all_skills)
+Same class one level up: the extension dir itself 0700. ... ok
+test_unreadable_parent_hides_readable_leaf_skills (tests.test_capability_check.CapabilityVerificationTests.test_unreadable_parent_hides_readable_leaf_skills)
+Codex P1 regression: a root-owned 0700 skills ROOT with ... ok
+test_unreadable_skill_counts_as_unmounted_and_is_named (tests.test_capability_check.CapabilityVerificationTests.test_unreadable_skill_counts_as_unmounted_and_is_named) ... ok
+test_every_unit_declares_an_allowed_category (tests.test_capability_check.UnitCategoryAllowlistTests.test_every_unit_declares_an_allowed_category) ... ok
+test_scanner_flags_a_violation (tests.test_capability_check.UnitCategoryAllowlistTests.test_scanner_flags_a_violation)
+Deliberate red fixtures: prove the guard CAN fail. ... ok
+test_units_exist_to_guard (tests.test_capability_check.UnitCategoryAllowlistTests.test_units_exist_to_guard)
+Sanity: an empty walk would make the guard vacuous. ... ok
+test_write_path_folds_capabilities_and_demotes_shortfall (tests.test_capability_check.WriteRuntimeStateCapabilitiesTests.test_write_path_folds_capabilities_and_demotes_shortfall) ... ok
+test_write_path_includes_public_runtime_cache_status (tests.test_capability_check.WriteRuntimeStateCapabilitiesTests.test_write_path_includes_public_runtime_cache_status) ... ok
+test_write_path_stays_healthy_when_capabilities_ok (tests.test_capability_check.WriteRuntimeStateCapabilitiesTests.test_write_path_stays_healthy_when_capabilities_ok) ... ok
+test_attestation_is_non_secret_and_names_runtime_generation (tests.test_tiny_runtime.AttestationTests.test_attestation_is_non_secret_and_names_runtime_generation) ... ok
+test_assemble_bundle_round_trip (tests.test_tiny_runtime.BakeScriptTests.test_assemble_bundle_round_trip) ... ok
+test_bundle_id_is_content_addressed (tests.test_tiny_runtime.BundleManifestTests.test_bundle_id_is_content_addressed) ... ok
+test_bundle_lock_uses_pinned_public_refs (tests.test_tiny_runtime.BundleManifestTests.test_bundle_lock_uses_pinned_public_refs) ... ok
+test_dev_dockerfile_reads_component_refs_from_bundle_lock (tests.test_tiny_runtime.BundleManifestTests.test_dev_dockerfile_reads_component_refs_from_bundle_lock) ... ok
+test_activation_flips_current_symlink (tests.test_tiny_runtime.LauncherTests.test_activation_flips_current_symlink) ... ok
+test_activation_rolls_back_when_health_fails (tests.test_tiny_runtime.LauncherTests.test_activation_rolls_back_when_health_fails) ... ok
+test_adapter_itself_reaches_openclaw (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_itself_reaches_openclaw) ... ok
+test_adapter_prefers_bundle_local_openclaw_path (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_prefers_bundle_local_openclaw_path) ... ok
+test_adapter_reports_missing_openclaw_without_raising (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_reports_missing_openclaw_without_raising) ... ok
+test_adapter_uses_injected_runner_for_official_commands (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_uses_injected_runner_for_official_commands) ... ok
+test_no_openclaw_access_outside_adapter (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_no_openclaw_access_outside_adapter) ... ok
+test_scanner_flags_a_violation (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_scanner_flags_a_violation) ... ok
+test_client_only_builds_me_urls (tests.test_tiny_runtime.PlatformClientTests.test_client_only_builds_me_urls) ... ok
+test_attestation_unit_uses_stable_current_path (tests.test_tiny_runtime.SystemdUnitTests.test_attestation_unit_uses_stable_current_path) ... ok
+test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot (tests.test_tiny_runtime.SystemdUnitTests.test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot) ... ok
+
+----------------------------------------------------------------------
+Ran 405 tests in 6.645s
+
+OK

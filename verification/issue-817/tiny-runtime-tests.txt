@@ -1,0 +1,22 @@
+$ python -m unittest tests.test_tiny_runtime -v
+test_attestation_is_non_secret_and_names_runtime_generation (tests.test_tiny_runtime.AttestationTests.test_attestation_is_non_secret_and_names_runtime_generation) ... ok
+test_assemble_bundle_round_trip (tests.test_tiny_runtime.BakeScriptTests.test_assemble_bundle_round_trip) ... ok
+test_bundle_id_is_content_addressed (tests.test_tiny_runtime.BundleManifestTests.test_bundle_id_is_content_addressed) ... ok
+test_bundle_lock_uses_pinned_public_refs (tests.test_tiny_runtime.BundleManifestTests.test_bundle_lock_uses_pinned_public_refs) ... ok
+test_dev_dockerfile_reads_component_refs_from_bundle_lock (tests.test_tiny_runtime.BundleManifestTests.test_dev_dockerfile_reads_component_refs_from_bundle_lock) ... ok
+test_activation_flips_current_symlink (tests.test_tiny_runtime.LauncherTests.test_activation_flips_current_symlink) ... ok
+test_activation_rolls_back_when_health_fails (tests.test_tiny_runtime.LauncherTests.test_activation_rolls_back_when_health_fails) ... ok
+test_adapter_itself_reaches_openclaw (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_itself_reaches_openclaw) ... ok
+test_adapter_prefers_bundle_local_openclaw_path (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_prefers_bundle_local_openclaw_path) ... ok
+test_adapter_reports_missing_openclaw_without_raising (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_reports_missing_openclaw_without_raising) ... ok
+test_adapter_uses_injected_runner_for_official_commands (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_adapter_uses_injected_runner_for_official_commands) ... ok
+test_no_openclaw_access_outside_adapter (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_no_openclaw_access_outside_adapter) ... ok
+test_scanner_flags_a_violation (tests.test_tiny_runtime.OpenClawAdapterBoundaryTests.test_scanner_flags_a_violation) ... ok
+test_client_only_builds_me_urls (tests.test_tiny_runtime.PlatformClientTests.test_client_only_builds_me_urls) ... ok
+test_attestation_unit_uses_stable_current_path (tests.test_tiny_runtime.SystemdUnitTests.test_attestation_unit_uses_stable_current_path) ... ok
+test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot (tests.test_tiny_runtime.SystemdUnitTests.test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.197s
+
+OK
