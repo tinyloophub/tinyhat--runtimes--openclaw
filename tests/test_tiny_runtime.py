@@ -81,6 +81,17 @@ class BundleManifestTests(unittest.TestCase):
             dockerfile,
         )
 
+    def test_legacy_dev_dockerfile_uses_locked_openclaw_and_runtime_packages(
+        self,
+    ) -> None:
+        dockerfile = (_REPO_ROOT / "dev" / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("tiny_runtime/bake/bundle.lock", dockerfile)
+        self.assertIn("OPENCLAW_INSTALL_SPEC", dockerfile)
+        self.assertNotIn("npm install -g openclaw@latest", dockerfile)
+        self.assertIn("COPY tiny_runtime ./tiny_runtime", dockerfile)
+        self.assertIn("COPY tinyhat_cli ./tinyhat_cli", dockerfile)
+
 
 class LauncherTests(unittest.TestCase):
     def test_activation_flips_current_symlink(self) -> None:
@@ -417,6 +428,144 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             )
             self.assertEqual(mirror["idempotency_key"], "original-key")
             self.assertEqual(mirror["spec"]["reason"], "original")
+
+    def test_apply_config_command_hot_reloads_without_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            get_paths: list[str] = []
+            applied: list[dict] = []
+
+            def fake_get_json(path: str) -> dict:
+                get_paths.append(path)
+                return {
+                    "revision": 5,
+                    "secrets": {"OPENAI_API_KEY": "sk-test-secret"},
+                }
+
+            def fake_apply_runtime_config(**kwargs) -> dict:
+                applied.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": len(kwargs["secrets"]),
+                    "reload": {"reloaded": True},
+                    "env_block_changed": False,
+                }
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                platform_get_json=fake_get_json,
+                apply_runtime_config=fake_apply_runtime_config,
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-apply",
+                    "idempotency_key": "idem-apply",
+                    "kind": "apply_config",
+                    "spec": {
+                        "desired_config_revision": 5,
+                        "reason": "credential_save",
+                        "hot_required": True,
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "hot_reloaded")
+            self.assertEqual(get_paths, ["/hapi/v1/computers/me/runtime-secrets"])
+            self.assertEqual(applied[0]["revision"], 5)
+            self.assertEqual(
+                applied[0]["secrets"],
+                {"OPENAI_API_KEY": "sk-test-secret"},
+            )
+            self.assertFalse(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_apply_config_command_fails_closed_when_hot_path_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                platform_get_json=lambda _path: {
+                    "revision": 9,
+                    "secrets": {"EXA_API_KEY": "exa-test-secret"},
+                },
+                apply_runtime_config=lambda **_kwargs: {
+                    "revision": 9,
+                    "secret_count": 1,
+                    "reload": {"reloaded": True},
+                    "env_block_changed": True,
+                },
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-apply-unsupported",
+                    "idempotency_key": "idem-apply-unsupported",
+                    "kind": "apply_config",
+                    "spec": {
+                        "desired_config_revision": 9,
+                        "reason": "credential_save",
+                        "hot_required": True,
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "config_apply_failed")
+            self.assertEqual(result["phase"], "unsupported_interface")
+            self.assertEqual(result["result"]["failure_label"], "unsupported_interface")
+            self.assertFalse(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_link_chatgpt_command_starts_device_code_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            starts: list[dict] = []
+
+            def fake_start(spec: dict) -> dict:
+                starts.append(spec)
+                return {"state": "started", "session_id": spec["session_id"]}
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                start_chatgpt_link=fake_start,
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-link",
+                    "idempotency_key": "idem-link",
+                    "kind": "link_chatgpt",
+                    "spec": {
+                        "session_id": "sess-123",
+                        "provider": "openai",
+                        "model_ref": "openai/gpt-5.5",
+                        "auth_flow": "device_code",
+                        "required_final_auth_path": "chatgpt_subscription",
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "device_code_started")
+            self.assertEqual(starts[0]["session_id"], "sess-123")
+            self.assertEqual(starts[0]["required_final_auth_path"], "chatgpt_subscription")
+            self.assertFalse(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
 
     def test_activate_bundle_command_rolls_back_on_health_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

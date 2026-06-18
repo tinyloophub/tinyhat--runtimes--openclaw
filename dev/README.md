@@ -52,15 +52,18 @@ docker build -f dev/Dockerfile -t tinyhat-openclaw-runtime:dev .
 ```
 
 The image is `node:22-slim` (OpenClaw declares `engines.node
->=22.19`) + git + the latest `openclaw` npm package + `supervisor.py`
-and a non-root `tinyhat` user. The Tinyhat OpenClaw plugin is cloned
-from the public repo/ref in `TINYHAT_PLATFORM_PLUGIN_REPO_URL` /
-`TINYHAT_PLATFORM_PLUGIN_REPO_REF` when the supervisor installs the
+>=22.19`) + git + the `openclaw` npm package pinned in
+`tiny_runtime/bake/bundle.lock` + `supervisor.py` / `tiny_runtime` /
+`tinyhat_cli` + a non-root `tinyhat` user. The Tinyhat OpenClaw plugin
+is cloned from the public repo/ref in `TINYHAT_PLATFORM_PLUGIN_REPO_URL`
+/ `TINYHAT_PLATFORM_PLUGIN_REPO_REF` when the supervisor installs the
 gateway config; it is not bundled in this image. `openclaw --version`
-runs immediately after the `npm install -g openclaw@latest` step as a
-build-time smoke check, so a future engine-floor bump fails the build
-instead of the first `docker run`. First build is slow (~600MB,
-~2min); subsequent builds cache the npm layer.
+runs immediately after the locked `npm install -g` step as a build-time
+smoke check, so a future engine-floor bump fails the build instead of
+the first `docker run`, and Docker cache cannot keep testing an older
+`openclaw@latest` layer than the bundle records. First build is slow
+(~600MB, ~2min); subsequent builds cache the npm layer until the lock
+file changes.
 
 ## Smoke the ChatGPT link retry
 

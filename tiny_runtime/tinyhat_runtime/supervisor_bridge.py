@@ -23,6 +23,9 @@ def handle_runtime_command(
     command: dict[str, Any],
     *,
     post_json: Callable[[str, dict[str, Any]], dict[str, Any]],
+    get_json: Callable[[str], dict[str, Any]] | None = None,
+    apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
+    start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     logger: logging.Logger,
     runner: RuntimeCommandRunner | None = None,
 ) -> None:
@@ -35,7 +38,12 @@ def handle_runtime_command(
             if key not in {"type", "revision"}
         }
     try:
-        result = (runner or RuntimeCommandRunner()).execute(runtime_command)
+        runtime_runner = runner or RuntimeCommandRunner(
+            platform_get_json=get_json,
+            apply_runtime_config=apply_runtime_config,
+            start_chatgpt_link=start_chatgpt_link,
+        )
+        result = runtime_runner.execute(runtime_command)
     except Exception as exc:  # noqa: BLE001 - command boundary
         logger.warning("runtime command execution failed before result: %s", exc)
         result = _runtime_command_failure_result(runtime_command, exc)
