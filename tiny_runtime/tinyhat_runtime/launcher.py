@@ -91,6 +91,8 @@ def activate_bundle(
         if not ok:
             _restore_link(current_link, previous)
             if start_command:
+                # Best effort: after restoring the old target, try to bring the
+                # gateway back even though the original start command failed.
                 _run_command(start_command, timeout=timeout)
             return ActivationResult(
                 activated=False,
@@ -109,6 +111,8 @@ def activate_bundle(
                 _run_command(stop_command, timeout=timeout)
             _restore_link(current_link, previous)
             if start_command:
+                # Best effort: activation has failed, so prefer attempting to
+                # restart the previous target over leaving the gateway stopped.
                 _run_command(start_command, timeout=timeout)
             return ActivationResult(
                 activated=False,

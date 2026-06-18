@@ -137,9 +137,13 @@ def _redact_zip_member(name: str, data: bytes) -> bytes:
             json.dumps(redact_json(payload), indent=2, sort_keys=True)
             + "\n"
         ).encode("utf-8")
-    if lowered.endswith((".md", ".txt", ".log")):
-        return redact_text(data.decode("utf-8", errors="replace")).encode("utf-8")
-    return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return b"[binary omitted by Tinyhat diagnostics redaction]\n"
+    if "\x00" in text:
+        return b"[binary omitted by Tinyhat diagnostics redaction]\n"
+    return redact_text(text).encode("utf-8")
 
 
 def redact_diagnostics_zip(path: Path) -> list[str]:

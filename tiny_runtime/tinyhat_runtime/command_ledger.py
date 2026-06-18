@@ -212,8 +212,12 @@ class CommandLedger:
         command_dir.mkdir(parents=True, exist_ok=True)
         target = command_dir / "command.json"
         tmp = command_dir / ".command.json.tmp"
-        tmp.write_text(_canonical_json(payload), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(_canonical_json(payload))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, target)
+        _fsync_dir(command_dir)
         self._upsert_index(payload, on_box_path=target)
 
     def _connect(self) -> sqlite3.Connection:
@@ -302,3 +306,16 @@ class CommandLedger:
             connection.commit()
         finally:
             connection.close()
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

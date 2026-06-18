@@ -27,6 +27,7 @@ ALLOWED_COMMAND_KINDS = frozenset(
 FAILURE_CODES = frozenset(
     {
         "activation_failed",
+        "attestation_failed",
         "attestation_mismatch",
         "bundle_not_found",
         "bundle_verification_failed",
@@ -258,7 +259,23 @@ class RuntimeCommandRunner:
             )
 
         self.ledger.update(command_id, status="running", phase="attest")
-        attestation_doc = self._current_attestation()
+        try:
+            attestation_doc = self._current_attestation()
+        except Exception as exc:  # noqa: BLE001 - rollback gate
+            rollback = self._rollback_to_previous(result.previous_target)
+            result_payload["attestation_error"] = redact_text(str(exc), limit=1000)
+            result_payload["rollback"] = rollback.__dict__ if rollback else None
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if rollback and rollback.activated else "failed",
+                phase="attestation_gate",
+                failure_code=(
+                    "attestation_failed" if rollback and rollback.activated else "rollback_failed"
+                ),
+                result=result_payload,
+            )
         result_payload["attestation"] = attestation_doc
         if attestation_doc.get("bundle_id") != expected_bundle_id:
             rollback = self._rollback_to_previous(result.previous_target)

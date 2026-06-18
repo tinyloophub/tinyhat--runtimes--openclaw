@@ -33,7 +33,21 @@ def redact_json(value: Any) -> Any:
         out: dict[str, Any] = {}
         for key, item in value.items():
             lowered = str(key).lower()
-            if any(marker in lowered for marker in ("token", "secret", "password", "key")):
+            if any(
+                marker in lowered
+                for marker in (
+                    "token",
+                    "secret",
+                    "password",
+                    "key",
+                    "authorization",
+                    "cookie",
+                    "credential",
+                    "private_key",
+                    "identity_token",
+                    "signed_url",
+                )
+            ):
                 out[str(key)] = "[REDACTED]"
             else:
                 out[str(key)] = redact_json(item)

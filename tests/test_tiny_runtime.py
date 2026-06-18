@@ -159,6 +159,51 @@ class LauncherTests(unittest.TestCase):
             self.assertTrue(result.activated)
             self.assertEqual(events.read_text(encoding="utf-8"), "stop\nstart\nhealth\n")
 
+    def test_activation_health_failure_restarts_previous_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            previous = base / "previous"
+            candidate = base / "candidate"
+            previous.mkdir()
+            candidate.mkdir()
+            _write_minimal_bundle(candidate)
+            current = base / "current"
+            os.symlink(previous, current)
+            events = base / "events.log"
+            append_event = (
+                "from pathlib import Path; "
+                f"p=Path({str(events)!r}); "
+                "p.write_text((p.read_text() if p.exists() else '') + EVENT + '\\n')"
+            )
+
+            result = launcher.activate_bundle(
+                candidate,
+                current_link=current,
+                stop_command=[
+                    sys.executable,
+                    "-c",
+                    f"EVENT='stop'; {append_event}",
+                ],
+                start_command=[
+                    sys.executable,
+                    "-c",
+                    f"EVENT='start'; {append_event}",
+                ],
+                health_command=[
+                    sys.executable,
+                    "-c",
+                    f"EVENT='health'; {append_event}; raise SystemExit(9)",
+                ],
+            )
+
+            self.assertFalse(result.activated)
+            self.assertTrue(result.rolled_back)
+            self.assertEqual(os.readlink(current), str(previous))
+            self.assertEqual(
+                events.read_text(encoding="utf-8"),
+                "stop\nstart\nhealth\nstop\nstart\n",
+            )
+
 
 class CommandLedgerTests(unittest.TestCase):
     def test_mirror_writes_user_json_and_sqlite_index(self) -> None:
@@ -403,6 +448,52 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(os.readlink(current), str(previous))
             self.assertNotEqual(os.readlink(current), str(target.resolve()))
 
+    def test_activate_bundle_rolls_back_when_attestation_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _previous_manifest = _install_bundle_under_id(
+                bundles,
+                base / "previous",
+                marker="previous-attestation",
+            )
+            _target, manifest = _install_bundle_under_id(
+                bundles,
+                base / "candidate",
+                marker="candidate-attestation",
+            )
+            current = base / "current"
+            os.symlink(previous, current)
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            def raise_attestation():
+                raise RuntimeError("attestation token=secret-token-value failed")
+
+            runner._current_attestation = raise_attestation  # type: ignore[method-assign]
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-attestation-rollback",
+                    "idempotency_key": "idem-attestation-rollback",
+                    "kind": "activate_bundle",
+                    "spec": {"bundle_id": manifest["bundle_id"]},
+                }
+            )
+
+            self.assertEqual(result["status"], "rolled_back")
+            self.assertEqual(result["failure_code"], "attestation_failed")
+            self.assertEqual(Path(os.readlink(current)).resolve(), previous.resolve())
+            encoded = json.dumps(result)
+            self.assertNotIn("secret-token-value", encoded)
+
 
 class DiagnosticsExportTests(unittest.TestCase):
     def test_export_diagnostics_uses_official_command_and_redacts_zip(self) -> None:
@@ -417,9 +508,21 @@ class DiagnosticsExportTests(unittest.TestCase):
                 out = Path(argv[argv.index("--output") + 1])
                 with zipfile.ZipFile(out, "w") as zf:
                     zf.writestr("summary.md", "token=secret-token-value\n")
+                    zf.writestr("config.yaml", "api_key=sk-live-secret-value\n")
+                    zf.writestr("env.conf", "authorization=Bearer abcdefghijklmno\n")
+                    zf.writestr("rotated.log.1", "token=tskey-auth-secret-value\n")
+                    zf.writestr("nostate", "secret=raw-secret-value-12345\n")
+                    zf.writestr("binary.bin", b"\x00secret-token-value\x00")
                     zf.writestr(
                         "diagnostics.json",
-                        json.dumps({"state": "healthy", "token": "secret-token-value"}),
+                        json.dumps(
+                            {
+                                "state": "healthy",
+                                "token": "secret-token-value",
+                                "authorization": "Basic abcdefghijklmno",
+                                "cookie": "session=abcdefghijklmno",
+                            }
+                        ),
                     )
                     zf.writestr("manifest.json", json.dumps({"schema": "fake"}))
                     zf.writestr("health/gateway.json", json.dumps({"status": "healthy"}))
@@ -438,6 +541,11 @@ class DiagnosticsExportTests(unittest.TestCase):
 
             self.assertEqual(payload["state"], "ready")
             self.assertIn("summary.md", payload["entries"])
+            self.assertIn("config.yaml", payload["entries"])
+            self.assertIn("env.conf", payload["entries"])
+            self.assertIn("rotated.log.1", payload["entries"])
+            self.assertIn("nostate", payload["entries"])
+            self.assertIn("binary.bin", payload["entries"])
             self.assertIn("diagnostics.json", payload["entries"])
             self.assertIn("manifest.json", payload["entries"])
             self.assertIn("health/gateway.json", payload["entries"])
@@ -448,6 +556,13 @@ class DiagnosticsExportTests(unittest.TestCase):
                     for name in zf.namelist()
                 )
             self.assertNotIn("secret-token-value", encoded)
+            self.assertNotIn("sk-live-secret-value", encoded)
+            self.assertNotIn("Bearer abcdefghijklmno", encoded)
+            self.assertNotIn("tskey-auth-secret-value", encoded)
+            self.assertNotIn("raw-secret-value-12345", encoded)
+            self.assertNotIn("Basic abcdefghijklmno", encoded)
+            self.assertNotIn("session=abcdefghijklmno", encoded)
+            self.assertIn("[binary omitted by Tinyhat diagnostics redaction]", encoded)
 
 
 class AttestationTests(unittest.TestCase):
