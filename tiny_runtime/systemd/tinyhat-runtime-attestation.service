@@ -1,0 +1,13 @@
+[Unit]
+Description=Tinyhat tiny_runtime attestation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/tinyhat/runtime.env
+WorkingDirectory=/opt/tinyhat/current
+ExecStart=/opt/tinyhat/current/bin/tinyhat-attest --output /var/lib/tinyhat/runtime/attestation.json
+
+[Install]
+WantedBy=multi-user.target

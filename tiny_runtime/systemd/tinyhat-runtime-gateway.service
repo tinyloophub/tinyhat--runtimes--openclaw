@@ -1,0 +1,15 @@
+[Unit]
+Description=Tinyhat OpenClaw gateway
+Wants=network-online.target tinyhat-runtime-attestation.service
+After=network-online.target tinyhat-runtime-attestation.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/tinyhat/runtime.env
+WorkingDirectory=/opt/tinyhat/current
+ExecStart=/opt/tinyhat/current/bin/tinyhat-runtime gateway run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

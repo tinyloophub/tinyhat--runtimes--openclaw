@@ -1,0 +1,6 @@
+{
+  "computer_id": "dev-computer",
+  "assignment_id": "dev-assignment",
+  "runtime_ref": "tiny-runtime-m1",
+  "platform_base_url": "https://platform.example.invalid"
+}
