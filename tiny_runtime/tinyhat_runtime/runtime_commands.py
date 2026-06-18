@@ -456,12 +456,17 @@ class RuntimeCommandRunner:
         self.ledger.update(command_id, status="running", phase="start_device_code")
         start = self.start_chatgpt_link(
             {
+                "type": "start_chatgpt_link",
                 "session_id": session_id,
                 "provider": provider,
                 "model_ref": model_ref,
-                "required_final_auth_path": required_auth_path,
+                "reason": "runtime_command_link_chatgpt",
             }
-        )
+        ) or {
+            "state": "started",
+            "session_id": session_id,
+            "worker": "openclaw_device_code",
+        }
         return self._finish(
             command_id=command_id,
             idempotency_key=idempotency_key,

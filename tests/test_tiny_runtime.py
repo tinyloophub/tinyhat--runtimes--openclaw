@@ -562,8 +562,9 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "applied")
             self.assertEqual(result["phase"], "device_code_started")
+            self.assertEqual(starts[0]["type"], "start_chatgpt_link")
             self.assertEqual(starts[0]["session_id"], "sess-123")
-            self.assertEqual(starts[0]["required_final_auth_path"], "chatgpt_subscription")
+            self.assertEqual(starts[0]["reason"], "runtime_command_link_chatgpt")
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 

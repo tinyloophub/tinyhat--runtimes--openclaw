@@ -6440,29 +6440,12 @@ def handle_runtime_command(command: dict) -> None:
     """Execute a typed ``tiny_runtime`` command delivered by heartbeat."""
     from tiny_runtime.tinyhat_runtime.supervisor_bridge import handle_runtime_command as bridge
 
-    def _start_chatgpt_link_from_runtime(spec: dict[str, Any]) -> dict[str, Any]:
-        session_id = str(spec.get("session_id") or "").strip()
-        handle_start_chatgpt_link_command(
-            {
-                "type": "start_chatgpt_link",
-                "session_id": session_id,
-                "provider": spec.get("provider") or CHATGPT_SUBSCRIPTION_PROVIDER,
-                "model_ref": spec.get("model_ref") or CHATGPT_SUBSCRIPTION_MODEL,
-                "reason": "runtime_command_link_chatgpt",
-            }
-        )
-        return {
-            "state": "started",
-            "session_id": session_id,
-            "worker": "openclaw_device_code",
-        }
-
     bridge(
         command,
         post_json=post_json,
         get_json=get_json,
         apply_runtime_config=apply_runtime_secret_map,
-        start_chatgpt_link=_start_chatgpt_link_from_runtime,
+        start_chatgpt_link=handle_start_chatgpt_link_command,
         logger=log,
     )
 
