@@ -9,10 +9,13 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -20,15 +23,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "tiny_runtime"))
 
 from tinyhat_runtime import RUNTIME_GENERATION  # noqa: E402
-from tinyhat_runtime import attestation, bundle, launcher  # noqa: E402
+from tinyhat_runtime import attestation, bundle, launcher, openclaw_adapter  # noqa: E402
+from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
 from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
+from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
 
 
-def _write_minimal_bundle(root: Path) -> dict:
+def _write_minimal_bundle(root: Path, *, marker: str = "") -> dict:
     (root / "bin").mkdir(parents=True)
     (root / "bin" / "tinyhat-runtime").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (root / "tinyhat_runtime").mkdir()
     (root / "tinyhat_runtime" / "__init__.py").write_text("", encoding="utf-8")
+    if marker:
+        (root / "bundle-marker.txt").write_text(marker, encoding="utf-8")
     return bundle.write_manifest(
         root,
         components={
@@ -115,6 +122,332 @@ class LauncherTests(unittest.TestCase):
             self.assertFalse(result.activated)
             self.assertTrue(result.rolled_back)
             self.assertEqual(os.readlink(current), str(previous))
+
+    def test_activation_stops_flips_starts_then_checks_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            candidate = base / "candidate"
+            candidate.mkdir()
+            _write_minimal_bundle(candidate)
+            current = base / "current"
+            events = base / "events.log"
+
+            result = launcher.activate_bundle(
+                candidate,
+                current_link=current,
+                stop_command=[
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(events)!r}).write_text('stop\\n')",
+                ],
+                start_command=[
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(events)!r}).write_text(Path({str(events)!r}).read_text() + 'start\\n')",
+                ],
+                health_command=[
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, pathlib; "
+                        f"assert os.readlink({str(current)!r}) == {str(candidate.resolve())!r}; "
+                        f"pathlib.Path({str(events)!r}).write_text(pathlib.Path({str(events)!r}).read_text() + 'health\\n')"
+                    ),
+                ],
+            )
+
+            self.assertTrue(result.activated)
+            self.assertEqual(events.read_text(encoding="utf-8"), "stop\nstart\nhealth\n")
+
+
+class CommandLedgerTests(unittest.TestCase):
+    def test_mirror_writes_user_json_and_sqlite_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = CommandLedger(root=root)
+            command = {
+                "command_id": "cmd-123",
+                "idempotency_key": "idem-123",
+                "kind": "export_diagnostics",
+                "spec": {"token": "secret-token-value", "reason": "admin-request"},
+            }
+
+            ledger.mirror(command)
+            ledger.update(
+                "cmd-123",
+                status="applied",
+                phase="exported",
+                result={"output_path": "/var/log/tinyhat/diagnostics/cmd-123.zip"},
+            )
+
+            command_json = root / "cmd-123" / "command.json"
+            self.assertTrue(command_json.exists())
+            encoded = command_json.read_text(encoding="utf-8")
+            self.assertNotIn("secret-token-value", encoded)
+            self.assertIn('"status": "applied"', encoded)
+
+            connection = sqlite3.connect(root / "commands.sqlite")
+            try:
+                row = connection.execute(
+                    "SELECT command_id, kind, status, phase, on_box_path FROM commands"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                row,
+                (
+                    "cmd-123",
+                    "export_diagnostics",
+                    "applied",
+                    "exported",
+                    str(command_json),
+                ),
+            )
+
+
+def _install_bundle_under_id(
+    bundles_dir: Path,
+    source_dir: Path,
+    *,
+    marker: str = "",
+) -> tuple[Path, dict]:
+    manifest = _write_minimal_bundle(source_dir, marker=marker)
+    target = bundles_dir / manifest["bundle_id"].removeprefix("sha256:")
+    shutil.move(str(source_dir), target)
+    return target, manifest
+
+
+class RuntimeCommandRunnerTests(unittest.TestCase):
+    def test_activate_bundle_command_applies_and_mirrors_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, manifest = _install_bundle_under_id(bundles, base / "candidate")
+            current = base / "current"
+            ledger = CommandLedger(root=base / "commands")
+            runner = RuntimeCommandRunner(
+                ledger=ledger,
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-activate",
+                    "idempotency_key": "idem-activate",
+                    "kind": "activate_bundle",
+                    "spec": {"bundle_id": manifest["bundle_id"]},
+                }
+            )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(os.readlink(current), str(target.resolve()))
+            mirror = json.loads(
+                (base / "commands" / "cmd-activate" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["status"], "applied")
+
+    def test_cancel_requested_command_stops_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            _target, manifest = _install_bundle_under_id(
+                bundles,
+                base / "candidate",
+                marker="cancel-candidate",
+            )
+            current = base / "current"
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-cancel",
+                    "idempotency_key": "idem-cancel",
+                    "kind": "activate_bundle",
+                    "cancel_requested_at": "2026-06-18T18:00:00Z",
+                    "spec": {"bundle_id": manifest["bundle_id"]},
+                }
+            )
+
+            self.assertEqual(result["status"], "canceled")
+            self.assertFalse(current.exists())
+            mirror = json.loads(
+                (base / "commands" / "cmd-cancel" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["status"], "canceled")
+
+    def test_duplicate_terminal_command_is_local_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ledger = CommandLedger(root=base / "commands")
+            ledger.mirror(
+                {
+                    "command_id": "cmd-duplicate",
+                    "idempotency_key": "idem-duplicate",
+                    "kind": "export_diagnostics",
+                    "spec": {},
+                }
+            )
+            ledger.update("cmd-duplicate", status="applied", phase="exported")
+            runner = RuntimeCommandRunner(
+                ledger=ledger,
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-duplicate",
+                    "idempotency_key": "idem-duplicate",
+                    "kind": "export_diagnostics",
+                    "spec": {},
+                }
+            )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertTrue(result["result"]["duplicate"])
+
+    def test_idempotency_mismatch_does_not_overwrite_original_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ledger = CommandLedger(root=base / "commands")
+            ledger.mirror(
+                {
+                    "command_id": "cmd-mismatch",
+                    "idempotency_key": "original-key",
+                    "kind": "export_diagnostics",
+                    "spec": {"reason": "original"},
+                }
+            )
+            runner = RuntimeCommandRunner(
+                ledger=ledger,
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-mismatch",
+                    "idempotency_key": "other-key",
+                    "kind": "export_diagnostics",
+                    "spec": {"reason": "conflicting"},
+                }
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "idempotency_mismatch")
+            mirror = json.loads(
+                (base / "commands" / "cmd-mismatch" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["idempotency_key"], "original-key")
+            self.assertEqual(mirror["spec"]["reason"], "original")
+
+    def test_activate_bundle_command_rolls_back_on_health_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _previous_manifest = _install_bundle_under_id(
+                bundles,
+                base / "previous",
+                marker="previous",
+            )
+            target, manifest = _install_bundle_under_id(
+                bundles,
+                base / "candidate",
+                marker="candidate",
+            )
+            current = base / "current"
+            os.symlink(previous, current)
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                health_command=[sys.executable, "-c", "raise SystemExit(9)"],
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-rollback",
+                    "idempotency_key": "idem-rollback",
+                    "kind": "activate_bundle",
+                    "spec": {"bundle_id": manifest["bundle_id"]},
+                }
+            )
+
+            self.assertEqual(result["status"], "rolled_back")
+            self.assertEqual(os.readlink(current), str(previous))
+            self.assertNotEqual(os.readlink(current), str(target.resolve()))
+
+
+class DiagnosticsExportTests(unittest.TestCase):
+    def test_export_diagnostics_uses_official_command_and_redacts_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "diagnostics.zip"
+
+            def runner(argv, **_kwargs):
+                self.assertEqual(
+                    argv[:4],
+                    ["openclaw", "gateway", "diagnostics", "export"],
+                )
+                out = Path(argv[argv.index("--output") + 1])
+                with zipfile.ZipFile(out, "w") as zf:
+                    zf.writestr("summary.md", "token=secret-token-value\n")
+                    zf.writestr(
+                        "diagnostics.json",
+                        json.dumps({"state": "healthy", "token": "secret-token-value"}),
+                    )
+                    zf.writestr("manifest.json", json.dumps({"schema": "fake"}))
+                    zf.writestr("health/gateway.json", json.dumps({"status": "healthy"}))
+                    zf.writestr("stability/latest.json", json.dumps({"status": "stable"}))
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps({"output": str(out), "token": "secret-token-value"}),
+                    stderr="",
+                )
+
+            payload = openclaw_adapter.export_diagnostics(
+                output_path=output,
+                runner=runner,
+            )
+
+            self.assertEqual(payload["state"], "ready")
+            self.assertIn("summary.md", payload["entries"])
+            self.assertIn("diagnostics.json", payload["entries"])
+            self.assertIn("manifest.json", payload["entries"])
+            self.assertIn("health/gateway.json", payload["entries"])
+            self.assertIn("stability/latest.json", payload["entries"])
+            with zipfile.ZipFile(output, "r") as zf:
+                encoded = "\n".join(
+                    zf.read(name).decode("utf-8", errors="replace")
+                    for name in zf.namelist()
+                )
+            self.assertNotIn("secret-token-value", encoded)
 
 
 class AttestationTests(unittest.TestCase):

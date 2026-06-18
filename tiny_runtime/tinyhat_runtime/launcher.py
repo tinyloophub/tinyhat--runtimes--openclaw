@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import bundle, paths
+from .redaction import redact_text
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class ActivationResult:
     target: str
     previous_target: str | None
     rolled_back: bool
+    phase: str
     diagnostic: str
 
 
@@ -36,38 +38,86 @@ def _readlink_or_none(path: Path) -> str | None:
     return None
 
 
+def _run_command(command: Sequence[str], *, timeout: int) -> tuple[bool, str]:
+    completed = subprocess.run(
+        list(command),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    detail = (completed.stderr or completed.stdout or "").strip()
+    if completed.returncode == 0:
+        return True, detail or "ok"
+    return False, redact_text(detail or f"command exited {completed.returncode}", limit=1000)
+
+
+def _restore_link(link: Path, previous: str | None) -> None:
+    if previous is not None:
+        _replace_symlink(link, Path(previous))
+    else:
+        link.unlink(missing_ok=True)
+
+
 def activate_bundle(
     bundle_dir: Path,
     *,
     current_link: Path = paths.CURRENT_LINK,
+    stop_command: Sequence[str] | None = None,
+    start_command: Sequence[str] | None = None,
     health_command: Sequence[str] | None = None,
     timeout: int = 30,
 ) -> ActivationResult:
     manifest = bundle.load_manifest(bundle_dir)
     bundle.verify_manifest(bundle_dir, manifest)
     previous = _readlink_or_none(current_link)
+    if stop_command:
+        ok, detail = _run_command(stop_command, timeout=timeout)
+        if not ok:
+            return ActivationResult(
+                activated=False,
+                bundle_id=str(manifest["bundle_id"]),
+                target=str(bundle_dir.resolve()),
+                previous_target=previous,
+                rolled_back=False,
+                phase="stop",
+                diagnostic=detail,
+            )
+
     _replace_symlink(current_link, bundle_dir.resolve())
 
-    if health_command:
-        completed = subprocess.run(
-            list(health_command),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        if completed.returncode != 0:
-            if previous is not None:
-                _replace_symlink(current_link, Path(previous))
-            else:
-                current_link.unlink(missing_ok=True)
+    if start_command:
+        ok, detail = _run_command(start_command, timeout=timeout)
+        if not ok:
+            _restore_link(current_link, previous)
+            if start_command:
+                _run_command(start_command, timeout=timeout)
             return ActivationResult(
                 activated=False,
                 bundle_id=str(manifest["bundle_id"]),
                 target=str(bundle_dir.resolve()),
                 previous_target=previous,
                 rolled_back=True,
-                diagnostic=(completed.stderr or completed.stdout or "health command failed").strip(),
+                phase="start",
+                diagnostic=detail,
+            )
+
+    if health_command:
+        ok, detail = _run_command(health_command, timeout=timeout)
+        if not ok:
+            if stop_command:
+                _run_command(stop_command, timeout=timeout)
+            _restore_link(current_link, previous)
+            if start_command:
+                _run_command(start_command, timeout=timeout)
+            return ActivationResult(
+                activated=False,
+                bundle_id=str(manifest["bundle_id"]),
+                target=str(bundle_dir.resolve()),
+                previous_target=previous,
+                rolled_back=True,
+                phase="health",
+                diagnostic=detail,
             )
 
     return ActivationResult(
@@ -76,5 +126,6 @@ def activate_bundle(
         target=str(bundle_dir.resolve()),
         previous_target=previous,
         rolled_back=False,
+        phase="activated",
         diagnostic="activated",
     )

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from . import attestation, bundle, identity, launcher, openclaw_adapter, paths
+from .command_ledger import CommandLedger
+from .runtime_commands import RuntimeCommandRunner, load_command_file
 
 
 def _components(args: argparse.Namespace) -> dict[str, Any]:
@@ -87,6 +89,31 @@ def _cmd_gateway_run(_args: argparse.Namespace) -> int:
     return openclaw_adapter.gateway_run()
 
 
+def _cmd_diagnostics_export(args: argparse.Namespace) -> int:
+    payload = openclaw_adapter.export_diagnostics(output_path=Path(args.output))
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("state") in {"ready", "ready_with_warnings"} else 1
+
+
+def _cmd_command_run(args: argparse.Namespace) -> int:
+    stop_command = shlex.split(args.stop_command) if args.stop_command else None
+    start_command = shlex.split(args.start_command) if args.start_command else None
+    health_command = shlex.split(args.health_command) if args.health_command else None
+    runner = RuntimeCommandRunner(
+        ledger=CommandLedger(root=Path(args.commands_dir)),
+        bundles_dir=Path(args.bundles_dir),
+        current_link=Path(args.current_link),
+        diagnostics_dir=Path(args.diagnostics_dir),
+        stop_command=stop_command,
+        start_command=start_command,
+        health_command=health_command,
+        service_restart=not args.no_service_restart,
+    )
+    payload = runner.execute(load_command_file(Path(args.command_json)))
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("status") in {"applied", "rolled_back", "canceled"} else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tinyhat-runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -128,6 +155,29 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_health.set_defaults(func=_cmd_gateway_health)
     gateway_run = gateway_sub.add_parser("run")
     gateway_run.set_defaults(func=_cmd_gateway_run)
+
+    diagnostics = subparsers.add_parser("diagnostics")
+    diagnostics_sub = diagnostics.add_subparsers(
+        dest="diagnostics_command",
+        required=True,
+    )
+    diagnostics_export = diagnostics_sub.add_parser("export")
+    diagnostics_export.add_argument("--output", required=True)
+    diagnostics_export.set_defaults(func=_cmd_diagnostics_export)
+
+    command = subparsers.add_parser("command")
+    command_sub = command.add_subparsers(dest="runtime_command", required=True)
+    run = command_sub.add_parser("run")
+    run.add_argument("--command-json", required=True)
+    run.add_argument("--commands-dir", default=str(paths.COMMANDS_LOG_DIR))
+    run.add_argument("--bundles-dir", default=str(paths.BUNDLES_DIR))
+    run.add_argument("--current-link", default=str(paths.CURRENT_LINK))
+    run.add_argument("--diagnostics-dir", default=str(paths.DIAGNOSTICS_DIR))
+    run.add_argument("--health-command")
+    run.add_argument("--stop-command")
+    run.add_argument("--start-command")
+    run.add_argument("--no-service-restart", action="store_true")
+    run.set_defaults(func=_cmd_command_run)
     return parser
 
 

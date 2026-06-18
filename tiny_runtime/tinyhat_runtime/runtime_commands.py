@@ -1,0 +1,437 @@
+"""Typed tiny_runtime command execution."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Sequence
+
+from . import attestation, bundle, launcher, openclaw_adapter, paths
+from .command_ledger import (
+    TERMINAL_STATUSES,
+    CommandLedger,
+    utc_now_iso,
+    validate_command_id,
+)
+from .identity import load_identity_document
+from .redaction import redact_json, redact_text
+
+COMMAND_RESULT_SCHEMA = "tiny_runtime_command_result_v1"
+ALLOWED_COMMAND_KINDS = frozenset(
+    {
+        "activate_bundle",
+        "rollback_bundle",
+        "export_diagnostics",
+    }
+)
+FAILURE_CODES = frozenset(
+    {
+        "activation_failed",
+        "attestation_mismatch",
+        "bundle_not_found",
+        "bundle_verification_failed",
+        "canceled",
+        "diagnostics_export_failed",
+        "idempotency_mismatch",
+        "invalid_command",
+        "rollback_failed",
+        "unsupported_kind",
+    }
+)
+
+
+class RuntimeCommandError(ValueError):
+    """Raised for invalid command specs before irreversible work starts."""
+
+
+def _default_gateway_stop_command() -> tuple[str, ...]:
+    return ("systemctl", "stop", "tinyhat-runtime-gateway.service")
+
+
+def _default_gateway_start_command() -> tuple[str, ...]:
+    return ("systemctl", "start", "tinyhat-runtime-gateway.service")
+
+
+def _default_health_command() -> tuple[str, ...]:
+    return (str(paths.CURRENT_LINK / "bin" / "tinyhat-runtime"), "gateway", "health")
+
+
+def _normalize_failure_code(value: str) -> str:
+    return value if value in FAILURE_CODES else "invalid_command"
+
+
+def _safe_command_sequence(value: Sequence[str] | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return tuple(str(item) for item in value)
+
+
+class RuntimeCommandRunner:
+    """Execute the narrow runtime command set from the platform ledger."""
+
+    def __init__(
+        self,
+        *,
+        ledger: CommandLedger | None = None,
+        bundles_dir: Path = paths.BUNDLES_DIR,
+        current_link: Path = paths.CURRENT_LINK,
+        diagnostics_dir: Path = paths.DIAGNOSTICS_DIR,
+        stop_command: Sequence[str] | None = None,
+        start_command: Sequence[str] | None = None,
+        health_command: Sequence[str] | None = None,
+        service_restart: bool = True,
+    ) -> None:
+        self.ledger = ledger or CommandLedger()
+        self.bundles_dir = bundles_dir
+        self.current_link = current_link
+        self.diagnostics_dir = diagnostics_dir
+        self.stop_command = (
+            _safe_command_sequence(stop_command)
+            if stop_command is not None
+            else _default_gateway_stop_command()
+            if service_restart
+            else None
+        )
+        self.start_command = (
+            _safe_command_sequence(start_command)
+            if start_command is not None
+            else _default_gateway_start_command()
+            if service_restart
+            else None
+        )
+        self.health_command = (
+            _safe_command_sequence(health_command)
+            if health_command is not None
+            else _default_health_command()
+        )
+
+    def execute(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id = validate_command_id(str(command.get("command_id") or ""))
+        idempotency_key = str(command.get("idempotency_key") or "")
+        kind = str(command.get("kind") or "")
+        existing = self.ledger.load(command_id)
+        if existing is not None:
+            existing_key = str(existing.get("idempotency_key") or "")
+            if existing_key and idempotency_key and existing_key != idempotency_key:
+                return {
+                    "schema": COMMAND_RESULT_SCHEMA,
+                    "command_id": command_id,
+                    "idempotency_key": idempotency_key,
+                    "kind": kind,
+                    "status": "failed",
+                    "phase": "validate",
+                    "failure_code": "idempotency_mismatch",
+                    "observed_at": utc_now_iso(),
+                    "result": {
+                        "detail": "idempotency_key mismatch for existing local mirror",
+                        "existing_status": existing.get("status"),
+                    },
+                }
+            if existing.get("status") in TERMINAL_STATUSES:
+                return {
+                    "schema": COMMAND_RESULT_SCHEMA,
+                    "command_id": command_id,
+                    "idempotency_key": idempotency_key,
+                    "kind": kind or str(existing.get("kind") or ""),
+                    "status": str(existing.get("status")),
+                    "phase": str(existing.get("phase") or "duplicate"),
+                    "failure_code": existing.get("failure_code"),
+                    "observed_at": utc_now_iso(),
+                    "result": {
+                        "duplicate": True,
+                        "existing_status": existing.get("status"),
+                    },
+                }
+        self.ledger.mirror(command)
+
+        if kind not in ALLOWED_COMMAND_KINDS:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="validate",
+                failure_code="unsupported_kind",
+                result={"detail": f"unsupported command kind: {kind}"},
+            )
+        if not idempotency_key:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="validate",
+                failure_code="invalid_command",
+                result={"detail": "idempotency_key is required"},
+            )
+
+        self.ledger.update(command_id, status="running", phase="start")
+        if self._cancel_requested(command):
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="canceled",
+                phase="safe_cancel",
+                failure_code="canceled",
+                result={"detail": "cancel requested before irreversible work"},
+            )
+
+        try:
+            if kind == "activate_bundle":
+                return self._activate_bundle(command)
+            if kind == "rollback_bundle":
+                return self._rollback_bundle(command)
+            if kind == "export_diagnostics":
+                return self._export_diagnostics(command)
+        except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="validate",
+                failure_code=(
+                    "bundle_verification_failed"
+                    if isinstance(exc, bundle.BundleVerificationError)
+                    else "invalid_command"
+                ),
+                result={"detail": str(exc)},
+            )
+        except Exception as exc:  # noqa: BLE001 - command boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="execute",
+                failure_code="invalid_command",
+                result={"detail": redact_text(str(exc), limit=1000)},
+            )
+
+        raise AssertionError("unreachable")
+
+    def _activate_bundle(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        expected_bundle_id = _required_string(spec, "bundle_id")
+        bundle_dir = self._bundle_dir_for_id(expected_bundle_id)
+        if not bundle_dir.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_not_found",
+                result={"bundle_id": expected_bundle_id, "bundle_dir": str(bundle_dir)},
+            )
+
+        self.ledger.update(command_id, status="running", phase="verify")
+        manifest = bundle.load_manifest(bundle_dir)
+        bundle.verify_manifest(bundle_dir, manifest)
+        if manifest.get("bundle_id") != expected_bundle_id:
+            raise RuntimeCommandError("bundle_id does not match staged manifest")
+
+        self.ledger.update(command_id, status="running", phase="flip_before_start")
+        result = launcher.activate_bundle(
+            bundle_dir,
+            current_link=self.current_link,
+            stop_command=self.stop_command,
+            start_command=self.start_command,
+            health_command=self.health_command,
+        )
+        result_payload = {
+            "activation": result.__dict__,
+            "bundle_id": expected_bundle_id,
+        }
+        if not result.activated:
+            status = "rolled_back" if result.rolled_back else "failed"
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status=status,
+                phase=result.phase,
+                failure_code="activation_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="attest")
+        attestation_doc = self._current_attestation()
+        result_payload["attestation"] = attestation_doc
+        if attestation_doc.get("bundle_id") != expected_bundle_id:
+            rollback = self._rollback_to_previous(result.previous_target)
+            result_payload["rollback"] = rollback.__dict__ if rollback else None
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if rollback and rollback.activated else "failed",
+                phase="attestation_gate",
+                failure_code=(
+                    "attestation_mismatch" if rollback and rollback.activated else "rollback_failed"
+                ),
+                result=result_payload,
+            )
+
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="attested",
+            result=result_payload,
+        )
+
+    def _rollback_bundle(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        target_bundle_id = _required_string(spec, "bundle_id")
+        bundle_dir = self._bundle_dir_for_id(target_bundle_id)
+        if not bundle_dir.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_not_found",
+                result={"bundle_id": target_bundle_id, "bundle_dir": str(bundle_dir)},
+            )
+        self.ledger.update(command_id, status="running", phase="rollback")
+        result = launcher.activate_bundle(
+            bundle_dir,
+            current_link=self.current_link,
+            stop_command=self.stop_command,
+            start_command=self.start_command,
+            health_command=self.health_command,
+        )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied" if result.activated else "failed",
+            phase="rolled_back" if result.activated else result.phase,
+            failure_code=None if result.activated else "rollback_failed",
+            result={"activation": result.__dict__, "bundle_id": target_bundle_id},
+        )
+
+    def _export_diagnostics(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id, idempotency_key, kind = _ids(command)
+        self.ledger.update(command_id, status="running", phase="export_diagnostics")
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        output_path = self.diagnostics_dir / f"{command_id}.zip"
+        payload = openclaw_adapter.export_diagnostics(output_path=output_path)
+        status = (
+            "applied"
+            if payload.get("state") in {"ready", "ready_with_warnings"}
+            else "failed"
+        )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status=status,
+            phase="exported" if status == "applied" else "export_failed",
+            failure_code=None if status == "applied" else "diagnostics_export_failed",
+            result=payload,
+        )
+
+    def _bundle_dir_for_id(self, bundle_id: str) -> Path:
+        if not bundle_id.startswith("sha256:"):
+            raise RuntimeCommandError("bundle_id must use sha256:<hex> format")
+        digest = bundle_id.removeprefix("sha256:")
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise RuntimeCommandError("bundle_id digest must be 64 lowercase hex chars")
+        return self.bundles_dir / digest
+
+    def _current_attestation(self) -> dict[str, Any]:
+        manifest = bundle.load_manifest(self.current_link)
+        bundle.verify_manifest(self.current_link, manifest)
+        identity_doc = (
+            load_identity_document(paths.IDENTITY_FILE)
+            if paths.IDENTITY_FILE.exists()
+            else {}
+        )
+        return attestation.build_attestation(
+            bundle_manifest=manifest,
+            identity_doc=identity_doc,
+            openclaw=openclaw_adapter.adapter_attestation(),
+        )
+
+    def _rollback_to_previous(self, previous_target: str | None) -> launcher.ActivationResult | None:
+        if not previous_target:
+            return None
+        return launcher.activate_bundle(
+            Path(previous_target),
+            current_link=self.current_link,
+            stop_command=self.stop_command,
+            start_command=self.start_command,
+            health_command=self.health_command,
+        )
+
+    @staticmethod
+    def _cancel_requested(command: dict[str, Any]) -> bool:
+        return bool(command.get("cancel_requested") is True or command.get("cancel_requested_at"))
+
+    def _finish(
+        self,
+        *,
+        command_id: str,
+        idempotency_key: str,
+        kind: str,
+        status: str,
+        phase: str,
+        failure_code: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        failure = _normalize_failure_code(failure_code) if failure_code else None
+        payload = {
+            "schema": COMMAND_RESULT_SCHEMA,
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+            "kind": kind,
+            "status": status,
+            "phase": phase,
+            "failure_code": failure,
+            "observed_at": utc_now_iso(),
+            "result": redact_json(result or {}),
+        }
+        self.ledger.update(
+            command_id,
+            status=status,
+            phase=phase,
+            failure_code=failure,
+            result=payload["result"],
+        )
+        return payload
+
+
+def load_command_file(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeCommandError("command file must contain a JSON object")
+    return payload
+
+
+def _spec(command: dict[str, Any]) -> dict[str, Any]:
+    spec = command.get("spec") or {}
+    if not isinstance(spec, dict):
+        raise RuntimeCommandError("command spec must be a JSON object")
+    return spec
+
+
+def _ids(command: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(command.get("command_id") or ""),
+        str(command.get("idempotency_key") or ""),
+        str(command.get("kind") or ""),
+    )
+
+
+def _required_string(spec: dict[str, Any], key: str) -> str:
+    value = spec.get(key)
+    if not isinstance(value, str) or not value:
+        raise RuntimeCommandError(f"spec.{key} is required")
+    return value
