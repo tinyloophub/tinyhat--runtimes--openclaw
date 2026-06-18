@@ -10,6 +10,7 @@ import base64
 import errno
 import json
 import os
+from pathlib import Path
 import shlex
 import shutil
 import sqlite3
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
+from tiny_runtime.tinyhat_runtime.command_ledger import CommandLedger
+from tiny_runtime.tinyhat_runtime.runtime_commands import RuntimeCommandRunner
 from tiny_runtime.tinyhat_runtime import supervisor_bridge
 from tinyhat_cli.units import component_update, manifest as manifest_unit
 
@@ -3965,6 +3968,35 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         self.assertEqual(result["revision"], 42)
         self.assertEqual(result["secret_count"], 1)
         self.assertTrue(result["env_block_changed"])
+
+    def test_apply_runtime_secret_map_dry_run_does_not_persist_env_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                config_path = supervisor.openclaw_config_path()
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as fh:
+                    json.dump({"env": {"OPENROUTER_API_KEY": "sk-or-v1-child"}}, fh)
+                with patch.object(supervisor, "reload_openclaw_secrets") as reload_mock:
+                    result = supervisor.apply_runtime_secret_map(
+                        revision=43,
+                        secrets={"EXA_API_KEY": "exa-test-key"},
+                        dry_run=True,
+                    )
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertEqual(result["revision"], 43)
+        self.assertEqual(result["reload"]["reason"], "dry_run")
+        self.assertTrue(result["env_block_changed"])
+        self.assertEqual(config, {"env": {"OPENROUTER_API_KEY": "sk-or-v1-child"}})
+        self.assertFalse(os.path.exists(secrets_path))
+        reload_mock.assert_not_called()
 
     def test_handle_apply_config_signals_rebind_on_env_change(self) -> None:
         # Reset the module-level rebind flags so the test is order-independent.
@@ -8428,6 +8460,66 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_apply_config_wiring_uses_supervisor_callbacks_with_real_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            applies: list[dict] = []
+
+            def runner_factory(**kwargs) -> RuntimeCommandRunner:
+                return RuntimeCommandRunner(
+                    ledger=CommandLedger(root=Path(tmp) / "commands"),
+                    service_restart=False,
+                    **kwargs,
+                )
+
+            def fake_apply_runtime_secret_map(**kwargs) -> dict:
+                applies.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": len(kwargs["secrets"]),
+                    "reload": {"ok": True, "dry_run": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": False,
+                }
+
+            with (
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    return_value={
+                        "revision": 8,
+                        "secrets": {"OPENAI_API_KEY": "sk-openai"},
+                    },
+                ) as get_json,
+                patch.object(
+                    supervisor,
+                    "apply_runtime_secret_map",
+                    side_effect=fake_apply_runtime_secret_map,
+                ),
+                patch.object(supervisor_bridge, "RuntimeCommandRunner", runner_factory),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor.handle_runtime_command(
+                    {
+                        "type": "runtime_command",
+                        "command": {
+                            "command_id": "cmd-apply-real-runner",
+                            "idempotency_key": "idem-apply-real-runner",
+                            "kind": "apply_config",
+                            "spec": {
+                                "desired_config_revision": 8,
+                                "hot_required": True,
+                            },
+                        },
+                    }
+                )
+
+        get_json.assert_called_once_with("/hapi/v1/computers/me/runtime-secrets")
+        self.assertEqual([item["dry_run"] for item in applies], [True, False])
+        post_json.assert_called_once()
+        path, body = post_json.call_args.args
+        self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+        self.assertEqual(body["result"]["status"], "applied")
+        self.assertEqual(body["result"]["phase"], "hot_reloaded")
 
 
 class UpdateComponentCommandTests(unittest.TestCase):

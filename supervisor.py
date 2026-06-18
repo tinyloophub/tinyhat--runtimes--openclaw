@@ -2817,7 +2817,7 @@ def _signal_rebind_for_secrets() -> None:
     _stop_holder["stop"] = True
 
 
-def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> bool:
+def sync_openclaw_secret_ref_config(secrets: dict[str, str], *, dry_run: bool = False) -> bool:
     """Update openclaw.json with Tinyhat's file SecretRef surfaces.
 
     Returns ``True`` if the runtime-secret entries in ``config["env"]``
@@ -2839,8 +2839,9 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str]) -> bool:
     _sync_openai_api_key_ref(config, secrets)
     _apply_runtime_secret_env_block(config, secrets)
     current_env = dict(config.get("env") or {})
-    _atomic_write_json(config_path, config, runtime_owned=True)
     env_block_changed = previous_env != current_env
+    if not dry_run:
+        _atomic_write_json(config_path, config, runtime_owned=True)
     log.info(
         "synced OpenClaw SecretRef config (provider=%s openai_ref=%s "
         "env_block_changed=%s env_keys=%d)",
@@ -3032,7 +3033,7 @@ def reload_openclaw_secrets(secrets: dict[str, str]) -> dict:
     )
 
 
-def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
+def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str], dry_run: bool = False) -> dict:
     """Apply one latest runtime-secret revision to OpenClaw.
 
     ``env_block_changed`` is returned alongside the reload result so the
@@ -3043,9 +3044,10 @@ def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str]) -> dict:
     Pure SecretRef changes (e.g. an ``OPENAI_API_KEY``-only edit) leave
     ``env_block_changed`` false and the gateway keeps running.
     """
-    write_tinyhat_secrets_file(secrets)
-    env_block_changed = sync_openclaw_secret_ref_config(secrets)
-    reload_result = reload_openclaw_secrets(secrets)
+    if not dry_run:
+        write_tinyhat_secrets_file(secrets)
+    env_block_changed = sync_openclaw_secret_ref_config(secrets, dry_run=dry_run)
+    reload_result = {"skipped": True, "reason": "dry_run"} if dry_run else reload_openclaw_secrets(secrets)
     return {
         "revision": revision,
         "secret_count": len(secrets or {}),

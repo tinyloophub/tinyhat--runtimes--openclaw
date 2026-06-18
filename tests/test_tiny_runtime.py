@@ -477,9 +477,12 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["status"], "applied")
             self.assertEqual(result["phase"], "hot_reloaded")
             self.assertEqual(get_paths, ["/hapi/v1/computers/me/runtime-secrets"])
-            self.assertEqual(applied[0]["revision"], 5)
+            self.assertEqual(len(applied), 2)
+            self.assertTrue(applied[0]["dry_run"])
+            self.assertFalse(applied[1]["dry_run"])
+            self.assertEqual(applied[1]["revision"], 5)
             self.assertEqual(
-                applied[0]["secrets"],
+                applied[1]["secrets"],
                 {"OPENAI_API_KEY": "sk-test-secret"},
             )
             self.assertFalse(result["result"]["restart_requested"])
@@ -501,7 +504,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                 apply_runtime_config=lambda **_kwargs: {
                     "revision": 9,
                     "secret_count": 1,
-                    "reload": {"reloaded": True},
+                    "reload": {"skipped": True, "reason": "dry_run"},
                     "env_block_changed": True,
                 },
                 service_restart=False,
@@ -524,8 +527,92 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["failure_code"], "config_apply_failed")
             self.assertEqual(result["phase"], "unsupported_interface")
             self.assertEqual(result["result"]["failure_label"], "unsupported_interface")
+            self.assertEqual(result["result"]["reload"]["reason"], "dry_run")
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_apply_config_command_reports_typed_failure_on_reload_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            def fake_apply_runtime_config(**kwargs) -> dict:
+                if kwargs.get("dry_run"):
+                    return {
+                        "revision": kwargs["revision"],
+                        "secret_count": len(kwargs["secrets"]),
+                        "reload": {"skipped": True},
+                        "env_block_changed": False,
+                    }
+                raise RuntimeError("reload failed for token=secret-value")
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                platform_get_json=lambda _path: {
+                    "revision": 6,
+                    "secrets": {"OPENAI_API_KEY": "sk-test-secret"},
+                },
+                apply_runtime_config=fake_apply_runtime_config,
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-apply-failed",
+                    "idempotency_key": "idem-apply-failed",
+                    "kind": "apply_config",
+                    "spec": {
+                        "desired_config_revision": 6,
+                        "reason": "credential_save",
+                        "hot_required": True,
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "hot_reload")
+            self.assertEqual(result["failure_code"], "config_apply_failed")
+            self.assertIn("[REDACTED]", result["result"]["detail"])
+            self.assertFalse(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_apply_config_command_rejects_invalid_spec_values(self) -> None:
+        cases = [
+            ({}, "desired_config_revision is required"),
+            ({"desired_config_revision": -1}, "desired_config_revision must be non-negative"),
+            ({"desired_config_revision": True}, "desired_config_revision must be an integer"),
+            (
+                {"desired_config_revision": 1, "hot_required": False},
+                "hot_required must be true",
+            ),
+        ]
+        for index, (spec, expected_detail) in enumerate(cases):
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                runner = RuntimeCommandRunner(
+                    ledger=CommandLedger(root=base / "commands"),
+                    bundles_dir=base / "bundles",
+                    current_link=base / "current",
+                    diagnostics_dir=base / "diagnostics",
+                    platform_get_json=lambda _path: {},
+                    apply_runtime_config=lambda **_kwargs: {},
+                    service_restart=False,
+                )
+
+                result = runner.execute(
+                    {
+                        "command_id": f"cmd-apply-invalid-{index}",
+                        "idempotency_key": f"idem-apply-invalid-{index}",
+                        "kind": "apply_config",
+                        "spec": spec,
+                    }
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["failure_code"], "invalid_command")
+                self.assertIn(expected_detail, result["result"]["detail"])
 
     def test_link_chatgpt_command_starts_device_code_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -567,6 +654,120 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(starts[0]["reason"], "runtime_command_link_chatgpt")
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_link_chatgpt_command_reports_typed_failure_on_worker_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                start_chatgpt_link=lambda _spec: (_ for _ in ()).throw(
+                    RuntimeError("worker failed with token=secret-value")
+                ),
+                service_restart=False,
+            )
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-link-failed",
+                    "idempotency_key": "idem-link-failed",
+                    "kind": "link_chatgpt",
+                    "spec": {
+                        "session_id": "sess-123",
+                        "provider": "openai",
+                        "model_ref": "openai/gpt-5.5",
+                        "auth_flow": "device_code",
+                        "required_final_auth_path": "chatgpt_subscription",
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "start_device_code")
+            self.assertEqual(result["failure_code"], "link_chatgpt_failed")
+            self.assertIn("[REDACTED]", result["result"]["detail"])
+            self.assertFalse(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_link_chatgpt_command_rejects_invalid_spec_values(self) -> None:
+        cases = [
+            ({"provider": "anthropic"}, "provider must be openai"),
+            ({"auth_flow": "browser"}, "auth_flow must be device_code"),
+            (
+                {"required_final_auth_path": "platform_credits"},
+                "required_final_auth_path must be chatgpt_subscription",
+            ),
+        ]
+        for index, (override, expected_detail) in enumerate(cases):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                spec = {
+                    "session_id": "sess-123",
+                    "provider": "openai",
+                    "model_ref": "openai/gpt-5.5",
+                    "auth_flow": "device_code",
+                    "required_final_auth_path": "chatgpt_subscription",
+                }
+                spec.update(override)
+                runner = RuntimeCommandRunner(
+                    ledger=CommandLedger(root=base / "commands"),
+                    bundles_dir=base / "bundles",
+                    current_link=base / "current",
+                    diagnostics_dir=base / "diagnostics",
+                    start_chatgpt_link=lambda _spec: {"state": "started"},
+                    service_restart=False,
+                )
+
+                result = runner.execute(
+                    {
+                        "command_id": f"cmd-link-invalid-{index}",
+                        "idempotency_key": f"idem-link-invalid-{index}",
+                        "kind": "link_chatgpt",
+                        "spec": spec,
+                    }
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["failure_code"], "invalid_command")
+                self.assertIn(expected_detail, result["result"]["detail"])
+
+    def test_duplicate_link_chatgpt_command_does_not_respawn_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            starts: list[dict] = []
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                start_chatgpt_link=lambda spec: starts.append(spec)
+                or {"state": "started"},
+                service_restart=False,
+            )
+            command = {
+                "command_id": "cmd-link-duplicate",
+                "idempotency_key": "idem-link-duplicate",
+                "kind": "link_chatgpt",
+                "spec": {
+                    "session_id": "sess-123",
+                    "provider": "openai",
+                    "model_ref": "openai/gpt-5.5",
+                    "auth_flow": "device_code",
+                    "required_final_auth_path": "chatgpt_subscription",
+                },
+            }
+
+            first = runner.execute(command)
+            second = runner.execute(command)
+
+            self.assertEqual(first["status"], "applied")
+            self.assertEqual(second["status"], "applied")
+            self.assertTrue(second["result"]["duplicate"])
+            self.assertEqual(len(starts), 1)
 
     def test_activate_bundle_command_rolls_back_on_health_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
