@@ -129,6 +129,12 @@ class RuntimeCommandRunner:
                     },
                 }
             if existing.get("status") in TERMINAL_STATUSES:
+                result = existing.get("result")
+                if not isinstance(result, dict):
+                    result = {}
+                result = dict(result)
+                result["duplicate"] = True
+                result["existing_status"] = existing.get("status")
                 return {
                     "schema": COMMAND_RESULT_SCHEMA,
                     "command_id": command_id,
@@ -138,10 +144,7 @@ class RuntimeCommandRunner:
                     "phase": str(existing.get("phase") or "duplicate"),
                     "failure_code": existing.get("failure_code"),
                     "observed_at": utc_now_iso(),
-                    "result": {
-                        "duplicate": True,
-                        "existing_status": existing.get("status"),
-                    },
+                    "result": result,
                 }
         self.ledger.mirror(command)
 

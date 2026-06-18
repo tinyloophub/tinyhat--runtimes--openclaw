@@ -6,6 +6,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
+from tiny_runtime.tinyhat_runtime import supervisor_bridge
 from tinyhat_cli.units import component_update, manifest as manifest_unit
 
 _AMBIENT_ENV: dict[str, str | None] = {}
@@ -8339,6 +8341,93 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
         write_config.assert_not_called()
         start_gateway.assert_not_called()
         stop_gateway.assert_called_once()
+
+
+class RuntimeCommandDispatchTests(unittest.TestCase):
+    """Heartbeat-delivered ``runtime_command`` bridge (tinyloophub/tinyloop#818)."""
+
+    def test_dispatch_routes_runtime_command_to_runner_and_posts_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = os.path.join(tmp, "cmd-diagnostics.zip")
+            artifact_bytes = b"diagnostics zip bytes"
+            with open(artifact_path, "wb") as fh:
+                fh.write(artifact_bytes)
+            runtime_command = {
+                "command_id": "cmd-diagnostics",
+                "idempotency_key": "idem-diagnostics",
+                "kind": "export_diagnostics",
+                "spec": {},
+            }
+            result = {
+                "schema": "tiny_runtime_command_result_v1",
+                "command_id": "cmd-diagnostics",
+                "idempotency_key": "idem-diagnostics",
+                "kind": "export_diagnostics",
+                "status": "applied",
+                "phase": "exported",
+                "failure_code": None,
+                "observed_at": "2026-06-18T19:00:00Z",
+                "result": {"output_path": artifact_path},
+            }
+            runner = SimpleNamespace(execute=lambda command: result)
+
+            with (
+                patch.object(
+                    supervisor_bridge,
+                    "RuntimeCommandRunner",
+                    return_value=runner,
+                ),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor.handle_heartbeat_command(
+                    {"type": "runtime_command", "command": runtime_command}
+                )
+
+            post_json.assert_called_once()
+            path, body = post_json.call_args.args
+            self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+            self.assertEqual(body["result"], result)
+            self.assertEqual(body["artifact"]["kind"], "diagnostics_zip")
+            self.assertEqual(body["artifact"]["state"], "uploaded")
+            self.assertEqual(body["artifact"]["content_type"], "application/zip")
+            self.assertEqual(body["artifact"]["size_bytes"], len(artifact_bytes))
+            self.assertEqual(
+                base64.b64decode(body["artifact"]["data_base64"]),
+                artifact_bytes,
+            )
+
+    def test_runtime_command_result_post_failure_does_not_raise(self) -> None:
+        result = {
+            "schema": "tiny_runtime_command_result_v1",
+            "command_id": "cmd-retry",
+            "idempotency_key": "idem-retry",
+            "kind": "export_diagnostics",
+            "status": "applied",
+            "phase": "exported",
+            "failure_code": None,
+            "observed_at": "2026-06-18T19:00:00Z",
+            "result": {},
+        }
+        runner = SimpleNamespace(execute=lambda command: result)
+
+        with (
+            patch.object(
+                supervisor_bridge,
+                "RuntimeCommandRunner",
+                return_value=runner,
+            ),
+            patch.object(supervisor, "post_json", side_effect=RuntimeError("offline")),
+        ):
+            supervisor.handle_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-retry",
+                        "idempotency_key": "idem-retry",
+                        "kind": "export_diagnostics",
+                    },
+                }
+            )
 
 
 class UpdateComponentCommandTests(unittest.TestCase):

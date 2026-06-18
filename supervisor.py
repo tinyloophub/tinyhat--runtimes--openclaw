@@ -6436,6 +6436,13 @@ def handle_update_component_command(
         _restart_supervisor()
 
 
+def handle_runtime_command(command: dict) -> None:
+    """Execute a typed ``tiny_runtime`` command delivered by heartbeat."""
+    from tiny_runtime.tinyhat_runtime.supervisor_bridge import handle_runtime_command as bridge
+
+    bridge(command, post_json=post_json, logger=log)
+
+
 def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None:
     """Dispatch a heartbeat-delivered command to its handler.
 
@@ -6455,6 +6462,8 @@ def handle_heartbeat_command(command: dict, binding: dict | None = None) -> None
         handle_apply_packages_command(command, binding=binding)
     elif cmd_type == "repair_openclaw_auth_store":
         handle_repair_openclaw_auth_store_command(command)
+    elif cmd_type in {"runtime_command", "tiny_runtime_command"}:
+        handle_runtime_command(command)
     else:
         log.info("ignoring unknown heartbeat command type: %r", cmd_type)
 

@@ -349,7 +349,12 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                     "spec": {},
                 }
             )
-            ledger.update("cmd-duplicate", status="applied", phase="exported")
+            ledger.update(
+                "cmd-duplicate",
+                status="applied",
+                phase="exported",
+                result={"output_path": "/var/log/tinyhat/diagnostics/cmd-duplicate.zip"},
+            )
             runner = RuntimeCommandRunner(
                 ledger=ledger,
                 bundles_dir=base / "bundles",
@@ -369,6 +374,10 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "applied")
             self.assertTrue(result["result"]["duplicate"])
+            self.assertEqual(
+                result["result"]["output_path"],
+                "/var/log/tinyhat/diagnostics/cmd-duplicate.zip",
+            )
 
     def test_idempotency_mismatch_does_not_overwrite_original_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
