@@ -117,9 +117,9 @@ def config_patch(
     replace_paths: Sequence[str] = (),
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
-    args: list[str] = ["config", "patch", "--stdin", "--json"]
+    args: list[str] = ["config", "patch", "--stdin"]
     if dry_run:
-        args.append("--dry-run")
+        args.extend(["--dry-run", "--json"])
     for path in replace_paths:
         args.extend(["--replace-path", path])
     result = run_openclaw(

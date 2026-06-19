@@ -898,7 +898,9 @@ class PlatformLoopTests(unittest.TestCase):
 
         posts: list[tuple[str, dict]] = []
         client = Mock()
-        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        client.post_json.side_effect = (
+            lambda path, payload: posts.append((path, payload)) or {}
+        )
         loop = platform_loop.TinyRuntimePlatformLoop(client=client)
 
         def fail_once() -> dict:
@@ -996,6 +998,57 @@ class PlatformLoopTests(unittest.TestCase):
         self.assertEqual(
             sample["sample_metadata"]["restart_policy"],
             "no_assignment_restart",
+        )
+
+    def test_binding_activation_failure_reports_supported_runtime_state(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def assigned_once() -> dict:
+            loop.stop_requested = True
+            return {
+                "assigned": True,
+                "binding": {
+                    "telegram_owner_user_id": "123456",
+                    "telegram_bot_user_id": "654321",
+                    "telegram_bot_token": "token=secret-value",
+                },
+            }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=assigned_once),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "failed"},
+            ),
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        runtime_state_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/runtime-state"
+        ]
+        self.assertEqual(len(runtime_state_payloads), 1)
+        self.assertEqual(
+            runtime_state_payloads[0]["runtime_health"],
+            "openclaw_not_ready",
+        )
+        self.assertTrue(runtime_state_payloads[0]["activation_failed"])
+        self.assertEqual(
+            runtime_state_payloads[0]["openclaw_control"],
+            "no_restart_requested",
         )
 
 
@@ -1263,6 +1316,62 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["plugin"]["state"], "unavailable")
         self.assertEqual(payload["gateway"]["state"], "unhealthy")
         self.assertEqual(payload["models"]["state"], "unavailable")
+
+    def test_config_patch_apply_mode_omits_json_flag(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        seen: dict[str, object] = {}
+
+        def runner(argv, **kwargs):
+            seen["argv"] = argv
+            seen["input"] = kwargs.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        result = openclaw_adapter.config_patch(
+            {"channels": {"telegram": {"enabled": True}}},
+            replace_paths=("channels.telegram",),
+            runner=runner,
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(
+            seen["argv"],
+            [
+                "openclaw",
+                "config",
+                "patch",
+                "--stdin",
+                "--replace-path",
+                "channels.telegram",
+            ],
+        )
+        self.assertNotIn("--json", seen["argv"])
+        self.assertIn('"channels"', str(seen["input"]))
+
+    def test_config_patch_dry_run_keeps_json_flag(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        seen: dict[str, object] = {}
+
+        def runner(argv, **_kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout='{"state":"would_apply"}',
+                stderr="",
+            )
+
+        result = openclaw_adapter.config_patch(
+            {"channels": {"telegram": {"enabled": True}}},
+            dry_run=True,
+            runner=runner,
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertIn("--dry-run", seen["argv"])
+        self.assertIn("--json", seen["argv"])
+        self.assertEqual(result["patch"], {"state": "would_apply"})
 
 
 class BakeScriptTests(unittest.TestCase):

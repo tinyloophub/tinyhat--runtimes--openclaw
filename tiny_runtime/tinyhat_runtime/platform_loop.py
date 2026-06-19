@@ -123,7 +123,7 @@ class TinyRuntimePlatformLoop:
                 detail = f"binding activation failed: {redact_text(str(exc), limit=1000)}"
                 LOG.exception(detail)
                 self._safe_post_runtime_state(
-                    "unhealthy",
+                    "openclaw_not_ready",
                     detail,
                     {
                         "assigned": True,
