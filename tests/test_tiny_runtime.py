@@ -123,6 +123,39 @@ class HotImageTests(unittest.TestCase):
             self.assertIn(["git", "checkout", "main"], calls)
             self.assertIn(["git", "reset", "--hard", "origin/main"], calls)
 
+    def test_preinstall_hot_image_plugins_applies_warm_config(self) -> None:
+        checkout = Path("/tmp/tinyhat-plugin-checkout")
+
+        with (
+            patch.object(
+                openclaw_adapter,
+                "install_plugin",
+                return_value={"state": "ready"},
+            ) as install_plugin,
+            patch.object(
+                openclaw_adapter,
+                "inspect_plugin",
+                return_value={"state": "ready"},
+            ),
+            patch.object(
+                openclaw_adapter,
+                "apply_warm_image_config",
+                return_value={"state": "ready"},
+            ) as apply_warm,
+            patch.object(
+                hot_image,
+                "_checkout_tinyhat_plugin",
+                return_value=(checkout, "a" * 40),
+            ),
+            patch.object(hot_image, "_write_tinyhat_marker") as write_marker,
+        ):
+            result = hot_image.preinstall_hot_image_plugins()
+
+        self.assertEqual(install_plugin.call_count, 2)
+        apply_warm.assert_called_once_with()
+        write_marker.assert_called_once_with(checkout=checkout, resolved_sha="a" * 40)
+        self.assertEqual(result["warm_config"], {"state": "ready"})
+
 
 class LauncherTests(unittest.TestCase):
     def test_activation_flips_current_symlink(self) -> None:
@@ -1524,7 +1557,23 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertIn("--json", seen["argv"])
         self.assertEqual(result["patch"], {"state": "would_apply"})
 
-    def test_binding_config_patch_omits_openrouter_provider_base_url(self) -> None:
+    def test_warm_image_config_patch_owns_stable_gateway_setup(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        patch = openclaw_adapter.warm_image_config_patch()
+
+        self.assertEqual(patch["gateway"]["mode"], "local")
+        self.assertFalse(patch["channels"]["telegram"]["enabled"])
+        self.assertEqual(
+            patch["secrets"]["providers"]["tinyhat"]["path"],
+            str(openclaw_adapter.paths.OPENCLAW_SECRETS_PATH),
+        )
+        self.assertIn("codex", patch["plugins"]["entries"])
+        self.assertIn("tinyhat", patch["plugins"]["entries"])
+        self.assertNotIn("commands", patch)
+        self.assertNotIn("env", patch)
+
+    def test_binding_config_patch_uses_secretrefs_on_hot_paths(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
         patch = openclaw_adapter.binding_config_patch(
@@ -1541,8 +1590,131 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             patch["agents"]["defaults"]["model"]["primary"],
             "openrouter/openai/gpt-5.5",
         )
-        self.assertEqual(patch["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
-        self.assertNotIn("models", patch)
+        self.assertEqual(
+            patch["channels"]["telegram"]["botToken"],
+            {
+                "source": "file",
+                "provider": "tinyhat",
+                "id": "/channels/telegram/botToken",
+            },
+        )
+        self.assertEqual(
+            patch["models"]["providers"]["openrouter"]["apiKey"],
+            {
+                "source": "file",
+                "provider": "tinyhat",
+                "id": "/providers/openrouter/apiKey",
+            },
+        )
+        self.assertEqual(
+            patch["channels"]["telegram"]["execApprovals"],
+            {"approvers": ["12345"]},
+        )
+        self.assertEqual(
+            patch["plugins"]["entries"]["tinyhat"]["config"],
+            {},
+        )
+        self.assertNotIn("gateway", patch)
+        self.assertNotIn("commands", patch)
+        self.assertNotIn("env", patch)
+        self.assertNotIn("openrouter.ai/api/v1", json.dumps(patch, sort_keys=True))
+        self.assertNotIn("123:token", json.dumps(patch, sort_keys=True))
+        self.assertNotIn("sk-or-v1-child", json.dumps(patch, sort_keys=True))
+
+    def test_apply_binding_config_writes_secrets_and_patches_hot_paths_only(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            seen: dict[str, object] = {}
+
+            def runner(argv, **kwargs):
+                seen["argv"] = argv
+                seen["input"] = kwargs.get("input")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.apply_binding_config(
+                    {
+                        "telegram_owner_user_id": "12345",
+                        "telegram_bot_token": "123:token",
+                        "openrouter_api_key": "sk-or-v1-child",
+                        "openrouter_default_model": "openai/gpt-5.5",
+                    },
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(
+                seen["argv"],
+                [
+                    "openclaw",
+                    "config",
+                    "patch",
+                    "--stdin",
+                    "--replace-path",
+                    "channels.telegram",
+                ],
+            )
+            input_text = str(seen["input"])
+            self.assertNotIn("commands", input_text)
+            self.assertNotIn("gateway", input_text)
+            self.assertNotIn("OPENROUTER_API_KEY", input_text)
+            self.assertNotIn("123:token", input_text)
+            self.assertNotIn("sk-or-v1-child", input_text)
+            secrets_payload = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                secrets_payload["channels"]["telegram"]["botToken"],
+                "123:token",
+            )
+            self.assertEqual(
+                secrets_payload["providers"]["openrouter"]["apiKey"],
+                "sk-or-v1-child",
+            )
+
+    def test_write_openclaw_secrets_preserves_binding_refs_on_user_secret_update(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            secrets_path.write_text(
+                json.dumps(
+                    {
+                        "channels": {"telegram": {"botToken": "123:token"}},
+                        "providers": {"openrouter": {"apiKey": "sk-or-v1-child"}},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.write_openclaw_secrets(
+                    {"EXA_API_KEY": "exa-test-secret"}
+                )
+
+            self.assertEqual(result["state"], "ready")
+            merged = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                merged["channels"]["telegram"]["botToken"],
+                "123:token",
+            )
+            self.assertEqual(
+                merged["providers"]["openrouter"]["apiKey"],
+                "sk-or-v1-child",
+            )
+            self.assertEqual(merged["EXA_API_KEY"], "exa-test-secret")
 
 
 class BakeScriptTests(unittest.TestCase):

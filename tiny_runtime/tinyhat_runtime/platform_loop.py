@@ -8,7 +8,6 @@ this loop never restarts OpenClaw as part of assignment activation.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import signal
@@ -340,13 +339,7 @@ class TinyRuntimePlatformLoop:
         # through the official OpenClaw secrets surface; env-block changes must
         # move to OpenClaw hot secret refs rather than restarting the gateway.
         if not dry_run:
-            from . import paths
-
-            paths.OPENCLAW_SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            paths.OPENCLAW_SECRETS_PATH.write_text(
-                json.dumps(secrets, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            openclaw_adapter.write_openclaw_secrets(secrets)
         reload_result = (
             {"skipped": True, "reason": "dry_run"}
             if dry_run
