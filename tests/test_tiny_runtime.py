@@ -893,6 +893,34 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
 
 
 class PlatformLoopTests(unittest.TestCase):
+    def test_ready_report_posts_hot_ready_snapshot_before_ready_edge(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+        loop._report_ready()
+
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+                "/hapi/v1/computers/me/runtime-state",
+            ],
+        )
+        runtime_payload = posts[0][1]
+        self.assertEqual(runtime_payload["runtime_health"], "healthy")
+        self.assertFalse(runtime_payload["assigned"])
+        self.assertEqual(
+            runtime_payload["gateway"],
+            {"liveness_owner": "systemd", "restart_loop": False},
+        )
+        self.assertEqual(posts[1][1]["state"], "ready")
+
     def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -937,13 +965,12 @@ class PlatformLoopTests(unittest.TestCase):
             return {"assigned": False}
 
         with (
-            patch.object(loop, "_report_ready"),
             patch.object(loop, "_poll_binding", side_effect=unassigned_once),
             patch.object(platform_loop.time, "sleep"),
         ):
             self.assertEqual(loop.run_forever(), 0)
 
-        client.post_json.assert_called_once()
+        self.assertGreaterEqual(client.post_json.call_count, 2)
 
     def test_binding_activation_does_not_restart_openclaw_gateway(self) -> None:
         from tinyhat_runtime import platform_loop

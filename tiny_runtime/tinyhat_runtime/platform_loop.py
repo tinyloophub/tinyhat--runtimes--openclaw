@@ -60,6 +60,7 @@ class TinyRuntimePlatformLoop:
     def __init__(self, *, client: PlatformClient | None = None) -> None:
         self.client = client or default_platform_client()
         self.stop_requested = False
+        self.ready_reported = False
 
     def run_forever(self) -> int:
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -90,11 +91,7 @@ class TinyRuntimePlatformLoop:
             if isinstance(command, dict):
                 self._dispatch_runtime_command(command)
             if response.get("assigned") is not True:
-                self._safe_post_runtime_state(
-                    "healthy",
-                    "control plane ready; awaiting binding",
-                    {"assigned": False},
-                )
+                self._report_ready()
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
             binding = response.get("binding")
@@ -139,10 +136,22 @@ class TinyRuntimePlatformLoop:
 
     def _report_ready(self) -> None:
         try:
+            self._post_runtime_state(
+                "healthy",
+                "control plane ready; awaiting binding",
+                {"assigned": False},
+            )
+        except Exception as exc:  # noqa: BLE001 - do not mark hot-ready without the report
+            LOG.info("ready report deferred until runtime-state succeeds: %s", exc)
+            return
+        if self.ready_reported:
+            return
+        try:
             self.client.post_json(
                 "/hapi/v1/computers/me/state",
                 {"state": "ready", "detail": "tiny_runtime platform loop ready"},
             )
+            self.ready_reported = True
             LOG.info("reported state=ready")
         except Exception as exc:  # noqa: BLE001 - ready may already be assigned
             LOG.info("ready report skipped/deferred: %s", exc)
@@ -242,6 +251,7 @@ class TinyRuntimePlatformLoop:
             )
             if response.get("assigned") is not True:
                 LOG.info("platform unassigned this Computer; returning to binding wait")
+                self.ready_reported = False
                 self._report_ready()
                 return
             next_binding = response.get("binding")
