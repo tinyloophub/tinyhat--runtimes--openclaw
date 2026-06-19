@@ -77,10 +77,12 @@ Computer-local OpenClaw SecretRef source, and calls the official:
 openclaw secrets reload --json
 ```
 
-It does not request a gateway or systemd restart. If OpenClaw reports that the
-change would need a non-hot env-block refresh, the command fails closed with a
-non-secret `failure_label=unsupported_interface` diagnostic so the platform can
-block the release rather than falsely telling the owner a credential is ready.
+SecretRef-backed fields hot-refresh through `openclaw secrets reload`. When an
+env-block credential changes, the runtime writes the new local config, posts the
+applied command result, then requests the existing local gateway rebind so child
+shells pick up the new environment. It still never asks systemd or the
+supervisor to restart the Computer runtime, and `systemd_restart_requested` stays
+`false`.
 
 `link_chatgpt` starts the official OpenClaw device-code flow for the local
 Computer. OAuth tokens stay on the Computer; the platform receives only the
