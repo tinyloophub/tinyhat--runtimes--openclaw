@@ -1114,6 +1114,37 @@ class BakeScriptTests(unittest.TestCase):
                 lock["dependencies"]["tinyhat_openclaw_plugin"]["ref"],
             )
 
+    def test_assemble_bundle_uses_explicit_authority_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "bundle"
+            env = {
+                **os.environ,
+                "TINYHAT_OPENCLAW_REF": "openclaw@2026.6.8",
+                "TINYHAT_PLUGIN_REF": "0d79c3ca35161c05b4987cff286f85e2c988a29d",
+            }
+            completed = subprocess.run(
+                [
+                    str(_REPO_ROOT / "tiny_runtime" / "bake" / "assemble-bundle.sh"),
+                    str(out_dir),
+                ],
+                cwd=_REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = bundle.load_manifest(out_dir)
+            self.assertTrue(bundle.verify_manifest(out_dir, manifest))
+            self.assertEqual(
+                manifest["components"]["openclaw"]["ref"],
+                "openclaw@2026.6.8",
+            )
+            self.assertEqual(
+                manifest["components"]["tinyhat_openclaw_plugin"]["ref"],
+                "0d79c3ca35161c05b4987cff286f85e2c988a29d",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
