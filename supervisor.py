@@ -2802,16 +2802,15 @@ def _apply_runtime_secret_env_block(
 def _signal_rebind_for_secrets() -> None:
     """Ask the supervisor's main loop for a local gateway rebind.
 
-    ``applyConfigEnvVars`` only runs at OpenClaw gateway boot, so a
-    change to ``config["env"]`` does not reach the bash tool's
-    ``process.env`` until the gateway is rebound. Reuse the existing
-    rebind machinery (stop → poll ``/me/binding`` → fresh config → fresh
-    gateway) rather than inventing a parallel restart path; the binding
-    watchdog and gateway-health probe already understand that flow.
+    ``applyConfigEnvVars`` and model-auth route selection are gateway-start
+    config. SecretRef-only changes stay hot via ``openclaw secrets reload``,
+    but gateway-start config needs the existing rebind machinery (stop -> poll
+    ``/me/binding`` -> fresh config -> fresh gateway). This is a local
+    OpenClaw gateway rebind, not a systemd supervisor restart.
     """
     log.info(
-        "runtime-secret env block changed; signaling gateway rebind so "
-        "applyConfigEnvVars picks up the new keys"
+        "runtime config changed; signaling local gateway rebind so OpenClaw "
+        "refreshes gateway-start config"
     )
     _stop_holder["rebind"] = True
     _stop_holder["stop"] = True
@@ -2842,9 +2841,11 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str], *, dry_run: bool = 
     env_block_changed = previous_env != current_env
     if not dry_run:
         _atomic_write_json(config_path, config, runtime_owned=True)
+    action = "checked" if dry_run else "synced"
     log.info(
-        "synced OpenClaw SecretRef config (provider=%s openai_ref=%s "
+        "%s OpenClaw SecretRef config (provider=%s openai_ref=%s "
         "env_block_changed=%s env_keys=%d)",
+        action,
         TINYHAT_SECRETS_PROVIDER,
         "yes" if (secrets.get(TINYHAT_OPENAI_API_KEY_NAME) or "").strip() else "no",
         "yes" if env_block_changed else "no",
@@ -3054,6 +3055,66 @@ def apply_runtime_secret_map(*, revision: int, secrets: dict[str, str], dry_run:
         "reload": reload_result,
         "env_block_changed": env_block_changed,
     }
+
+
+def apply_runtime_config_for_runtime_command(
+    *, revision: int, secrets: dict[str, str], dry_run: bool = False
+) -> dict:
+    """Apply a typed ``apply_config`` command and detect gateway-start drift.
+
+    Runtime secrets can be hot-reloaded through SecretRef. Model-auth route
+    changes (for example platform credits -> ChatGPT subscription) are not a
+    SecretRef change: they rewrite OpenClaw's gateway-start config and require
+    one controlled local gateway rebind after the command result is durably
+    posted.
+    """
+    result = apply_runtime_secret_map(
+        revision=revision,
+        secrets=secrets,
+        dry_run=dry_run,
+    )
+    result.setdefault("gateway_config_changed", False)
+    result["model_auth_signature_changed"] = False
+    result["gateway_rebind_required"] = bool(result.get("env_block_changed"))
+    if dry_run:
+        return result
+
+    resp = get_json(_binding_poll_path(wait_seconds=0))
+    if resp.get("assigned") is False:
+        raise RuntimeError("platform unassigned this Computer during apply_config")
+    binding = resp.get("binding")
+    if not isinstance(binding, dict):
+        raise RuntimeError("/me/binding returned no binding during apply_config")
+
+    owner_signature = _owner_identity_signature(binding)
+    cached_owner_signature = _stop_holder.get("owner_signature")
+    if cached_owner_signature and owner_signature != cached_owner_signature:
+        raise RuntimeError(
+            "binding owner changed during apply_config; refusing hot config refresh"
+        )
+
+    model_auth_signature = _binding_model_auth_signature(binding)
+    cached_model_auth_signature = _stop_holder.get("model_auth_signature")
+    model_auth_changed = (
+        bool(cached_model_auth_signature)
+        and model_auth_signature != cached_model_auth_signature
+    )
+    if not model_auth_changed:
+        return result
+
+    try:
+        before = _openclaw_config_fingerprint().get("value")
+    except FileNotFoundError:
+        before = None
+    write_openclaw_config(binding)
+    try:
+        after = _openclaw_config_fingerprint().get("value")
+    except FileNotFoundError:
+        after = None
+    result["model_auth_signature_changed"] = True
+    result["gateway_config_changed"] = before != after
+    result["gateway_rebind_required"] = True
+    return result
 
 
 def openclaw_auth_profiles_path(*, agent_id: str = DEFAULT_OPENCLAW_AGENT_ID) -> str:
@@ -4428,11 +4489,18 @@ def stop_openclaw_gateway() -> None:
 #                 every fresh ``/me/binding`` response so a fast
 #                 unassign + reassign that lands inside the heartbeat
 #                 window still triggers a clean rebind.
+# ``owner_signature`` — subset used to decide when OAuth auth stores must be
+#                 wiped because the Computer changed owners.
+# ``model_auth_signature`` — model/auth route last written during Phase D.
+#                 Typed apply_config uses this to own platform-credits <->
+#                 ChatGPT subscription rebinds without racing the watchdog.
 _stop_holder = {
     "stop": False,
     "rebind": False,
     "component_update_restart": False,
     "signature": None,
+    "owner_signature": None,
+    "model_auth_signature": None,
 }
 _config_apply_state = {
     "failed_revision": None,
@@ -4476,16 +4544,12 @@ def _binding_signature(binding: dict) -> tuple:
     Any change in any field between two consecutive watchdog polls
     indicates the platform replaced the binding under us — admin
     re-assigned the same VPS (different bot, different account,
-    different owner, or new vault row with a fresh token, or an
-    OpenRouter child key + base URL + default model that appeared
-    after a transient vault miss on the first poll), OR the owner
-    linked or unlinked ChatGPT subscription state changed. A pending
-    device-code flow is normalized as platform credits because
-    ``write_openclaw_config`` also keeps the OpenRouter-backed config
-    until the local OAuth profile exists. This prevents the watchdog
-    from restarting the gateway mid-tool while the agent is sending
-    the verification URL + code; the linked model ref still triggers
-    the rebind that rewrites openclaw.json for the subscription.
+    different owner, or new vault row with a fresh token, or an OpenRouter
+    child key + base URL + default model that appeared after a transient
+    vault miss on the first poll). Model-auth route flips are deliberately
+    excluded: typed ``apply_config`` owns the controlled local rebind for
+    platform-credits <-> ChatGPT subscription changes, so the watchdog does
+    not race the command result POST.
     """
     return (
         str(binding.get("telegram_bot_user_id") or ""),
@@ -4497,7 +4561,6 @@ def _binding_signature(binding: dict) -> tuple:
         str(binding.get("openrouter_base_url") or ""),
         str(binding.get("openrouter_default_model") or ""),
         json.dumps(binding.get("openrouter_model_package") or {}, sort_keys=True),
-        *_binding_model_auth_signature(binding),
     )
 
 
@@ -6445,7 +6508,7 @@ def handle_runtime_command(command: dict) -> None:
         command,
         post_json=post_json,
         get_json=get_json,
-        apply_runtime_config=apply_runtime_secret_map,
+        apply_runtime_config=apply_runtime_config_for_runtime_command,
         start_chatgpt_link=handle_start_chatgpt_link_command,
         request_runtime_secret_rebind=_signal_rebind_for_secrets,
         logger=log,
@@ -6830,6 +6893,14 @@ def _run_one_binding_cycle() -> int:
             phase_spans=phase_spans,
             gateway_result=gateway_result,
         )
+    except urllib.error.HTTPError as http_exc:
+        if http_exc.code == 400:
+            log.info(
+                "active /me/state POST skipped: platform already has a later "
+                "state (HTTP 400)"
+            )
+        else:
+            log.exception("active /me/state POST failed: %s", http_exc)
     except Exception as exc:
         log.exception("active /me/state POST failed: %s", exc)
 
@@ -6841,6 +6912,7 @@ def _run_one_binding_cycle() -> int:
     # change = wipe; mode flip for the same owner = don't wipe).
     _stop_holder["signature"] = _binding_signature(binding)
     _stop_holder["owner_signature"] = _owner_identity_signature(binding)
+    _stop_holder["model_auth_signature"] = _binding_model_auth_signature(binding)
     log.info(
         "phase D: binding signature locked (bot=@%s owner=%s)",
         binding.get("telegram_bot_username"),
@@ -6918,6 +6990,8 @@ def _run_one_binding_cycle() -> int:
             notify_watchdog_checkpoint("phase-d-platform-heartbeat")
             if isinstance(command, dict):
                 handle_heartbeat_command(command, binding=binding)
+                if _stop_holder["stop"]:
+                    return 0
             # Watchdog: did the platform unassign us OR swap the
             # binding under us? Both cases must trigger rebind. The
             # unassign + immediate reassign path can land inside the

@@ -437,6 +437,10 @@ class RuntimeCommandRunner:
             "secret_count": int(result.get("secret_count") or len(secrets)),
             "reload": result.get("reload") or {},
             "env_block_changed": bool(result.get("env_block_changed")),
+            "gateway_config_changed": bool(result.get("gateway_config_changed")),
+            "model_auth_signature_changed": bool(
+                result.get("model_auth_signature_changed")
+            ),
             "gateway_rebind_requested": False,
             "restart_requested": False,
             "systemd_restart_requested": False,
@@ -466,7 +470,14 @@ class RuntimeCommandRunner:
                 "secret_count": int(result.get("secret_count") or len(secrets)),
                 "reload": result.get("reload") or {},
                 "env_block_changed": bool(result.get("env_block_changed")),
-                "gateway_rebind_requested": bool(result.get("env_block_changed")),
+                "gateway_config_changed": bool(result.get("gateway_config_changed")),
+                "model_auth_signature_changed": bool(
+                    result.get("model_auth_signature_changed")
+                ),
+                "gateway_rebind_requested": bool(
+                    result.get("gateway_rebind_required")
+                    or result.get("env_block_changed")
+                ),
                 "restart_requested": False,
                 "systemd_restart_requested": False,
             }

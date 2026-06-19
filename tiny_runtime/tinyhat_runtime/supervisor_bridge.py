@@ -86,7 +86,9 @@ def _result_needs_runtime_secret_rebind(result: dict[str, Any]) -> bool:
     if result.get("kind") != "apply_config" or result.get("status") != "applied":
         return False
     payload = result.get("result")
-    return isinstance(payload, dict) and bool(payload.get("env_block_changed"))
+    return isinstance(payload, dict) and bool(
+        payload.get("gateway_rebind_requested") or payload.get("env_block_changed")
+    )
 
 
 def _default_runtime_command_runner(

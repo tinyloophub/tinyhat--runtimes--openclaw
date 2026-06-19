@@ -4478,6 +4478,7 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                 "rebind": False,
                 "signature": None,
                 "owner_signature": None,
+                "model_auth_signature": None,
             }
         )
 
@@ -5913,7 +5914,7 @@ class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
 
 
 class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
-    """Issue #23 / PR #24 review #1 — signature must move on a mode flip."""
+    """Model-auth route flips are command-owned, not watchdog identity."""
 
     def _base_binding(self) -> dict:
         return {
@@ -5935,14 +5936,24 @@ class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
             supervisor._binding_signature(after),
         )
 
-    def test_signature_moves_when_subscription_model_ref_links(self) -> None:
+    def test_signature_stays_stable_when_subscription_model_ref_links(self) -> None:
+        before = dict(
+            self._base_binding(), llm_auth_mode="chatgpt_subscription"
+        )
+        after = dict(before, llm_model_ref="openai/gpt-5.5")
+        self.assertEqual(
+            supervisor._binding_signature(before),
+            supervisor._binding_signature(after),
+        )
+
+    def test_model_auth_signature_moves_when_subscription_model_ref_links(self) -> None:
         before = dict(
             self._base_binding(), llm_auth_mode="chatgpt_subscription"
         )
         after = dict(before, llm_model_ref="openai/gpt-5.5")
         self.assertNotEqual(
-            supervisor._binding_signature(before),
-            supervisor._binding_signature(after),
+            supervisor._binding_model_auth_signature(before),
+            supervisor._binding_model_auth_signature(after),
         )
 
     def test_owner_signature_stable_across_mode_flip(self) -> None:
@@ -8378,6 +8389,74 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
 class RuntimeCommandDispatchTests(unittest.TestCase):
     """Heartbeat-delivered ``runtime_command`` bridge (tinyloophub/tinyloop#818)."""
 
+    def test_apply_config_refreshes_subscription_config_as_command_rebind(
+        self,
+    ) -> None:
+        package = {
+            "default_model": "deepseek/deepseek-v4-pro",
+            "default_role": "default",
+            "enabled_roles": ["cheap", "default"],
+            "models": {
+                "cheap": "deepseek/deepseek-v4-flash",
+                "default": "deepseek/deepseek-v4-pro",
+            },
+        }
+        before_binding = _openrouter_binding(package)
+        linked_binding = {
+            **before_binding,
+            "llm_auth_mode": "chatgpt_subscription",
+            "llm_model_ref": "openai/gpt-5.5",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(
+                    tmpdir, "tinyhat-secrets.json"
+                ),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(before_binding)
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                old_holder = dict(supervisor._stop_holder)
+                supervisor._stop_holder.update(
+                    {
+                        "owner_signature": supervisor._owner_identity_signature(
+                            before_binding
+                        ),
+                        "model_auth_signature": supervisor._binding_model_auth_signature(
+                            before_binding
+                        ),
+                    }
+                )
+                try:
+                    with (
+                        patch.object(
+                            supervisor,
+                            "get_json",
+                            return_value={"assigned": True, "binding": linked_binding},
+                        ),
+                        patch.object(
+                            supervisor,
+                            "reload_openclaw_secrets",
+                            return_value={"ok": True},
+                        ),
+                    ):
+                        result = supervisor.apply_runtime_config_for_runtime_command(
+                            revision=8,
+                            secrets={},
+                            dry_run=False,
+                        )
+                finally:
+                    supervisor._stop_holder.clear()
+                    supervisor._stop_holder.update(old_holder)
+
+        self.assertFalse(result["env_block_changed"])
+        self.assertTrue(result["model_auth_signature_changed"])
+        self.assertTrue(result["gateway_config_changed"])
+        self.assertTrue(result["gateway_rebind_required"])
+
     def test_dispatch_routes_runtime_command_to_runner_and_posts_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = os.path.join(tmp, "cmd-diagnostics.zip")
@@ -8563,13 +8642,16 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
                     **kwargs,
                 )
 
-            def fake_apply_runtime_secret_map(**kwargs) -> dict:
+            def fake_apply_runtime_config(**kwargs) -> dict:
                 applies.append(kwargs)
                 return {
                     "revision": kwargs["revision"],
                     "secret_count": len(kwargs["secrets"]),
                     "reload": {"ok": True, "dry_run": bool(kwargs.get("dry_run"))},
                     "env_block_changed": False,
+                    "gateway_config_changed": False,
+                    "model_auth_signature_changed": False,
+                    "gateway_rebind_required": False,
                 }
 
             with (
@@ -8583,8 +8665,8 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
                 ) as get_json,
                 patch.object(
                     supervisor,
-                    "apply_runtime_secret_map",
-                    side_effect=fake_apply_runtime_secret_map,
+                    "apply_runtime_config_for_runtime_command",
+                    side_effect=fake_apply_runtime_config,
                 ),
                 patch.object(supervisor_bridge, "RuntimeCommandRunner", runner_factory),
                 patch.object(supervisor, "post_json") as post_json,
