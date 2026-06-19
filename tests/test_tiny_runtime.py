@@ -1027,6 +1027,33 @@ class PlatformLoopTests(unittest.TestCase):
             "no_assignment_restart",
         )
 
+    def test_gateway_ready_wait_covers_openclaw_self_restart(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        self.assertGreaterEqual(platform_loop.GATEWAY_READY_WAIT_SECONDS, 75)
+
+    def test_gateway_ready_wait_polls_until_official_health_recovers(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = Mock()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                side_effect=[
+                    {"state": "unhealthy"},
+                    {"state": "healthy", "gateway": {"ok": True}},
+                ],
+            ) as gateway_health,
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            health = loop._wait_for_gateway_ready()
+
+        self.assertEqual(health["state"], "healthy")
+        self.assertEqual(gateway_health.call_count, 2)
+
     def test_binding_activation_failure_reports_supported_runtime_state(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -1453,6 +1480,8 @@ class BakeScriptTests(unittest.TestCase):
             self.assertTrue(os.access(helper, os.X_OK))
             helper_text = helper.read_text(encoding="utf-8")
             self.assertIn("tinyhat_runtime.main bake preinstall-plugins", helper_text)
+            self.assertIn("chown -R 0:0", helper_text)
+            self.assertNotIn('chown -R "${runtime_user}:${runtime_group}"', helper_text)
             self.assertNotIn("import supervisor", helper_text)
             self.assertNotIn("ensure_codex_subscription_plugin_installed", helper_text)
             self.assertNotIn("ensure_tinyhat_plugin_installed", helper_text)
