@@ -7,6 +7,12 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.5
+
+Patch release for Tinyloop `tiny_runtime_bundle` image bakes that need the
+bundle manifest, attestation, and image catalog to resolve from the same
+platform authority refs.
+
 ### Fixed
 
 - Let the `tiny_runtime` bundle assembler take explicit OpenClaw and Tinyhat
