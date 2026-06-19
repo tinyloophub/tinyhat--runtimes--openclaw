@@ -19,16 +19,20 @@ export PYTHONPATH="${repo_root}/tiny_runtime${PYTHONPATH:+:${PYTHONPATH}}"
 
 install -d -m 0750 "$(dirname -- "${config_path}")"
 install -d -m 0700 "${state_dir}" "${state_dir}/workspace"
-if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
-  chown -R "${runtime_user}:${runtime_group}" \
+if [[ "$(id -u)" -eq 0 ]]; then
+  # OpenClaw's plugin loader rejects non-root-owned plugin candidates when the
+  # gateway runs as root. The baked image runs the gateway through systemd
+  # without a User= override, so initialize plugin/config/state candidates as
+  # root-owned rather than preserving temporary bake user ownership.
+  chown -R 0:0 \
     "$(dirname -- "${config_path}")" \
     "${state_dir}"
 fi
 
 python3 -m tinyhat_runtime.main bake preinstall-plugins >/tmp/tinyhat-hot-image-plugins.json
 
-if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
-  chown -R "${runtime_user}:${runtime_group}" \
+if [[ "$(id -u)" -eq 0 ]]; then
+  chown -R 0:0 \
     "$(dirname -- "${config_path}")" \
     "${state_dir}"
 fi

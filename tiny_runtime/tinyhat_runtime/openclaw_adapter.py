@@ -117,9 +117,9 @@ def config_patch(
     replace_paths: Sequence[str] = (),
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
-    args: list[str] = ["config", "patch", "--stdin", "--json"]
+    args: list[str] = ["config", "patch", "--stdin"]
     if dry_run:
-        args.append("--dry-run")
+        args.extend(["--dry-run", "--json"])
     for path in replace_paths:
         args.extend(["--replace-path", path])
     result = run_openclaw(
@@ -188,43 +188,33 @@ def secrets_reload(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     return {"state": "ready", "secrets": redact_json(result.json_payload())}
 
 
-def binding_config_patch(
-    binding: dict[str, Any],
+def _tinyhat_file_secret_ref(pointer: str) -> dict[str, str]:
+    return {"source": "file", "provider": "tinyhat", "id": pointer}
+
+
+def _tinyhat_plugin_config(
     *,
     platform_base_url: str | None = None,
     backend_audience: str | None = None,
 ) -> dict[str, Any]:
-    owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
-    bot_token = str(binding.get("telegram_bot_token") or "").strip()
-    if not owner_id:
-        raise ValueError("binding is missing telegram_owner_user_id")
-    if not bot_token:
-        raise ValueError("binding is missing telegram_bot_token")
-
-    openrouter_key = str(binding.get("openrouter_api_key") or "").strip()
-    openrouter_base = str(binding.get("openrouter_base_url") or "").strip()
-    openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
-    llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
-    llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits").strip()
-
-    primary_model = (
-        llm_model_ref
-        if llm_auth_mode == "chatgpt_subscription" and llm_model_ref
-        else f"openrouter/{openrouter_model.lstrip('/')}"
-        if openrouter_model
-        else "openai/gpt-5.5"
-    )
-    env_block: dict[str, str] = {}
-    if openrouter_key:
-        env_block["OPENROUTER_API_KEY"] = openrouter_key
-
-    tinyhat_plugin_config: dict[str, Any] = {}
+    config: dict[str, Any] = {}
     if platform_base_url:
-        tinyhat_plugin_config["platformBaseUrl"] = platform_base_url
+        config["platformBaseUrl"] = platform_base_url
     if backend_audience:
-        tinyhat_plugin_config["backendAudience"] = backend_audience
+        config["backendAudience"] = backend_audience
+    return config
 
-    patch: dict[str, Any] = {
+
+def warm_image_config_patch(
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+) -> dict[str, Any]:
+    tinyhat_plugin_config = _tinyhat_plugin_config(
+        platform_base_url=platform_base_url,
+        backend_audience=backend_audience,
+    )
+    return {
         "gateway": {
             "mode": "local",
             "bind": "loopback",
@@ -235,20 +225,17 @@ def binding_config_patch(
         "agents": {
             "defaults": {
                 "workspace": str(paths.OPENCLAW_STATE_DIR / "workspace"),
-                "model": {"primary": primary_model},
+                "model": {"primary": "openai/gpt-5.5"},
                 "compaction": {"reserveTokensFloor": 20000},
             }
         },
         "channels": {
             "telegram": {
-                "enabled": True,
-                "dmPolicy": "allowlist",
+                "enabled": False,
+                "dmPolicy": "disabled",
                 "groupPolicy": "disabled",
-                "allowFrom": [owner_id],
-                "botToken": bot_token,
             }
         },
-        "commands": {"ownerAllowFrom": [f"telegram:{owner_id}"]},
         "plugins": {
             "entries": {
                 "telegram": {"enabled": True},
@@ -273,12 +260,153 @@ def binding_config_patch(
         },
         "session": {"dmScope": "per-channel-peer"},
     }
-    if openrouter_base:
-        patch.setdefault("models", {}).setdefault("providers", {})["openrouter"] = {
-            "baseURL": openrouter_base
+
+
+def apply_warm_image_config(
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    return config_patch(
+        warm_image_config_patch(
+            platform_base_url=platform_base_url,
+            backend_audience=backend_audience,
+        ),
+        replace_paths=("channels.telegram",),
+        runner=runner,
+    )
+
+
+def _deep_merge_json_objects(
+    existing: dict[str, Any],
+    overlay: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in overlay.items():
+        previous = merged.get(key)
+        if isinstance(previous, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_json_objects(previous, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_existing_secrets(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _count_secret_leaves(payload: Any) -> int:
+    if isinstance(payload, dict):
+        return sum(_count_secret_leaves(value) for value in payload.values())
+    return 1
+
+
+def write_openclaw_secrets(
+    secrets: dict[str, Any],
+    *,
+    merge: bool = True,
+) -> dict[str, Any]:
+    paths.OPENCLAW_SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_existing_secrets(paths.OPENCLAW_SECRETS_PATH) if merge else {}
+    payload = _deep_merge_json_objects(existing, secrets)
+    tmp_path = paths.OPENCLAW_SECRETS_PATH.with_name(
+        f".{paths.OPENCLAW_SECRETS_PATH.name}.tmp"
+    )
+    tmp_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.chmod(0o600)
+    tmp_path.replace(paths.OPENCLAW_SECRETS_PATH)
+    return {
+        "state": "ready",
+        "secret_count": _count_secret_leaves(secrets),
+        "merged": merge,
+    }
+
+
+def binding_secrets_payload(binding: dict[str, Any]) -> dict[str, Any]:
+    bot_token = str(binding.get("telegram_bot_token") or "").strip()
+    if not bot_token:
+        raise ValueError("binding is missing telegram_bot_token")
+    openrouter_key = str(binding.get("openrouter_api_key") or "").strip()
+    return {
+        "channels": {"telegram": {"botToken": bot_token}},
+        "providers": {"openrouter": {"apiKey": openrouter_key}},
+    }
+
+
+def binding_config_patch(
+    binding: dict[str, Any],
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+) -> dict[str, Any]:
+    owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
+    bot_token = str(binding.get("telegram_bot_token") or "").strip()
+    if not owner_id:
+        raise ValueError("binding is missing telegram_owner_user_id")
+    if not bot_token:
+        raise ValueError("binding is missing telegram_bot_token")
+
+    openrouter_key = str(binding.get("openrouter_api_key") or "").strip()
+    openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
+    llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
+    llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits").strip()
+
+    primary_model = (
+        llm_model_ref
+        if llm_auth_mode == "chatgpt_subscription" and llm_model_ref
+        else f"openrouter/{openrouter_model.lstrip('/')}"
+        if openrouter_model
+        else "openai/gpt-5.5"
+    )
+    tinyhat_plugin_config = _tinyhat_plugin_config(
+        platform_base_url=platform_base_url,
+        backend_audience=backend_audience,
+    )
+
+    patch: dict[str, Any] = {
+        "agents": {"defaults": {"model": {"primary": primary_model}}},
+        "channels": {
+            "telegram": {
+                "enabled": True,
+                "dmPolicy": "allowlist",
+                "groupPolicy": "disabled",
+                "allowFrom": [owner_id],
+                "botToken": _tinyhat_file_secret_ref("/channels/telegram/botToken"),
+                "execApprovals": {"approvers": [owner_id]},
+            }
+        },
+        "plugins": {
+            "entries": {
+                "tinyhat": {"config": tinyhat_plugin_config},
+            }
+        },
+        "secrets": {
+            "providers": {
+                "tinyhat": {
+                    "source": "file",
+                    "path": str(paths.OPENCLAW_SECRETS_PATH),
+                    "mode": "json",
+                }
+            },
+            "defaults": {"file": "tinyhat"},
+        },
+        "session": {"dmScope": "per-channel-peer"},
+    }
+    if openrouter_key:
+        patch["models"] = {
+            "providers": {
+                "openrouter": {
+                    "apiKey": _tinyhat_file_secret_ref("/providers/openrouter/apiKey")
+                }
+            }
         }
-    if env_block:
-        patch["env"] = env_block
     return patch
 
 
@@ -287,6 +415,7 @@ def apply_binding_config(
     *,
     platform_base_url: str | None = None,
     backend_audience: str | None = None,
+    preserve_existing_secrets: bool = True,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
     patch = binding_config_patch(
@@ -294,11 +423,17 @@ def apply_binding_config(
         platform_base_url=platform_base_url,
         backend_audience=backend_audience,
     )
-    return config_patch(
+    secrets_result = write_openclaw_secrets(
+        binding_secrets_payload(binding),
+        merge=preserve_existing_secrets,
+    )
+    patch_result = config_patch(
         patch,
-        replace_paths=("plugins.entries", "channels.telegram", "commands.ownerAllowFrom"),
+        replace_paths=("channels.telegram",),
         runner=runner,
     )
+    patch_result["secrets"] = secrets_result
+    return patch_result
 
 
 def _redact_zip_member(name: str, data: bytes) -> bytes:

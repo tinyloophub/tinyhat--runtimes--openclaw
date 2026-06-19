@@ -8,7 +8,6 @@ this loop never restarts OpenClaw as part of assignment activation.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import signal
@@ -32,7 +31,7 @@ BINDING_WAIT_SECONDS = float(os.environ.get("TINYHAT_BINDING_WAIT_SECONDS", "25"
 IDLE_SLEEP_SECONDS = float(os.environ.get("TINYHAT_BINDING_IDLE_SLEEP_SECONDS", "1"))
 HEARTBEAT_SECONDS = float(os.environ.get("TINYHAT_HEARTBEAT_SECONDS", "30"))
 GATEWAY_READY_WAIT_SECONDS = float(
-    os.environ.get("TINYHAT_GATEWAY_READY_WAIT_SECONDS", "20")
+    os.environ.get("TINYHAT_GATEWAY_READY_WAIT_SECONDS", "90")
 )
 GATEWAY_READY_POLL_SECONDS = float(
     os.environ.get("TINYHAT_GATEWAY_READY_POLL_SECONDS", "0.5")
@@ -60,6 +59,7 @@ class TinyRuntimePlatformLoop:
     def __init__(self, *, client: PlatformClient | None = None) -> None:
         self.client = client or default_platform_client()
         self.stop_requested = False
+        self.ready_reported = False
 
     def run_forever(self) -> int:
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -90,11 +90,7 @@ class TinyRuntimePlatformLoop:
             if isinstance(command, dict):
                 self._dispatch_runtime_command(command)
             if response.get("assigned") is not True:
-                self._safe_post_runtime_state(
-                    "healthy",
-                    "control plane ready; awaiting binding",
-                    {"assigned": False},
-                )
+                self._report_ready()
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
             binding = response.get("binding")
@@ -123,7 +119,7 @@ class TinyRuntimePlatformLoop:
                 detail = f"binding activation failed: {redact_text(str(exc), limit=1000)}"
                 LOG.exception(detail)
                 self._safe_post_runtime_state(
-                    "unhealthy",
+                    "openclaw_not_ready",
                     detail,
                     {
                         "assigned": True,
@@ -139,18 +135,29 @@ class TinyRuntimePlatformLoop:
 
     def _report_ready(self) -> None:
         try:
-            self.client.post_json(
-                "/hapi/v1/computers/me/state",
-                {"state": "ready", "detail": "tiny_runtime platform loop ready"},
+            self._post_runtime_state(
+                "healthy",
+                "control plane ready; awaiting binding",
+                {"assigned": False},
             )
-            LOG.info("reported state=ready")
-        except Exception as exc:  # noqa: BLE001 - ready may already be assigned
-            LOG.info("ready report skipped/deferred: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - do not mark hot-ready without the report
+            LOG.info("ready report deferred until runtime-state succeeds: %s", exc)
+            return
+        if self.ready_reported:
+            return
+        state_posted = self._post_lifecycle_state(
+            "ready",
+            "tiny_runtime platform loop ready",
+            already_state="ready",
+        )
+        self.ready_reported = True
+        if state_posted:
+            LOG.info("confirmed state=ready")
 
     def _poll_binding(self) -> dict[str, Any]:
         path = (
             "/hapi/v1/computers/me/binding"
-            f"?wait_seconds={BINDING_WAIT_SECONDS:g}&include_command=true"
+            f"?wait_seconds={BINDING_WAIT_SECONDS:g}&include_command=false"
         )
         return self.client.get_json(path, timeout=int(BINDING_WAIT_SECONDS + 10))
 
@@ -162,12 +169,14 @@ class TinyRuntimePlatformLoop:
         cycle_started: float,
         binding_received: float,
         phase_spans: list[dict[str, Any]],
+        preserve_existing_secrets: bool = True,
     ) -> None:
         config_started = time.monotonic()
         config_result = openclaw_adapter.apply_binding_config(
             binding,
             platform_base_url=platform_base_url_from_env(),
             backend_audience=backend_audience_from_env(),
+            preserve_existing_secrets=preserve_existing_secrets,
         )
         if config_result.get("state") != "ready":
             raise RuntimeError(f"OpenClaw config patch failed: {config_result}")
@@ -182,9 +191,10 @@ class TinyRuntimePlatformLoop:
         phase_spans.append(_phase("bot_ready", "bot-ready", ready_started, ready_done))
 
         active_started = time.monotonic()
-        self.client.post_json(
-            "/hapi/v1/computers/me/state",
-            {"state": "active", "detail": "tiny_runtime OpenClaw ready"},
+        self._post_lifecycle_state(
+            "active",
+            "tiny_runtime OpenClaw ready",
+            already_state="active",
         )
         active_done = time.monotonic()
         phase_spans.append(_phase("binding_ack", "binding ack", active_started, active_done))
@@ -242,19 +252,25 @@ class TinyRuntimePlatformLoop:
             )
             if response.get("assigned") is not True:
                 LOG.info("platform unassigned this Computer; returning to binding wait")
+                self.ready_reported = False
                 self._report_ready()
                 return
             next_binding = response.get("binding")
             if isinstance(next_binding, dict) and self._binding_signature(next_binding) != current_signature:
                 LOG.info("binding changed; applying new identity bind")
+                preserve_existing_secrets = (
+                    self._binding_owner_id(next_binding) == self._binding_owner_id(binding)
+                )
                 self._activate_binding(
                     next_binding,
                     cycle_started_wall=time.time(),
                     cycle_started=time.monotonic(),
                     binding_received=time.monotonic(),
                     phase_spans=[],
+                    preserve_existing_secrets=preserve_existing_secrets,
                 )
                 current_signature = self._binding_signature(next_binding)
+                binding = next_binding
             elapsed = time.monotonic() - started
             time.sleep(max(1.0, HEARTBEAT_SECONDS - elapsed))
 
@@ -268,6 +284,37 @@ class TinyRuntimePlatformLoop:
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"OpenClaw gateway was not ready: {last_health}")
             time.sleep(max(0.1, GATEWAY_READY_POLL_SECONDS))
+
+    def _post_lifecycle_state(
+        self,
+        state: str,
+        detail: str,
+        *,
+        already_state: str,
+    ) -> bool:
+        try:
+            self.client.post_json(
+                "/hapi/v1/computers/me/state",
+                {"state": state, "detail": detail},
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - status check decides if this is stale
+            try:
+                status = self.client.get_json(
+                    "/hapi/v1/computers/me/platform-status",
+                    timeout=10,
+                )
+            except Exception:
+                raise exc
+            if status.get("state") == already_state:
+                if state == "active" and status.get("assigned") is not True:
+                    raise exc
+                LOG.info(
+                    "state=%s already satisfied by platform; continuing",
+                    state,
+                )
+                return False
+            raise exc
 
     def _dispatch_runtime_command(self, command: dict[str, Any]) -> None:
         runtime_command = command.get("command")
@@ -299,13 +346,7 @@ class TinyRuntimePlatformLoop:
         # through the official OpenClaw secrets surface; env-block changes must
         # move to OpenClaw hot secret refs rather than restarting the gateway.
         if not dry_run:
-            from . import paths
-
-            paths.OPENCLAW_SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            paths.OPENCLAW_SECRETS_PATH.write_text(
-                json.dumps(secrets, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            openclaw_adapter.write_openclaw_secrets(secrets)
         reload_result = (
             {"skipped": True, "reason": "dry_run"}
             if dry_run
@@ -358,7 +399,12 @@ class TinyRuntimePlatformLoop:
             },
         }
         if extra:
-            payload.update(extra)
+            gateway_extra = extra.get("gateway")
+            payload.update(
+                {key: value for key, value in extra.items() if key != "gateway"}
+            )
+            if isinstance(gateway_extra, dict):
+                payload["gateway"] = {**payload["gateway"], **gateway_extra}
         self.client.post_json("/hapi/v1/computers/me/runtime-state", payload)
 
     def _safe_post_runtime_state(
@@ -421,6 +467,10 @@ class TinyRuntimePlatformLoop:
             str(binding.get("llm_auth_mode") or ""),
             str(binding.get("llm_model_ref") or ""),
         )
+
+    @staticmethod
+    def _binding_owner_id(binding: dict[str, Any]) -> str:
+        return str(binding.get("telegram_owner_user_id") or "")
 
 
 def main() -> int:

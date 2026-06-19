@@ -20,6 +20,7 @@ from . import (
     platform_loop,
 )
 from .command_ledger import CommandLedger
+from .platform_client import backend_audience_from_env, platform_base_url_from_env
 from .runtime_commands import RuntimeCommandRunner, load_command_file
 
 
@@ -127,6 +128,15 @@ def _cmd_platform_loop(_args: argparse.Namespace) -> int:
     return platform_loop.main()
 
 
+def _cmd_platform_warm_config(args: argparse.Namespace) -> int:
+    payload = openclaw_adapter.apply_warm_image_config(
+        platform_base_url=args.platform_base_url or platform_base_url_from_env(),
+        backend_audience=args.backend_audience or backend_audience_from_env(),
+    )
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("state") == "ready" else 1
+
+
 def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
     payload = hot_image.preinstall_hot_image_plugins()
     print(json.dumps(payload, sort_keys=True))
@@ -202,6 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
     platform_sub = platform.add_subparsers(dest="platform_command", required=True)
     loop = platform_sub.add_parser("loop")
     loop.set_defaults(func=_cmd_platform_loop)
+    warm_config = platform_sub.add_parser("warm-config")
+    warm_config.add_argument("--platform-base-url")
+    warm_config.add_argument("--backend-audience")
+    warm_config.set_defaults(func=_cmd_platform_warm_config)
 
     bake = subparsers.add_parser("bake")
     bake_sub = bake.add_subparsers(dest="bake_command", required=True)

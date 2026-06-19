@@ -116,6 +116,9 @@ def preinstall_hot_image_plugins() -> dict[str, Any]:
     tinyhat_inspect = openclaw_adapter.inspect_plugin(TINYHAT_PLUGIN_ID)
     if tinyhat_inspect.get("state") != "ready":
         raise RuntimeError(f"Tinyhat plugin unavailable after install: {tinyhat_inspect}")
+    warm_config = openclaw_adapter.apply_warm_image_config()
+    if warm_config.get("state") != "ready":
+        raise RuntimeError(f"Warm OpenClaw config failed: {warm_config}")
     _write_tinyhat_marker(checkout=checkout, resolved_sha=resolved_sha)
     return {
         "codex": codex_inspect,
@@ -124,4 +127,5 @@ def preinstall_hot_image_plugins() -> dict[str, Any]:
             "resolved_commit_sha": resolved_sha,
             "checkout_dir": str(checkout),
         },
+        "warm_config": warm_config,
     }

@@ -24,7 +24,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "tiny_runtime"))
 
 from tinyhat_runtime import RUNTIME_GENERATION  # noqa: E402
-from tinyhat_runtime import attestation, bundle, hot_image, launcher, openclaw_adapter  # noqa: E402
+from tinyhat_runtime import (  # noqa: E402
+    attestation,
+    bundle,
+    hot_image,
+    launcher,
+    main,
+    openclaw_adapter,
+)
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
 from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
 from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
@@ -122,6 +129,39 @@ class HotImageTests(unittest.TestCase):
             self.assertIn(["git", "fetch", "--tags", "--prune", "origin"], calls)
             self.assertIn(["git", "checkout", "main"], calls)
             self.assertIn(["git", "reset", "--hard", "origin/main"], calls)
+
+    def test_preinstall_hot_image_plugins_applies_warm_config(self) -> None:
+        checkout = Path("/tmp/tinyhat-plugin-checkout")
+
+        with (
+            patch.object(
+                openclaw_adapter,
+                "install_plugin",
+                return_value={"state": "ready"},
+            ) as install_plugin,
+            patch.object(
+                openclaw_adapter,
+                "inspect_plugin",
+                return_value={"state": "ready"},
+            ),
+            patch.object(
+                openclaw_adapter,
+                "apply_warm_image_config",
+                return_value={"state": "ready"},
+            ) as apply_warm,
+            patch.object(
+                hot_image,
+                "_checkout_tinyhat_plugin",
+                return_value=(checkout, "a" * 40),
+            ),
+            patch.object(hot_image, "_write_tinyhat_marker") as write_marker,
+        ):
+            result = hot_image.preinstall_hot_image_plugins()
+
+        self.assertEqual(install_plugin.call_count, 2)
+        apply_warm.assert_called_once_with()
+        write_marker.assert_called_once_with(checkout=checkout, resolved_sha="a" * 40)
+        self.assertEqual(result["warm_config"], {"state": "ready"})
 
 
 class LauncherTests(unittest.TestCase):
@@ -893,12 +933,74 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
 
 
 class PlatformLoopTests(unittest.TestCase):
-    def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
+    def test_ready_report_posts_hot_ready_snapshot_before_ready_edge(self) -> None:
         from tinyhat_runtime import platform_loop
 
         posts: list[tuple[str, dict]] = []
         client = Mock()
         client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+        loop._report_ready()
+
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+                "/hapi/v1/computers/me/runtime-state",
+            ],
+        )
+        runtime_payload = posts[0][1]
+        self.assertEqual(runtime_payload["runtime_health"], "healthy")
+        self.assertFalse(runtime_payload["assigned"])
+        self.assertEqual(
+            runtime_payload["gateway"],
+            {"liveness_owner": "systemd", "restart_loop": False},
+        )
+        self.assertEqual(posts[1][1]["state"], "ready")
+
+    def test_ready_report_treats_existing_ready_state_as_idempotent(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 400: Bad Request")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "ready", "assigned": False}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+        loop._report_ready()
+
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+                "/hapi/v1/computers/me/runtime-state",
+            ],
+        )
+        client.get_json.assert_called_once_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+
+    def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = (
+            lambda path, payload: posts.append((path, payload)) or {}
+        )
         loop = platform_loop.TinyRuntimePlatformLoop(client=client)
 
         def fail_once() -> dict:
@@ -935,13 +1037,12 @@ class PlatformLoopTests(unittest.TestCase):
             return {"assigned": False}
 
         with (
-            patch.object(loop, "_report_ready"),
             patch.object(loop, "_poll_binding", side_effect=unassigned_once),
             patch.object(platform_loop.time, "sleep"),
         ):
             self.assertEqual(loop.run_forever(), 0)
 
-        client.post_json.assert_called_once()
+        self.assertGreaterEqual(client.post_json.call_count, 2)
 
     def test_binding_activation_does_not_restart_openclaw_gateway(self) -> None:
         from tinyhat_runtime import platform_loop
@@ -958,7 +1059,10 @@ class PlatformLoopTests(unittest.TestCase):
         now = time.monotonic()
 
         with (
-            patch.dict(os.environ, {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"}),
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
             patch.object(
                 platform_loop.openclaw_adapter,
                 "apply_binding_config",
@@ -979,6 +1083,7 @@ class PlatformLoopTests(unittest.TestCase):
             )
 
         apply_config.assert_called_once()
+        self.assertIs(apply_config.call_args.kwargs["preserve_existing_secrets"], True)
         gateway_health.assert_called_once()
         self.assertFalse(hasattr(platform_loop.openclaw_adapter, "gateway_restart_once"))
         startup_payloads = [
@@ -996,6 +1101,197 @@ class PlatformLoopTests(unittest.TestCase):
         self.assertEqual(
             sample["sample_metadata"]["restart_policy"],
             "no_assignment_restart",
+        )
+
+    def test_binding_activation_treats_existing_active_state_as_idempotent(
+        self,
+    ) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 400: Bad Request")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "active", "assigned": True}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_user_id": "654321",
+            "telegram_bot_token": "token=secret-value",
+        }
+        now = time.monotonic()
+
+        with (
+            patch.dict(os.environ, {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"}),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "ready"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                return_value={"state": "healthy"},
+            ),
+        ):
+            loop._activate_binding(
+                binding,
+                cycle_started_wall=0.0,
+                cycle_started=now,
+                binding_received=now,
+                phase_spans=[],
+            )
+
+        client.get_json.assert_called_once_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+        runtime_state_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/runtime-state"
+        ]
+        self.assertEqual(len(runtime_state_payloads), 2)
+        self.assertTrue(runtime_state_payloads[0].get("startup_timings"))
+        self.assertEqual(runtime_state_payloads[1]["runtime_health"], "healthy")
+        self.assertEqual(
+            runtime_state_payloads[1]["gateway"]["liveness_owner"],
+            "systemd",
+        )
+
+    def test_active_rebind_replaces_secrets_when_owner_changes(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = Mock()
+        client.post_json.return_value = {}
+        original_binding = {
+            "telegram_owner_user_id": "owner-1",
+            "telegram_bot_user_id": "bot-1",
+            "telegram_bot_token": "token=secret-value",
+        }
+        next_binding = {
+            **original_binding,
+            "telegram_owner_user_id": "owner-2",
+        }
+
+        responses = [{"assigned": True, "binding": next_binding}]
+
+        def get_json(path: str, **_kwargs):
+            return responses.pop(0)
+
+        client.get_json.side_effect = get_json
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_status",
+                return_value={"state": "healthy"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "ready"},
+            ) as apply_config,
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                return_value={"state": "healthy"},
+            ),
+            patch.object(platform_loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                loop._active_loop(original_binding)
+
+        apply_config.assert_called_once()
+        self.assertIs(apply_config.call_args.kwargs["preserve_existing_secrets"], False)
+
+    def test_gateway_ready_wait_covers_openclaw_self_restart(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        self.assertGreaterEqual(platform_loop.GATEWAY_READY_WAIT_SECONDS, 75)
+
+    def test_gateway_ready_wait_polls_until_official_health_recovers(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = Mock()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                side_effect=[
+                    {"state": "unhealthy"},
+                    {"state": "healthy", "gateway": {"ok": True}},
+                ],
+            ) as gateway_health,
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            health = loop._wait_for_gateway_ready()
+
+        self.assertEqual(health["state"], "healthy")
+        self.assertEqual(gateway_health.call_count, 2)
+
+    def test_binding_activation_failure_reports_supported_runtime_state(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def assigned_once() -> dict:
+            loop.stop_requested = True
+            return {
+                "assigned": True,
+                "binding": {
+                    "telegram_owner_user_id": "123456",
+                    "telegram_bot_user_id": "654321",
+                    "telegram_bot_token": "token=secret-value",
+                },
+            }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=assigned_once),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "failed"},
+            ),
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        runtime_state_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/runtime-state"
+        ]
+        self.assertEqual(len(runtime_state_payloads), 1)
+        self.assertEqual(
+            runtime_state_payloads[0]["runtime_health"],
+            "openclaw_not_ready",
+        )
+        self.assertTrue(runtime_state_payloads[0]["activation_failed"])
+        self.assertEqual(
+            runtime_state_payloads[0]["openclaw_control"],
+            "no_restart_requested",
         )
 
 
@@ -1121,6 +1417,7 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertIn("ExecStart=/opt/tinyhat/current/bin/tinyhat-runtime gateway run", unit)
         self.assertIn("Restart=always", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertNotIn("tinyhat-runtime-attestation.service", unit)
 
     def test_attestation_unit_uses_stable_current_path(self) -> None:
         unit = (
@@ -1264,6 +1561,291 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["gateway"]["state"], "unhealthy")
         self.assertEqual(payload["models"]["state"], "unavailable")
 
+    def test_config_patch_apply_mode_omits_json_flag(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        seen: dict[str, object] = {}
+
+        def runner(argv, **kwargs):
+            seen["argv"] = argv
+            seen["input"] = kwargs.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        result = openclaw_adapter.config_patch(
+            {"channels": {"telegram": {"enabled": True}}},
+            replace_paths=("channels.telegram",),
+            runner=runner,
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(
+            seen["argv"],
+            [
+                "openclaw",
+                "config",
+                "patch",
+                "--stdin",
+                "--replace-path",
+                "channels.telegram",
+            ],
+        )
+        self.assertNotIn("--json", seen["argv"])
+        self.assertIn('"channels"', str(seen["input"]))
+
+    def test_config_patch_dry_run_keeps_json_flag(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        seen: dict[str, object] = {}
+
+        def runner(argv, **_kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout='{"state":"would_apply"}',
+                stderr="",
+            )
+
+        result = openclaw_adapter.config_patch(
+            {"channels": {"telegram": {"enabled": True}}},
+            dry_run=True,
+            runner=runner,
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertIn("--dry-run", seen["argv"])
+        self.assertIn("--json", seen["argv"])
+        self.assertEqual(result["patch"], {"state": "would_apply"})
+
+    def test_warm_image_config_patch_owns_stable_gateway_setup(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        patch = openclaw_adapter.warm_image_config_patch(
+            platform_base_url="https://platform.example.test",
+            backend_audience="https://audience.example.test",
+        )
+
+        self.assertEqual(patch["gateway"]["mode"], "local")
+        self.assertFalse(patch["channels"]["telegram"]["enabled"])
+        self.assertEqual(
+            patch["secrets"]["providers"]["tinyhat"]["path"],
+            str(openclaw_adapter.paths.OPENCLAW_SECRETS_PATH),
+        )
+        self.assertEqual(
+            patch["plugins"]["entries"]["tinyhat"]["config"],
+            {
+                "platformBaseUrl": "https://platform.example.test",
+                "backendAudience": "https://audience.example.test",
+            },
+        )
+        self.assertIn("codex", patch["plugins"]["entries"])
+        self.assertIn("tinyhat", patch["plugins"]["entries"])
+        self.assertNotIn("commands", patch)
+        self.assertNotIn("env", patch)
+
+    def test_platform_warm_config_command_applies_startup_stable_config(self) -> None:
+        with patch.object(
+            openclaw_adapter,
+            "apply_warm_image_config",
+            return_value={"state": "ready"},
+        ) as apply_warm:
+            status = main.main(
+                [
+                    "platform",
+                    "warm-config",
+                    "--platform-base-url",
+                    "https://platform.example.test",
+                    "--backend-audience",
+                    "https://audience.example.test",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        apply_warm.assert_called_once_with(
+            platform_base_url="https://platform.example.test",
+            backend_audience="https://audience.example.test",
+        )
+
+    def test_binding_config_patch_uses_secretrefs_on_hot_paths(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        patch = openclaw_adapter.binding_config_patch(
+            {
+                "telegram_owner_user_id": "12345",
+                "telegram_bot_token": "123:token",
+                "openrouter_api_key": "sk-or-v1-child",
+                "openrouter_base_url": "https://openrouter.ai/api/v1",
+                "openrouter_default_model": "openai/gpt-5.5",
+            }
+        )
+
+        self.assertEqual(
+            patch["agents"]["defaults"]["model"]["primary"],
+            "openrouter/openai/gpt-5.5",
+        )
+        self.assertEqual(
+            patch["channels"]["telegram"]["botToken"],
+            {
+                "source": "file",
+                "provider": "tinyhat",
+                "id": "/channels/telegram/botToken",
+            },
+        )
+        self.assertEqual(
+            patch["models"]["providers"]["openrouter"]["apiKey"],
+            {
+                "source": "file",
+                "provider": "tinyhat",
+                "id": "/providers/openrouter/apiKey",
+            },
+        )
+        self.assertEqual(
+            patch["channels"]["telegram"]["execApprovals"],
+            {"approvers": ["12345"]},
+        )
+        self.assertEqual(
+            patch["plugins"]["entries"]["tinyhat"]["config"],
+            {},
+        )
+        self.assertNotIn("gateway", patch)
+        self.assertNotIn("commands", patch)
+        self.assertNotIn("env", patch)
+        self.assertNotIn("openrouter.ai/api/v1", json.dumps(patch, sort_keys=True))
+        self.assertNotIn("123:token", json.dumps(patch, sort_keys=True))
+        self.assertNotIn("sk-or-v1-child", json.dumps(patch, sort_keys=True))
+
+    def test_apply_binding_config_writes_secrets_and_patches_hot_paths_only(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            seen: dict[str, object] = {}
+
+            def runner(argv, **kwargs):
+                seen["argv"] = argv
+                seen["input"] = kwargs.get("input")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.apply_binding_config(
+                    {
+                        "telegram_owner_user_id": "12345",
+                        "telegram_bot_token": "123:token",
+                        "openrouter_api_key": "sk-or-v1-child",
+                        "openrouter_default_model": "openai/gpt-5.5",
+                    },
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(
+                seen["argv"],
+                [
+                    "openclaw",
+                    "config",
+                    "patch",
+                    "--stdin",
+                    "--replace-path",
+                    "channels.telegram",
+                ],
+            )
+            input_text = str(seen["input"])
+            self.assertNotIn("commands", input_text)
+            self.assertNotIn("gateway", input_text)
+            self.assertNotIn("OPENROUTER_API_KEY", input_text)
+            self.assertNotIn("123:token", input_text)
+            self.assertNotIn("sk-or-v1-child", input_text)
+            secrets_payload = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                secrets_payload["channels"]["telegram"]["botToken"],
+                "123:token",
+            )
+            self.assertEqual(
+                secrets_payload["providers"]["openrouter"]["apiKey"],
+                "sk-or-v1-child",
+            )
+
+    def test_apply_binding_config_can_replace_secrets_for_cross_owner_rebind(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            secrets_path.write_text(
+                json.dumps({"EXA_API_KEY": "stale-owner-secret"}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            def runner(argv, **_kwargs):
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.apply_binding_config(
+                    {
+                        "telegram_owner_user_id": "67890",
+                        "telegram_bot_token": "456:token",
+                    },
+                    preserve_existing_secrets=False,
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            secrets_payload = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertNotIn("EXA_API_KEY", secrets_payload)
+            self.assertEqual(
+                secrets_payload["channels"]["telegram"]["botToken"],
+                "456:token",
+            )
+
+    def test_write_openclaw_secrets_preserves_binding_refs_on_user_secret_update(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            secrets_path.write_text(
+                json.dumps(
+                    {
+                        "channels": {"telegram": {"botToken": "123:token"}},
+                        "providers": {"openrouter": {"apiKey": "sk-or-v1-child"}},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.write_openclaw_secrets(
+                    {"EXA_API_KEY": "exa-test-secret"}
+                )
+
+            self.assertEqual(result["state"], "ready")
+            merged = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                merged["channels"]["telegram"]["botToken"],
+                "123:token",
+            )
+            self.assertEqual(
+                merged["providers"]["openrouter"]["apiKey"],
+                "sk-or-v1-child",
+            )
+            self.assertEqual(merged["EXA_API_KEY"], "exa-test-secret")
+
 
 class BakeScriptTests(unittest.TestCase):
     def test_assemble_bundle_round_trip(self) -> None:
@@ -1297,6 +1879,8 @@ class BakeScriptTests(unittest.TestCase):
             self.assertTrue(os.access(helper, os.X_OK))
             helper_text = helper.read_text(encoding="utf-8")
             self.assertIn("tinyhat_runtime.main bake preinstall-plugins", helper_text)
+            self.assertIn("chown -R 0:0", helper_text)
+            self.assertNotIn('chown -R "${runtime_user}:${runtime_group}"', helper_text)
             self.assertNotIn("import supervisor", helper_text)
             self.assertNotIn("ensure_codex_subscription_plugin_installed", helper_text)
             self.assertNotIn("ensure_tinyhat_plugin_installed", helper_text)
