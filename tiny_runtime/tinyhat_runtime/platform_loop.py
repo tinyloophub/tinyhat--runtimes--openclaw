@@ -157,7 +157,7 @@ class TinyRuntimePlatformLoop:
     def _poll_binding(self) -> dict[str, Any]:
         path = (
             "/hapi/v1/computers/me/binding"
-            f"?wait_seconds={BINDING_WAIT_SECONDS:g}&include_command=true"
+            f"?wait_seconds={BINDING_WAIT_SECONDS:g}&include_command=false"
         )
         return self.client.get_json(path, timeout=int(BINDING_WAIT_SECONDS + 10))
 

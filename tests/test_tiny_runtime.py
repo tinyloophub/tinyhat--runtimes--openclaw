@@ -24,7 +24,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "tiny_runtime"))
 
 from tinyhat_runtime import RUNTIME_GENERATION  # noqa: E402
-from tinyhat_runtime import attestation, bundle, hot_image, launcher, openclaw_adapter  # noqa: E402
+from tinyhat_runtime import (  # noqa: E402
+    attestation,
+    bundle,
+    hot_image,
+    launcher,
+    main,
+    openclaw_adapter,
+)
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
 from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
 from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
@@ -1560,7 +1567,10 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
     def test_warm_image_config_patch_owns_stable_gateway_setup(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
-        patch = openclaw_adapter.warm_image_config_patch()
+        patch = openclaw_adapter.warm_image_config_patch(
+            platform_base_url="https://platform.example.test",
+            backend_audience="https://audience.example.test",
+        )
 
         self.assertEqual(patch["gateway"]["mode"], "local")
         self.assertFalse(patch["channels"]["telegram"]["enabled"])
@@ -1568,10 +1578,40 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             patch["secrets"]["providers"]["tinyhat"]["path"],
             str(openclaw_adapter.paths.OPENCLAW_SECRETS_PATH),
         )
+        self.assertEqual(
+            patch["plugins"]["entries"]["tinyhat"]["config"],
+            {
+                "platformBaseUrl": "https://platform.example.test",
+                "backendAudience": "https://audience.example.test",
+            },
+        )
         self.assertIn("codex", patch["plugins"]["entries"])
         self.assertIn("tinyhat", patch["plugins"]["entries"])
         self.assertNotIn("commands", patch)
         self.assertNotIn("env", patch)
+
+    def test_platform_warm_config_command_applies_startup_stable_config(self) -> None:
+        with patch.object(
+            openclaw_adapter,
+            "apply_warm_image_config",
+            return_value={"state": "ready"},
+        ) as apply_warm:
+            status = main.main(
+                [
+                    "platform",
+                    "warm-config",
+                    "--platform-base-url",
+                    "https://platform.example.test",
+                    "--backend-audience",
+                    "https://audience.example.test",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        apply_warm.assert_called_once_with(
+            platform_base_url="https://platform.example.test",
+            backend_audience="https://audience.example.test",
+        )
 
     def test_binding_config_patch_uses_secretrefs_on_hot_paths(self) -> None:
         from tinyhat_runtime import openclaw_adapter

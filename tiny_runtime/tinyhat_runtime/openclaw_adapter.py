@@ -262,9 +262,17 @@ def warm_image_config_patch(
     }
 
 
-def apply_warm_image_config(*, runner: Runner = subprocess.run) -> dict[str, Any]:
+def apply_warm_image_config(
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
     return config_patch(
-        warm_image_config_patch(),
+        warm_image_config_patch(
+            platform_base_url=platform_base_url,
+            backend_audience=backend_audience,
+        ),
         replace_paths=("channels.telegram",),
         runner=runner,
     )
