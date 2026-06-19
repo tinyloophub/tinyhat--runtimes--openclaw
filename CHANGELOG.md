@@ -7,6 +7,11 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.6
+
+Patch release for Tinyloop `tiny_runtime_bundle` image bakes that preinstall
+the OpenClaw plugins needed by hot Computers before they enter the ready pool.
+
 ### Added
 
 - Add a repo-owned hot-image preinstall helper that bakes the Codex subscription
