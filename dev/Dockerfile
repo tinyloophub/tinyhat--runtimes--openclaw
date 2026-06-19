@@ -44,17 +44,19 @@ RUN apt-get update \
     && curl -fsSL https://tailscale.com/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenClaw at the same npm package the prod bootstrap does.
-# The dev image pins ``latest`` deliberately — local dev wants the
-# version a fresh prod Computer would install today. The runtime
-# ``VERSION`` file records the published runtime payload version.
+# Install OpenClaw at the same npm package the baked runtime bundle records.
+# Reading the ref from bundle.lock keeps dev-image proof aligned with the
+# preinstalled image contract and prevents a cached ``latest`` layer from
+# silently testing an older framework than the bundle will ship.
 #
 # ``openclaw --version`` immediately after install is the build-time
 # smoke check: if the runtime's Node base falls behind OpenClaw's
 # engines floor again (the failure mode that triggered the Node 22
 # bump in this Dockerfile), the build fails here instead of at the
 # first ``docker run``.
-RUN npm install -g openclaw@latest \
+COPY tiny_runtime/bake/bundle.lock /tmp/tinyhat-bundle.lock
+RUN OPENCLAW_INSTALL_SPEC="$(python3 -c 'import json; print(json.load(open("/tmp/tinyhat-bundle.lock", encoding="utf-8"))["dependencies"]["openclaw"]["resolved"])')" \
+    && npm install -g --no-fund --no-audit "${OPENCLAW_INSTALL_SPEC}" \
     && openclaw --version
 
 # Non-root runtime user (``tinyhat:tinyhat``). The state dir lives
@@ -66,10 +68,15 @@ RUN npm install -g openclaw@latest \
 RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
         --home-dir /home/tinyhat --shell /bin/bash tinyhat \
-    && mkdir -p /home/tinyhat/runtime/openclaw /etc/openclaw \
+    && mkdir -p \
+        /home/tinyhat/runtime/openclaw \
+        /etc/openclaw \
+        /var/log/tinyhat/commands \
+        /var/log/tinyhat/diagnostics \
     && chown -R tinyhat:tinyhat \
         /home/tinyhat \
         /etc/openclaw \
+        /var/log/tinyhat \
         /usr/local/bin \
         /usr/local/lib/node_modules
 
@@ -89,10 +96,11 @@ RUN HOME=/home/tinyhat/runtime \
 
 WORKDIR /opt/tinyhat-runtime
 
-# Copy the supervisor, the tinyhat_cli package it delegates the
+# Copy the supervisor, the tiny_runtime/tinyhat_cli packages it delegates the
 # extracted units to, and bootstrap.sh (copied for parity with the
 # production runtime layout).
 COPY supervisor.py bootstrap.sh VERSION README.md ./
+COPY tiny_runtime ./tiny_runtime
 COPY tinyhat_cli ./tinyhat_cli
 COPY dev/entrypoint.sh ./dev-entrypoint.sh
 RUN chmod +x supervisor.py bootstrap.sh dev-entrypoint.sh \

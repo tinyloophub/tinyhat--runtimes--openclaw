@@ -6,12 +6,15 @@ import base64
 import hashlib
 import logging
 import os
+from pathlib import Path
 from typing import Any, Callable
 
-from .command_ledger import utc_now_iso
+from . import paths
+from .command_ledger import CommandLedger, utc_now_iso
 from .redaction import redact_text
 from .runtime_commands import RuntimeCommandRunner
 
+_REAL_RUNTIME_COMMAND_RUNNER = RuntimeCommandRunner
 RUNTIME_COMMAND_RESULT_ENDPOINT = "/hapi/v1/computers/me/runtime-command/result"
 RUNTIME_COMMAND_ARTIFACT_MAX_BYTES_ENV = (
     "TINYHAT_RUNTIME_COMMAND_ARTIFACT_MAX_BYTES"
@@ -23,9 +26,13 @@ def handle_runtime_command(
     command: dict[str, Any],
     *,
     post_json: Callable[[str, dict[str, Any]], dict[str, Any]],
+    get_json: Callable[[str], dict[str, Any]] | None = None,
+    apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
+    start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    request_runtime_secret_rebind: Callable[[], None] | None = None,
     logger: logging.Logger,
     runner: RuntimeCommandRunner | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Execute a typed runtime command and best-effort POST the result."""
     runtime_command = command.get("command")
     if not isinstance(runtime_command, dict):
@@ -35,7 +42,13 @@ def handle_runtime_command(
             if key not in {"type", "revision"}
         }
     try:
-        result = (runner or RuntimeCommandRunner()).execute(runtime_command)
+        runtime_runner = runner or _default_runtime_command_runner(
+            platform_get_json=get_json,
+            apply_runtime_config=apply_runtime_config,
+            start_chatgpt_link=start_chatgpt_link,
+            logger=logger,
+        )
+        result = runtime_runner.execute(runtime_command)
     except Exception as exc:  # noqa: BLE001 - command boundary
         logger.warning("runtime command execution failed before result: %s", exc)
         result = _runtime_command_failure_result(runtime_command, exc)
@@ -52,6 +65,66 @@ def handle_runtime_command(
             result.get("command_id"),
             exc,
         )
+        return result
+
+    if (
+        request_runtime_secret_rebind is not None
+        and _result_needs_runtime_secret_rebind(result)
+    ):
+        try:
+            request_runtime_secret_rebind()
+        except Exception as exc:  # noqa: BLE001 - command side-effect boundary
+            logger.warning(
+                "runtime command rebind hook failed command_id=%r: %s",
+                result.get("command_id"),
+                exc,
+            )
+    return result
+
+
+def _result_needs_runtime_secret_rebind(result: dict[str, Any]) -> bool:
+    if result.get("kind") != "apply_config" or result.get("status") != "applied":
+        return False
+    payload = result.get("result")
+    return isinstance(payload, dict) and bool(
+        payload.get("gateway_rebind_requested") or payload.get("env_block_changed")
+    )
+
+
+def _default_runtime_command_runner(
+    *,
+    platform_get_json: Callable[[str], dict[str, Any]] | None,
+    apply_runtime_config: Callable[..., dict[str, Any]] | None,
+    start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    logger: logging.Logger,
+) -> RuntimeCommandRunner:
+    kwargs = {
+        "platform_get_json": platform_get_json,
+        "apply_runtime_config": apply_runtime_config,
+        "start_chatgpt_link": start_chatgpt_link,
+    }
+    if RuntimeCommandRunner is _REAL_RUNTIME_COMMAND_RUNNER:
+        kwargs["ledger"] = _command_ledger_for_runtime(logger=logger)
+    return RuntimeCommandRunner(**kwargs)
+
+
+def _command_ledger_for_runtime(*, logger: logging.Logger) -> CommandLedger:
+    root = paths.COMMANDS_LOG_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return CommandLedger(root=root)
+    except OSError as exc:
+        fallback = paths.STATE_ROOT / "commands"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise exc
+        logger.warning(
+            "runtime command log root unavailable (%s); using fallback %s",
+            redact_text(str(exc), limit=240),
+            fallback,
+        )
+        return CommandLedger(root=fallback)
 
 
 def _runtime_command_failure_result(

@@ -10,6 +10,7 @@ import base64
 import errno
 import json
 import os
+from pathlib import Path
 import shlex
 import shutil
 import sqlite3
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import supervisor
+from tiny_runtime.tinyhat_runtime.command_ledger import CommandLedger
+from tiny_runtime.tinyhat_runtime.runtime_commands import RuntimeCommandRunner
 from tiny_runtime.tinyhat_runtime import supervisor_bridge
 from tinyhat_cli.units import component_update, manifest as manifest_unit
 
@@ -3966,10 +3969,40 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         self.assertEqual(result["secret_count"], 1)
         self.assertTrue(result["env_block_changed"])
 
+    def test_apply_runtime_secret_map_dry_run_does_not_persist_env_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "tinyhat-secrets.json")
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": secrets_path,
+            }
+            with patch.dict(os.environ, env, clear=False):
+                config_path = supervisor.openclaw_config_path()
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as fh:
+                    json.dump({"env": {"OPENROUTER_API_KEY": "sk-or-v1-child"}}, fh)
+                with patch.object(supervisor, "reload_openclaw_secrets") as reload_mock:
+                    result = supervisor.apply_runtime_secret_map(
+                        revision=43,
+                        secrets={"EXA_API_KEY": "exa-test-key"},
+                        dry_run=True,
+                    )
+                with open(config_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+
+        self.assertEqual(result["revision"], 43)
+        self.assertEqual(result["reload"]["reason"], "dry_run")
+        self.assertTrue(result["env_block_changed"])
+        self.assertEqual(config, {"env": {"OPENROUTER_API_KEY": "sk-or-v1-child"}})
+        self.assertFalse(os.path.exists(secrets_path))
+        reload_mock.assert_not_called()
+
     def test_handle_apply_config_signals_rebind_on_env_change(self) -> None:
         # Reset the module-level rebind flags so the test is order-independent.
         supervisor._stop_holder["rebind"] = False
         supervisor._stop_holder["stop"] = False
+        supervisor._stop_holder["rebind_reason"] = None
         supervisor._config_apply_state["failed_revision"] = None
         supervisor._config_apply_state["failed_diagnostic"] = None
         supervisor._config_apply_state["failed_reported"] = False
@@ -3999,6 +4032,10 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
 
         self.assertTrue(supervisor._stop_holder["rebind"])
         self.assertTrue(supervisor._stop_holder["stop"])
+        self.assertEqual(
+            supervisor._stop_holder["rebind_reason"],
+            "runtime_config_changed",
+        )
         posted.assert_called_once()
         self.assertEqual(posted.call_args.kwargs["revision"], 5)
         self.assertEqual(posted.call_args.kwargs["status"], "applied")
@@ -4006,6 +4043,7 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         # Cleanup so unrelated tests are not affected.
         supervisor._stop_holder["rebind"] = False
         supervisor._stop_holder["stop"] = False
+        supervisor._stop_holder["rebind_reason"] = None
 
     def test_handle_apply_config_skips_rebind_when_env_unchanged(self) -> None:
         supervisor._stop_holder["rebind"] = False
@@ -4446,6 +4484,7 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
                 "rebind": False,
                 "signature": None,
                 "owner_signature": None,
+                "model_auth_signature": None,
             }
         )
 
@@ -4514,7 +4553,12 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             "awaiting_binding",
         )
         self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
-        self.assertEqual(payload, runtime_state_posts[0])
+        self.assertEqual(
+            supervisor._runtime_state_platform_post_signature(
+                supervisor.budget_runtime_state_payload(payload)
+            ),
+            supervisor._runtime_state_platform_post_signature(runtime_state_posts[0]),
+        )
 
     def test_unbound_phase_refreshes_ready_runtime_state_while_waiting(
         self,
@@ -4645,7 +4689,12 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             runtime_state_posts[0]["gateway"]["action"],
             "awaiting_binding",
         )
-        self.assertEqual(payload, runtime_state_posts[0])
+        self.assertEqual(
+            supervisor._runtime_state_platform_post_signature(
+                supervisor.budget_runtime_state_payload(payload)
+            ),
+            supervisor._runtime_state_platform_post_signature(runtime_state_posts[0]),
+        )
 
     def test_platform_setup_failure_fails_closed_before_config_apply(self) -> None:
         binding = _subscription_binding(with_openrouter=True)
@@ -4981,6 +5030,14 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         self.assertEqual(
             supervisor._binding_poll_path(wait_seconds=8),
             "/hapi/v1/computers/me/binding?wait_seconds=8",
+        )
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=8, include_command=True),
+            "/hapi/v1/computers/me/binding?wait_seconds=8&include_command=true",
+        )
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=0, include_command=True),
+            "/hapi/v1/computers/me/binding?include_command=true",
         )
 
 
@@ -5881,7 +5938,7 @@ class WipeChatgptSubscriptionProfileTests(unittest.TestCase):
 
 
 class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
-    """Issue #23 / PR #24 review #1 — signature must move on a mode flip."""
+    """Model-auth route flips are command-owned, not watchdog identity."""
 
     def _base_binding(self) -> dict:
         return {
@@ -5903,14 +5960,24 @@ class BindingSignatureSubscriptionFieldsTests(unittest.TestCase):
             supervisor._binding_signature(after),
         )
 
-    def test_signature_moves_when_subscription_model_ref_links(self) -> None:
+    def test_signature_stays_stable_when_subscription_model_ref_links(self) -> None:
+        before = dict(
+            self._base_binding(), llm_auth_mode="chatgpt_subscription"
+        )
+        after = dict(before, llm_model_ref="openai/gpt-5.5")
+        self.assertEqual(
+            supervisor._binding_signature(before),
+            supervisor._binding_signature(after),
+        )
+
+    def test_model_auth_signature_moves_when_subscription_model_ref_links(self) -> None:
         before = dict(
             self._base_binding(), llm_auth_mode="chatgpt_subscription"
         )
         after = dict(before, llm_model_ref="openai/gpt-5.5")
         self.assertNotEqual(
-            supervisor._binding_signature(before),
-            supervisor._binding_signature(after),
+            supervisor._binding_model_auth_signature(before),
+            supervisor._binding_model_auth_signature(after),
         )
 
     def test_owner_signature_stable_across_mode_flip(self) -> None:
@@ -8346,6 +8413,74 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
 class RuntimeCommandDispatchTests(unittest.TestCase):
     """Heartbeat-delivered ``runtime_command`` bridge (tinyloophub/tinyloop#818)."""
 
+    def test_apply_config_refreshes_subscription_config_as_command_rebind(
+        self,
+    ) -> None:
+        package = {
+            "default_model": "deepseek/deepseek-v4-pro",
+            "default_role": "default",
+            "enabled_roles": ["cheap", "default"],
+            "models": {
+                "cheap": "deepseek/deepseek-v4-flash",
+                "default": "deepseek/deepseek-v4-pro",
+            },
+        }
+        before_binding = _openrouter_binding(package)
+        linked_binding = {
+            **before_binding,
+            "llm_auth_mode": "chatgpt_subscription",
+            "llm_model_ref": "openai/gpt-5.5",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "TINYHAT_DEV_RUNTIME": "1",
+                "TINYHAT_RUNTIME_HOME": tmpdir,
+                "TINYHAT_SECRETS_PATH": os.path.join(
+                    tmpdir, "tinyhat-secrets.json"
+                ),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                supervisor.write_openclaw_config(before_binding)
+                _seed_auth_profile(supervisor.openclaw_state_dir())
+                old_holder = dict(supervisor._stop_holder)
+                supervisor._stop_holder.update(
+                    {
+                        "owner_signature": supervisor._owner_identity_signature(
+                            before_binding
+                        ),
+                        "model_auth_signature": supervisor._binding_model_auth_signature(
+                            before_binding
+                        ),
+                    }
+                )
+                try:
+                    with (
+                        patch.object(
+                            supervisor,
+                            "get_json",
+                            return_value={"assigned": True, "binding": linked_binding},
+                        ),
+                        patch.object(
+                            supervisor,
+                            "reload_openclaw_secrets",
+                            return_value={"ok": True},
+                        ),
+                    ):
+                        result = supervisor.apply_runtime_config_for_runtime_command(
+                            revision=8,
+                            secrets={},
+                            dry_run=False,
+                        )
+                finally:
+                    supervisor._stop_holder.clear()
+                    supervisor._stop_holder.update(old_holder)
+
+        self.assertFalse(result["env_block_changed"])
+        self.assertTrue(result["model_auth_signature_changed"])
+        self.assertTrue(result["gateway_config_changed"])
+        self.assertTrue(result["gateway_rebind_required"])
+
     def test_dispatch_routes_runtime_command_to_runner_and_posts_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = os.path.join(tmp, "cmd-diagnostics.zip")
@@ -8428,6 +8563,261 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_apply_config_runtime_command_rebinds_after_result_post(self) -> None:
+        result = {
+            "schema": "tiny_runtime_command_result_v1",
+            "command_id": "cmd-apply-env",
+            "idempotency_key": "idem-apply-env",
+            "kind": "apply_config",
+            "status": "applied",
+            "phase": "hot_reloaded",
+            "failure_code": None,
+            "observed_at": "2026-06-18T19:00:00Z",
+            "result": {
+                "env_block_changed": True,
+                "gateway_rebind_requested": True,
+                "restart_requested": False,
+                "systemd_restart_requested": False,
+            },
+        }
+        runner = SimpleNamespace(execute=lambda command: result)
+        events: list[str] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            events.append("post")
+            return {"ok": True}
+
+        with (
+            patch.object(
+                supervisor_bridge,
+                "RuntimeCommandRunner",
+                return_value=runner,
+            ),
+            patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            patch.object(
+                supervisor,
+                "_signal_rebind_for_secrets",
+                side_effect=lambda: events.append("rebind"),
+            ),
+        ):
+            supervisor.handle_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-apply-env",
+                        "idempotency_key": "idem-apply-env",
+                        "kind": "apply_config",
+                    },
+                }
+            )
+
+        self.assertEqual(events, ["post", "rebind"])
+
+    def test_apply_config_runtime_command_skips_rebind_when_post_fails(self) -> None:
+        result = {
+            "schema": "tiny_runtime_command_result_v1",
+            "command_id": "cmd-apply-env-retry",
+            "idempotency_key": "idem-apply-env-retry",
+            "kind": "apply_config",
+            "status": "applied",
+            "phase": "hot_reloaded",
+            "failure_code": None,
+            "observed_at": "2026-06-18T19:00:00Z",
+            "result": {
+                "env_block_changed": True,
+                "gateway_rebind_requested": True,
+                "restart_requested": False,
+                "systemd_restart_requested": False,
+            },
+        }
+        runner = SimpleNamespace(execute=lambda command: result)
+
+        with (
+            patch.object(
+                supervisor_bridge,
+                "RuntimeCommandRunner",
+                return_value=runner,
+            ),
+            patch.object(supervisor, "post_json", side_effect=RuntimeError("offline")),
+            patch.object(supervisor, "_signal_rebind_for_secrets") as rebind,
+        ):
+            supervisor.handle_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-apply-env-retry",
+                        "idempotency_key": "idem-apply-env-retry",
+                        "kind": "apply_config",
+                    },
+                }
+            )
+
+        rebind.assert_not_called()
+
+    def test_apply_config_wiring_uses_supervisor_callbacks_with_real_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            applies: list[dict] = []
+
+            def runner_factory(**kwargs) -> RuntimeCommandRunner:
+                return RuntimeCommandRunner(
+                    ledger=CommandLedger(root=Path(tmp) / "commands"),
+                    service_restart=False,
+                    **kwargs,
+                )
+
+            def fake_apply_runtime_config(**kwargs) -> dict:
+                applies.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": len(kwargs["secrets"]),
+                    "reload": {"ok": True, "dry_run": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": False,
+                    "gateway_config_changed": False,
+                    "model_auth_signature_changed": False,
+                    "gateway_rebind_required": False,
+                }
+
+            with (
+                patch.object(
+                    supervisor,
+                    "get_json",
+                    return_value={
+                        "revision": 8,
+                        "secrets": {"OPENAI_API_KEY": "sk-openai"},
+                    },
+                ) as get_json,
+                patch.object(
+                    supervisor,
+                    "apply_runtime_config_for_runtime_command",
+                    side_effect=fake_apply_runtime_config,
+                ),
+                patch.object(supervisor_bridge, "RuntimeCommandRunner", runner_factory),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor.handle_runtime_command(
+                    {
+                        "type": "runtime_command",
+                        "command": {
+                            "command_id": "cmd-apply-real-runner",
+                            "idempotency_key": "idem-apply-real-runner",
+                            "kind": "apply_config",
+                            "spec": {
+                                "desired_config_revision": 8,
+                                "hot_required": True,
+                            },
+                        },
+                    }
+                )
+
+        get_json.assert_called_once_with("/hapi/v1/computers/me/runtime-secrets")
+        self.assertEqual([item["dry_run"] for item in applies], [True, False])
+        post_json.assert_called_once()
+        path, body = post_json.call_args.args
+        self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+        self.assertEqual(body["result"]["status"], "applied")
+
+    def test_link_chatgpt_wiring_uses_supervisor_callback_with_real_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            starts: list[dict] = []
+
+            def runner_factory(**kwargs) -> RuntimeCommandRunner:
+                return RuntimeCommandRunner(
+                    ledger=CommandLedger(root=Path(tmp) / "commands"),
+                    service_restart=False,
+                    **kwargs,
+                )
+
+            def fake_start_chatgpt_link(spec: dict) -> dict:
+                starts.append(spec)
+                return {"state": "started", "session_id": spec["session_id"]}
+
+            with (
+                patch.object(
+                    supervisor,
+                    "handle_start_chatgpt_link_command",
+                    side_effect=fake_start_chatgpt_link,
+                ) as start_link,
+                patch.object(supervisor_bridge, "RuntimeCommandRunner", runner_factory),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor.handle_runtime_command(
+                    {
+                        "type": "runtime_command",
+                        "command": {
+                            "command_id": "cmd-link-real-runner",
+                            "idempotency_key": "idem-link-real-runner",
+                            "kind": "link_chatgpt",
+                            "spec": {
+                                "session_id": "sess-real-runner",
+                                "provider": "openai",
+                                "model_ref": "openai/gpt-5.5",
+                                "auth_flow": "device_code",
+                                "required_final_auth_path": "chatgpt_subscription",
+                            },
+                        },
+                    }
+                )
+
+        start_link.assert_called_once()
+        self.assertEqual(starts[0]["type"], "start_chatgpt_link")
+        self.assertEqual(starts[0]["session_id"], "sess-real-runner")
+        post_json.assert_called_once()
+        path, body = post_json.call_args.args
+        self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+        self.assertEqual(body["result"]["status"], "applied")
+        self.assertEqual(body["result"]["phase"], "device_code_started")
+
+    def test_default_runner_falls_back_when_command_log_root_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            configured_root = root / "commands-root"
+            configured_root.write_text("not a directory", encoding="utf-8")
+            fallback_state_root = root / "state"
+            applies: list[dict] = []
+            posts: list[tuple[str, dict]] = []
+
+            def fake_apply_runtime_secret_map(**kwargs) -> dict:
+                applies.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": len(kwargs["secrets"]),
+                    "reload": {"ok": True, "dry_run": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": False,
+                }
+
+            with (
+                patch.object(supervisor_bridge.paths, "COMMANDS_LOG_DIR", configured_root),
+                patch.object(supervisor_bridge.paths, "STATE_ROOT", fallback_state_root),
+            ):
+                result = supervisor_bridge.handle_runtime_command(
+                    {
+                        "command_id": "cmd-fallback-log-root",
+                        "idempotency_key": "idem-fallback-log-root",
+                        "kind": "apply_config",
+                        "spec": {
+                            "desired_config_revision": 4,
+                            "hot_required": True,
+                        },
+                    },
+                    post_json=lambda path, body: posts.append((path, body)) or {},
+                    get_json=lambda path: {
+                        "revision": 4,
+                        "secrets": {"OPENAI_API_KEY": "sk-test"},
+                    },
+                    apply_runtime_config=fake_apply_runtime_secret_map,
+                    logger=supervisor.log,
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual([item["dry_run"] for item in applies], [True, False])
+            self.assertEqual(posts[0][0], supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+            self.assertEqual(posts[0][1]["result"]["phase"], "hot_reloaded")
+            command_root = fallback_state_root / "commands"
+            self.assertTrue(
+                (command_root / "cmd-fallback-log-root" / "command.json").exists()
+            )
+            self.assertTrue((command_root / "commands.sqlite").exists())
 
 
 class UpdateComponentCommandTests(unittest.TestCase):

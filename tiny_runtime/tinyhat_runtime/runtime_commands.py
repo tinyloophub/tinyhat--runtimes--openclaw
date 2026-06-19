@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from . import attestation, bundle, launcher, openclaw_adapter, paths
 from .command_ledger import (
@@ -22,6 +22,8 @@ ALLOWED_COMMAND_KINDS = frozenset(
         "activate_bundle",
         "rollback_bundle",
         "export_diagnostics",
+        "apply_config",
+        "link_chatgpt",
     }
 )
 FAILURE_CODES = frozenset(
@@ -32,9 +34,11 @@ FAILURE_CODES = frozenset(
         "bundle_not_found",
         "bundle_verification_failed",
         "canceled",
+        "config_apply_failed",
         "diagnostics_export_failed",
         "idempotency_mismatch",
         "invalid_command",
+        "link_chatgpt_failed",
         "rollback_failed",
         "unsupported_kind",
     }
@@ -61,6 +65,14 @@ def _normalize_failure_code(value: str) -> str:
     return value if value in FAILURE_CODES else "invalid_command"
 
 
+def _no_restart_failure_payload(exc: Exception) -> dict[str, Any]:
+    return {
+        "detail": redact_text(str(exc), limit=1000),
+        "restart_requested": False,
+        "systemd_restart_requested": False,
+    }
+
+
 def _safe_command_sequence(value: Sequence[str] | None) -> tuple[str, ...] | None:
     if value is None:
         return None
@@ -81,11 +93,17 @@ class RuntimeCommandRunner:
         start_command: Sequence[str] | None = None,
         health_command: Sequence[str] | None = None,
         service_restart: bool = True,
+        platform_get_json: Callable[[str], dict[str, Any]] | None = None,
+        apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
+        start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.ledger = ledger or CommandLedger()
         self.bundles_dir = bundles_dir
         self.current_link = current_link
         self.diagnostics_dir = diagnostics_dir
+        self.platform_get_json = platform_get_json
+        self.apply_runtime_config = apply_runtime_config
+        self.start_chatgpt_link = start_chatgpt_link
         self.stop_command = (
             _safe_command_sequence(stop_command)
             if stop_command is not None
@@ -188,6 +206,10 @@ class RuntimeCommandRunner:
                 return self._rollback_bundle(command)
             if kind == "export_diagnostics":
                 return self._export_diagnostics(command)
+            if kind == "apply_config":
+                return self._apply_config(command)
+            if kind == "link_chatgpt":
+                return self._link_chatgpt(command)
         except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
             return self._finish(
                 command_id=command_id,
@@ -358,6 +380,193 @@ class RuntimeCommandRunner:
             result=payload,
         )
 
+    def _apply_config(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        desired_revision = _required_int(spec, "desired_config_revision")
+        if spec.get("hot_required") is False:
+            raise RuntimeCommandError("apply_config.hot_required must be true")
+        if self.platform_get_json is None:
+            raise RuntimeCommandError("platform_get_json callback is required")
+        if self.apply_runtime_config is None:
+            raise RuntimeCommandError("apply_runtime_config callback is required")
+
+        self.ledger.update(command_id, status="running", phase="pull_runtime_secrets")
+        try:
+            payload = self.platform_get_json("/hapi/v1/computers/me/runtime-secrets")
+        except RuntimeCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - platform boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="pull_runtime_secrets",
+                failure_code="config_apply_failed",
+                result=_no_restart_failure_payload(exc),
+            )
+        revision = int(payload.get("revision") or desired_revision)
+        raw_secrets = payload.get("secrets") or {}
+        if not isinstance(raw_secrets, dict):
+            raise RuntimeCommandError("/me/runtime-secrets returned a non-object secrets map")
+        secrets = {str(key): str(value) for key, value in raw_secrets.items()}
+
+        self.ledger.update(command_id, status="running", phase="check_hot_support")
+        try:
+            result = self.apply_runtime_config(
+                revision=revision,
+                secrets=secrets,
+                dry_run=True,
+            )
+        except RuntimeCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - runtime config boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="check_hot_support",
+                failure_code="config_apply_failed",
+                result=_no_restart_failure_payload(exc),
+            )
+        result_payload = {
+            "desired_config_revision": desired_revision,
+            "applied_revision": revision,
+            "secret_count": int(result.get("secret_count") or len(secrets)),
+            "reload": result.get("reload") or {},
+            "env_block_changed": bool(result.get("env_block_changed")),
+            "gateway_config_changed": bool(result.get("gateway_config_changed")),
+            "model_auth_signature_changed": bool(
+                result.get("model_auth_signature_changed")
+            ),
+            "gateway_rebind_requested": False,
+            "restart_requested": False,
+            "systemd_restart_requested": False,
+        }
+
+        self.ledger.update(command_id, status="running", phase="hot_reload")
+        try:
+            result = self.apply_runtime_config(
+                revision=revision,
+                secrets=secrets,
+                dry_run=False,
+            )
+        except RuntimeCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - runtime config boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="hot_reload",
+                failure_code="config_apply_failed",
+                result=_no_restart_failure_payload(exc),
+            )
+        result_payload.update(
+            {
+                "secret_count": int(result.get("secret_count") or len(secrets)),
+                "reload": result.get("reload") or {},
+                "env_block_changed": bool(result.get("env_block_changed")),
+                "gateway_config_changed": bool(result.get("gateway_config_changed")),
+                "model_auth_signature_changed": bool(
+                    result.get("model_auth_signature_changed")
+                ),
+                "gateway_rebind_requested": bool(
+                    result.get("gateway_rebind_required")
+                    or result.get("env_block_changed")
+                ),
+                "restart_requested": False,
+                "systemd_restart_requested": False,
+            }
+        )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="hot_reloaded",
+            result=result_payload,
+        )
+
+    def _link_chatgpt(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        session_id = _required_string(spec, "session_id")
+        provider = str(spec.get("provider") or "openai").strip()
+        model_ref = str(spec.get("model_ref") or "openai/gpt-5.5").strip()
+        auth_flow = str(spec.get("auth_flow") or "device_code").strip()
+        required_auth_path = str(
+            spec.get("required_final_auth_path") or "chatgpt_subscription"
+        ).strip()
+        if provider != "openai":
+            raise RuntimeCommandError("link_chatgpt.provider must be openai")
+        if auth_flow != "device_code":
+            raise RuntimeCommandError("link_chatgpt.auth_flow must be device_code")
+        if required_auth_path != "chatgpt_subscription":
+            raise RuntimeCommandError(
+                "link_chatgpt.required_final_auth_path must be chatgpt_subscription"
+            )
+        if self.start_chatgpt_link is None:
+            raise RuntimeCommandError("start_chatgpt_link callback is required")
+
+        self.ledger.update(command_id, status="running", phase="start_device_code")
+        try:
+            start = self.start_chatgpt_link(
+                {
+                    "type": "start_chatgpt_link",
+                    "session_id": session_id,
+                    "provider": provider,
+                    "model_ref": model_ref,
+                    "reason": "runtime_command_link_chatgpt",
+                }
+            ) or {
+                "state": "started",
+                "session_id": session_id,
+                "worker": "openclaw_device_code",
+            }
+        except RuntimeCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - device-code worker boundary
+            payload = _no_restart_failure_payload(exc)
+            payload.update(
+                {
+                    "session_id": session_id,
+                    "provider": provider,
+                    "model_ref": model_ref,
+                    "auth_flow": auth_flow,
+                    "required_final_auth_path": required_auth_path,
+                }
+            )
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="start_device_code",
+                failure_code="link_chatgpt_failed",
+                result=payload,
+            )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="device_code_started",
+            result={
+                "session_id": session_id,
+                "provider": provider,
+                "model_ref": model_ref,
+                "auth_flow": auth_flow,
+                "required_final_auth_path": required_auth_path,
+                "restart_requested": False,
+                "systemd_restart_requested": False,
+                "start": start,
+            },
+        )
+
     def _bundle_dir_for_id(self, bundle_id: str) -> Path:
         if not bundle_id.startswith("sha256:"):
             raise RuntimeCommandError("bundle_id must use sha256:<hex> format")
@@ -455,3 +664,16 @@ def _required_string(spec: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise RuntimeCommandError(f"spec.{key} is required")
     return value
+
+
+def _required_int(spec: dict[str, Any], key: str) -> int:
+    value = spec.get(key)
+    if isinstance(value, bool):
+        raise RuntimeCommandError(f"spec.{key} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeCommandError(f"spec.{key} is required") from exc
+    if parsed < 0:
+        raise RuntimeCommandError(f"spec.{key} must be non-negative")
+    return parsed

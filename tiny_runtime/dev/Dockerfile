@@ -10,6 +10,10 @@ RUN chmod +x \
       /opt/tinyhat/current/bake/*.sh \
       /opt/tinyhat/current/dev/entrypoint.sh \
       /opt/tinyhat/current/dev/fake-openclaw \
+    && if ! getent group tinyhat >/dev/null; then groupadd --system tinyhat; fi \
+    && if ! id -u tinyhat >/dev/null 2>&1; then useradd --system --gid tinyhat --home-dir /home/tinyhat --create-home --shell /usr/sbin/nologin tinyhat; fi \
+    && mkdir -p /var/log/tinyhat/commands /var/log/tinyhat/diagnostics /home/tinyhat/runtime/openclaw \
+    && chown -R tinyhat:tinyhat /var/log/tinyhat /home/tinyhat/runtime \
     && mkdir -p /opt/tinyhat/current/vendor/openclaw/bin \
     && ln -s /opt/tinyhat/current/dev/fake-openclaw /opt/tinyhat/current/vendor/openclaw/bin/openclaw \
     && PYTHONPATH=/opt/tinyhat/current \

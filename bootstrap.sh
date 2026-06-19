@@ -51,6 +51,7 @@ OPENCLAW_CONFIG_PATH="/etc/openclaw/openclaw.json"
 OPENCLAW_CONFIG_DIR="$(dirname "${OPENCLAW_CONFIG_PATH}")"
 OPENCLAW_STATE_DIR="/var/lib/tinyhat-openclaw"
 OPENCLAW_USER_STATE_BACKUP_ROOT="/var/lib/tinyhat-openclaw-backups"
+TINYHAT_RUNTIME_LOG_ROOT="${TINYHAT_RUNTIME_LOG_ROOT:-/var/log/tinyhat}"
 RUNTIME_BOOTSTRAP_STATUS_PATH="${OPENCLAW_STATE_DIR}/bootstrap-status.json"
 OPENCLAW_GATEWAY_PORT="18789"
 OPENCLAW_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-}"
@@ -87,12 +88,20 @@ ensure_runtime_user() {
 }
 
 chown_runtime_paths() {
-  mkdir -p "${OPENCLAW_CONFIG_DIR}" "${OPENCLAW_STATE_DIR}"
+  mkdir -p \
+    "${OPENCLAW_CONFIG_DIR}" \
+    "${OPENCLAW_STATE_DIR}" \
+    "${TINYHAT_RUNTIME_LOG_ROOT}/commands" \
+    "${TINYHAT_RUNTIME_LOG_ROOT}/diagnostics"
   chown -R \
     "${TINYHAT_RUNTIME_USER}:${TINYHAT_RUNTIME_GROUP}" \
     "${OPENCLAW_CONFIG_DIR}" \
-    "${OPENCLAW_STATE_DIR}"
-  chmod 0700 "${OPENCLAW_CONFIG_DIR}" "${OPENCLAW_STATE_DIR}"
+    "${OPENCLAW_STATE_DIR}" \
+    "${TINYHAT_RUNTIME_LOG_ROOT}"
+  chmod 0700 \
+    "${OPENCLAW_CONFIG_DIR}" \
+    "${OPENCLAW_STATE_DIR}" \
+    "${TINYHAT_RUNTIME_LOG_ROOT}"
 }
 
 verify_codex_subscription_plugin() {
@@ -436,7 +445,7 @@ git --version
 
 ensure_runtime_user
 hard_reset_openclaw_user_state_layout
-mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access
+mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access "${TINYHAT_RUNTIME_LOG_ROOT}"
 chown_runtime_paths
 
 if [[ "${PRIVATE_ACCESS_PROVIDER}" == "tailscale" ]]; then

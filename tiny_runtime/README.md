@@ -20,7 +20,8 @@ runtime. The stable contract is:
   with a local `/var/log/tinyhat/commands/commands.sqlite` index for
   on-box listing/querying;
 - execute only the closed runtime command set:
-  `activate_bundle`, `rollback_bundle`, and `export_diagnostics`.
+  `activate_bundle`, `rollback_bundle`, `export_diagnostics`,
+  `apply_config`, and `link_chatgpt`.
 
 Bundle verification proves the local files match the declared manifest and
 bundle id. It is not a signature system; production promotion should still pin
@@ -68,6 +69,25 @@ The runtime rewrites the resulting zip through Tinyhat redaction before
 settling the command. The expected support bundle includes `summary.md`,
 `diagnostics.json`, `manifest.json`, health snapshots, and
 `stability/latest.json`.
+
+`apply_config` pulls the latest `/me/runtime-secrets` map, writes the
+Computer-local OpenClaw SecretRef source, and calls the official:
+
+```bash
+openclaw secrets reload --json
+```
+
+SecretRef-backed fields hot-refresh through `openclaw secrets reload`. When an
+env-block credential changes, the runtime writes the new local config, posts the
+applied command result, then sets `gateway_rebind_requested=true` and requests
+the existing local gateway rebind so child shells pick up the new environment.
+It still never asks systemd or the supervisor to restart the Computer runtime;
+`restart_requested` and `systemd_restart_requested` stay `false`.
+
+`link_chatgpt` starts the official OpenClaw device-code flow for the local
+Computer. OAuth tokens stay on the Computer; the platform receives only the
+public device-code state and later runtime verification that the active auth
+path is `chatgpt_subscription`.
 
 ## Local proof
 
