@@ -1,7 +1,7 @@
 [Unit]
 Description=Tinyhat OpenClaw gateway
-Wants=network-online.target tinyhat-runtime-attestation.service
-After=network-online.target tinyhat-runtime-attestation.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple

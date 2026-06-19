@@ -13,6 +13,8 @@ runtime. The stable contract is:
 - run systemd units through `/opt/tinyhat/current`; systemd/OpenClaw owns
   gateway liveness, while the tiny Tinyhat platform loop owns only
   assignment, heartbeat, ledger dispatch, and timing reports;
+- keep attestation as a boot/update proof, not a dependency of every
+  OpenClaw gateway restart;
 - reuse the platform `/me/*` identity surface;
 - report a non-secret attestation document with `runtime_generation =
   tiny_runtime`;

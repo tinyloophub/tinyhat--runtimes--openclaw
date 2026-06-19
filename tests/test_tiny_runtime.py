@@ -1365,6 +1365,7 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertIn("ExecStart=/opt/tinyhat/current/bin/tinyhat-runtime gateway run", unit)
         self.assertIn("Restart=always", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertNotIn("tinyhat-runtime-attestation.service", unit)
 
     def test_attestation_unit_uses_stable_current_path(self) -> None:
         unit = (
