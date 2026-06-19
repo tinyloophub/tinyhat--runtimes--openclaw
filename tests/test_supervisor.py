@@ -25,8 +25,8 @@ from unittest.mock import call, patch
 import supervisor
 from tiny_runtime.tinyhat_runtime.command_ledger import CommandLedger
 from tiny_runtime.tinyhat_runtime.runtime_commands import RuntimeCommandRunner
-from tiny_runtime.tinyhat_runtime import supervisor_bridge
 from tinyhat_cli.units import component_update, manifest as manifest_unit
+from tinyhat_cli.units import runtime_command_bridge as supervisor_bridge
 
 _AMBIENT_ENV: dict[str, str | None] = {}
 _AMBIENT_ENV_KEYS = (

@@ -9,11 +9,12 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from . import paths
-from .command_ledger import CommandLedger, utc_now_iso
-from .redaction import redact_text
-from .runtime_commands import RuntimeCommandRunner
+from tiny_runtime.tinyhat_runtime import paths
+from tiny_runtime.tinyhat_runtime.command_ledger import CommandLedger, utc_now_iso
+from tiny_runtime.tinyhat_runtime.redaction import redact_text
+from tiny_runtime.tinyhat_runtime.runtime_commands import RuntimeCommandRunner
 
+UNIT_CATEGORY = "supervision"
 _REAL_RUNTIME_COMMAND_RUNNER = RuntimeCommandRunner
 RUNTIME_COMMAND_RESULT_ENDPOINT = "/hapi/v1/computers/me/runtime-command/result"
 RUNTIME_COMMAND_ARTIFACT_MAX_BYTES_ENV = (

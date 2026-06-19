@@ -42,9 +42,14 @@ if [[ "${skip_systemd}" != "1" ]]; then
     "${systemd_dir}/tinyhat-runtime-gateway.service"
   install -m 0644 "${target}/systemd/tinyhat-runtime-attestation.service" \
     "${systemd_dir}/tinyhat-runtime-attestation.service"
+  install -m 0644 "${target}/systemd/tinyhat-runtime-platform.service" \
+    "${systemd_dir}/tinyhat-runtime-platform.service"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
-    systemctl enable tinyhat-runtime-gateway.service tinyhat-runtime-attestation.service
+    systemctl enable \
+      tinyhat-runtime-gateway.service \
+      tinyhat-runtime-attestation.service \
+      tinyhat-runtime-platform.service
   fi
 fi
 

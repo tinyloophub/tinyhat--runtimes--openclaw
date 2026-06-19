@@ -69,6 +69,7 @@ def run_openclaw(
     timeout: int | None = 30,
     runner: Runner = subprocess.run,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> AdapterResult:
     argv = ("openclaw", *tuple(args))
     try:
@@ -79,6 +80,7 @@ def run_openclaw(
             timeout=timeout,
             check=False,
             env=env or openclaw_env(),
+            input=input_text,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return AdapterResult(command=argv, returncode=127, stdout="", stderr=str(exc))
@@ -97,6 +99,45 @@ def inspect_plugin(plugin_id: str, *, runner: Runner = subprocess.run) -> dict[s
     return {"state": "ready", "plugin": redact_json(result.json_payload())}
 
 
+def install_plugin(source: str, *, runner: Runner = subprocess.run) -> dict[str, Any]:
+    result = run_openclaw(
+        ("plugins", "install", source, "--force"),
+        timeout=120,
+        runner=runner,
+    )
+    if not result.ok:
+        return {"state": "failed", "detail": result.public_summary()}
+    return {"state": "ready", "detail": result.public_summary()}
+
+
+def config_patch(
+    patch: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    replace_paths: Sequence[str] = (),
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    args: list[str] = ["config", "patch", "--stdin", "--json"]
+    if dry_run:
+        args.append("--dry-run")
+    for path in replace_paths:
+        args.extend(["--replace-path", path])
+    result = run_openclaw(
+        tuple(args),
+        runner=runner,
+        input_text=json.dumps(patch, sort_keys=True),
+    )
+    if not result.ok:
+        return {"state": "failed", "detail": result.public_summary()}
+    payload: dict[str, Any] = {}
+    if result.stdout.strip():
+        try:
+            payload = redact_json(result.json_payload())
+        except json.JSONDecodeError:
+            payload = {"stdout": redact_text(result.stdout)}
+    return {"state": "ready", "patch": payload, "detail": result.public_summary()}
+
+
 def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     result = run_openclaw(("gateway", "health", "--json"), runner=runner)
     if not result.ok:
@@ -104,9 +145,30 @@ def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     return {"state": "healthy", "gateway": redact_json(result.json_payload())}
 
 
+def gateway_status(*, runner: Runner = subprocess.run) -> dict[str, Any]:
+    result = run_openclaw(("gateway", "status", "--json"), runner=runner)
+    if not result.ok:
+        return {"state": "unavailable", "detail": result.public_summary()}
+    return {"state": "ready", "gateway": redact_json(result.json_payload())}
+
+
 def gateway_run() -> int:
     try:
-        return subprocess.call(["openclaw", "gateway", "run"], env=openclaw_env())
+        return subprocess.call(
+            [
+                "openclaw",
+                "gateway",
+                "run",
+                "--allow-unconfigured",
+                "--bind",
+                "loopback",
+                "--auth",
+                "none",
+                "--tailscale",
+                "off",
+            ],
+            env=openclaw_env(),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         print(redact_text(str(exc)), flush=True)
         return 127
@@ -124,6 +186,119 @@ def secrets_reload(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     if not result.ok:
         return {"state": "failed", "detail": result.public_summary()}
     return {"state": "ready", "secrets": redact_json(result.json_payload())}
+
+
+def binding_config_patch(
+    binding: dict[str, Any],
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+) -> dict[str, Any]:
+    owner_id = str(binding.get("telegram_owner_user_id") or "").strip()
+    bot_token = str(binding.get("telegram_bot_token") or "").strip()
+    if not owner_id:
+        raise ValueError("binding is missing telegram_owner_user_id")
+    if not bot_token:
+        raise ValueError("binding is missing telegram_bot_token")
+
+    openrouter_key = str(binding.get("openrouter_api_key") or "").strip()
+    openrouter_base = str(binding.get("openrouter_base_url") or "").strip()
+    openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
+    llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
+    llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits").strip()
+
+    primary_model = (
+        llm_model_ref
+        if llm_auth_mode == "chatgpt_subscription" and llm_model_ref
+        else f"openrouter/{openrouter_model.lstrip('/')}"
+        if openrouter_model
+        else "openai/gpt-5.5"
+    )
+    env_block: dict[str, str] = {}
+    if openrouter_key:
+        env_block["OPENROUTER_API_KEY"] = openrouter_key
+
+    tinyhat_plugin_config: dict[str, Any] = {}
+    if platform_base_url:
+        tinyhat_plugin_config["platformBaseUrl"] = platform_base_url
+    if backend_audience:
+        tinyhat_plugin_config["backendAudience"] = backend_audience
+
+    patch: dict[str, Any] = {
+        "gateway": {
+            "mode": "local",
+            "bind": "loopback",
+            "port": int(os.environ.get("TINYHAT_OPENCLAW_GATEWAY_PORT", "18789")),
+            "auth": {"mode": "none"},
+            "tailscale": {"mode": "off"},
+        },
+        "agents": {
+            "defaults": {
+                "workspace": str(paths.OPENCLAW_STATE_DIR / "workspace"),
+                "model": {"primary": primary_model},
+                "compaction": {"reserveTokensFloor": 20000},
+            }
+        },
+        "channels": {
+            "telegram": {
+                "enabled": True,
+                "dmPolicy": "allowlist",
+                "groupPolicy": "disabled",
+                "allowFrom": [owner_id],
+                "botToken": bot_token,
+            }
+        },
+        "commands": {"ownerAllowFrom": [f"telegram:{owner_id}"]},
+        "plugins": {
+            "entries": {
+                "telegram": {"enabled": True},
+                "openai": {"enabled": True},
+                "codex": {"enabled": True},
+                "codex-supervisor": {"enabled": True},
+                "tinyhat": {
+                    "enabled": True,
+                    "config": tinyhat_plugin_config,
+                },
+            }
+        },
+        "secrets": {
+            "providers": {
+                "tinyhat": {
+                    "source": "file",
+                    "path": str(paths.OPENCLAW_SECRETS_PATH),
+                    "mode": "json",
+                }
+            },
+            "defaults": {"file": "tinyhat"},
+        },
+        "session": {"dmScope": "per-channel-peer"},
+    }
+    if openrouter_base:
+        patch.setdefault("models", {}).setdefault("providers", {})["openrouter"] = {
+            "baseURL": openrouter_base
+        }
+    if env_block:
+        patch["env"] = env_block
+    return patch
+
+
+def apply_binding_config(
+    binding: dict[str, Any],
+    *,
+    platform_base_url: str | None = None,
+    backend_audience: str | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    patch = binding_config_patch(
+        binding,
+        platform_base_url=platform_base_url,
+        backend_audience=backend_audience,
+    )
+    return config_patch(
+        patch,
+        replace_paths=("plugins.entries", "channels.telegram", "commands.ownerAllowFrom"),
+        runner=runner,
+    )
 
 
 def _redact_zip_member(name: str, data: bytes) -> bytes:

@@ -6522,7 +6522,7 @@ def handle_update_component_command(
 
 def handle_runtime_command(command: dict) -> None:
     """Execute a typed ``tiny_runtime`` command delivered by heartbeat."""
-    from tiny_runtime.tinyhat_runtime.supervisor_bridge import handle_runtime_command as bridge
+    from tinyhat_cli.units.runtime_command_bridge import handle_runtime_command as bridge
 
     bridge(
         command,
