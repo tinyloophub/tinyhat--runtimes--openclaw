@@ -1119,6 +1119,9 @@ class BakeScriptTests(unittest.TestCase):
             helper_text = helper.read_text(encoding="utf-8")
             self.assertIn("ensure_codex_subscription_plugin_installed", helper_text)
             self.assertIn("ensure_tinyhat_plugin_installed", helper_text)
+            self.assertIn("_is_codex_subscription_plugin_available", helper_text)
+            self.assertNotIn("openclaw plugins inspect codex --json", helper_text)
+            self.assertNotIn("json.load(sys.stdin)", helper_text)
 
     def test_assemble_bundle_uses_explicit_authority_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

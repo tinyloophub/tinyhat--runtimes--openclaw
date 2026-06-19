@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Preinstall binding-independent OpenClaw plugins while baking a hot image.
+# Invoked from the runtime source checkout by the monorepo image bake script.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -25,10 +26,13 @@ if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
 fi
 
 python3 - <<'PY'
+import sys
 import supervisor
 
 supervisor.ensure_codex_subscription_plugin_installed()
 supervisor.ensure_tinyhat_plugin_installed()
+if not supervisor._is_codex_subscription_plugin_available():
+    sys.exit("codex subscription plugin not available after preinstall")
 PY
 
 if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
@@ -37,17 +41,6 @@ if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
     "${state_dir}"
 fi
 
-runuser_cmd=()
-if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
-  runuser_cmd=(runuser -u "${runtime_user}" --)
-fi
-
-"${runuser_cmd[@]}" env \
-  HOME="${state_dir}" \
-  OPENCLAW_CONFIG_PATH="${config_path}" \
-  OPENCLAW_STATE_DIR="${state_dir}" \
-  openclaw plugins inspect codex --json \
-  | python3 -c 'import json, sys; p=(json.load(sys.stdin).get("plugin") or {}); ids=p.get("providerIds") or p.get("providers") or []; sys.exit(0 if p.get("id") == "codex" and p.get("enabled") is not False and p.get("status") == "loaded" and "codex" in ids else 1)'
 test -f "${state_dir}/tinyhat-plugin.version"
 
 echo "[tinyhat-runtime] hot image plugin preinstall verified"
