@@ -146,15 +146,14 @@ class TinyRuntimePlatformLoop:
             return
         if self.ready_reported:
             return
-        try:
-            self.client.post_json(
-                "/hapi/v1/computers/me/state",
-                {"state": "ready", "detail": "tiny_runtime platform loop ready"},
-            )
-            self.ready_reported = True
-            LOG.info("reported state=ready")
-        except Exception as exc:  # noqa: BLE001 - ready may already be assigned
-            LOG.info("ready report skipped/deferred: %s", exc)
+        state_posted = self._post_lifecycle_state(
+            "ready",
+            "tiny_runtime platform loop ready",
+            already_state="ready",
+        )
+        self.ready_reported = True
+        if state_posted:
+            LOG.info("confirmed state=ready")
 
     def _poll_binding(self) -> dict[str, Any]:
         path = (
@@ -191,9 +190,10 @@ class TinyRuntimePlatformLoop:
         phase_spans.append(_phase("bot_ready", "bot-ready", ready_started, ready_done))
 
         active_started = time.monotonic()
-        self.client.post_json(
-            "/hapi/v1/computers/me/state",
-            {"state": "active", "detail": "tiny_runtime OpenClaw ready"},
+        self._post_lifecycle_state(
+            "active",
+            "tiny_runtime OpenClaw ready",
+            already_state="active",
         )
         active_done = time.monotonic()
         phase_spans.append(_phase("binding_ack", "binding ack", active_started, active_done))
@@ -278,6 +278,37 @@ class TinyRuntimePlatformLoop:
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"OpenClaw gateway was not ready: {last_health}")
             time.sleep(max(0.1, GATEWAY_READY_POLL_SECONDS))
+
+    def _post_lifecycle_state(
+        self,
+        state: str,
+        detail: str,
+        *,
+        already_state: str,
+    ) -> bool:
+        try:
+            self.client.post_json(
+                "/hapi/v1/computers/me/state",
+                {"state": state, "detail": detail},
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - status check decides if this is stale
+            try:
+                status = self.client.get_json(
+                    "/hapi/v1/computers/me/platform-status",
+                    timeout=10,
+                )
+            except Exception:
+                raise exc
+            if status.get("state") == already_state:
+                if state == "active" and status.get("assigned") is not True:
+                    raise exc
+                LOG.info(
+                    "state=%s already satisfied by platform; continuing",
+                    state,
+                )
+                return False
+            raise exc
 
     def _dispatch_runtime_command(self, command: dict[str, Any]) -> None:
         runtime_command = command.get("command")
@@ -368,7 +399,12 @@ class TinyRuntimePlatformLoop:
             },
         }
         if extra:
-            payload.update(extra)
+            gateway_extra = extra.get("gateway")
+            payload.update(
+                {key: value for key, value in extra.items() if key != "gateway"}
+            )
+            if isinstance(gateway_extra, dict):
+                payload["gateway"] = {**payload["gateway"], **gateway_extra}
         self.client.post_json("/hapi/v1/computers/me/runtime-state", payload)
 
     def _safe_post_runtime_state(

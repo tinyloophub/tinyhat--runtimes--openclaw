@@ -921,6 +921,38 @@ class PlatformLoopTests(unittest.TestCase):
         )
         self.assertEqual(posts[1][1]["state"], "ready")
 
+    def test_ready_report_treats_existing_ready_state_as_idempotent(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 400: Bad Request")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "ready", "assigned": False}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+        loop._report_ready()
+
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+                "/hapi/v1/computers/me/runtime-state",
+            ],
+        )
+        client.get_json.assert_called_once_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+
     def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -987,7 +1019,10 @@ class PlatformLoopTests(unittest.TestCase):
         now = time.monotonic()
 
         with (
-            patch.dict(os.environ, {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"}),
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
             patch.object(
                 platform_loop.openclaw_adapter,
                 "apply_binding_config",
@@ -1025,6 +1060,68 @@ class PlatformLoopTests(unittest.TestCase):
         self.assertEqual(
             sample["sample_metadata"]["restart_policy"],
             "no_assignment_restart",
+        )
+
+    def test_binding_activation_treats_existing_active_state_as_idempotent(
+        self,
+    ) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 400: Bad Request")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "active", "assigned": True}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_user_id": "654321",
+            "telegram_bot_token": "token=secret-value",
+        }
+        now = time.monotonic()
+
+        with (
+            patch.dict(os.environ, {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"}),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "ready"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                return_value={"state": "healthy"},
+            ),
+        ):
+            loop._activate_binding(
+                binding,
+                cycle_started_wall=0.0,
+                cycle_started=now,
+                binding_received=now,
+                phase_spans=[],
+            )
+
+        client.get_json.assert_called_once_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+        runtime_state_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/runtime-state"
+        ]
+        self.assertEqual(len(runtime_state_payloads), 2)
+        self.assertTrue(runtime_state_payloads[0].get("startup_timings"))
+        self.assertEqual(runtime_state_payloads[1]["runtime_health"], "healthy")
+        self.assertEqual(
+            runtime_state_payloads[1]["gateway"]["liveness_owner"],
+            "systemd",
         )
 
     def test_gateway_ready_wait_covers_openclaw_self_restart(self) -> None:
