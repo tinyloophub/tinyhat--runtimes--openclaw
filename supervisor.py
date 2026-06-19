@@ -1480,11 +1480,18 @@ def _binding_requires_chatgpt_subscription_provider(binding: dict) -> bool:
 
 def _try_check_codex_subscription_plugin() -> bool:
     try:
-        return ensure_codex_subscription_plugin_installed()
+        _sync_openclaw_cli_runtime_ownership()
+        available = _is_codex_subscription_plugin_available()
+        if not available:
+            log.info(
+                "Codex subscription plugin is not preinstalled; skipping "
+                "optional bind-time install for platform-credit binding"
+            )
+        return available
     except Exception as exc:
         log.warning(
-            "Codex subscription plugin unavailable; continuing without "
-            "auxiliary Codex plugin tools: %s",
+            "Codex subscription plugin inspection failed; continuing without "
+            "auxiliary Codex plugin tools on this platform-credit binding: %s",
             exc,
         )
         return False

@@ -7,6 +7,17 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Added
+
+- Add a repo-owned hot-image preinstall helper that bakes the Codex subscription
+  provider plugin and Tinyhat platform plugin into `tiny_runtime_bundle` images.
+
+### Changed
+
+- Avoid installing the optional Codex subscription plugin on the platform-credit
+  assignment path; platform-credit bindings now inspect any preinstalled plugin
+  and continue without npm work when it is absent.
+
 ## 0.15.5
 
 Patch release for Tinyloop `tiny_runtime_bundle` image bakes that need the

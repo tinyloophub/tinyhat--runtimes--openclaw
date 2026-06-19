@@ -8319,14 +8319,10 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
         self.assertTrue(result["chatgpt_subscription_provider_available"])
         self.assertTrue(result["tinyhat_plugin_installed"])
 
-    def test_prepare_platform_runtime_setup_keeps_codex_plugin_optional_for_platform_credits(
+    def test_prepare_platform_runtime_setup_only_inspects_optional_codex_plugin_for_platform_credits(
         self,
     ) -> None:
         calls: list[str] = []
-
-        def fail_codex() -> bool:
-            calls.append("codex")
-            raise RuntimeError("codex registry unavailable")
 
         def fail_openai() -> bool:
             calls.append("openai")
@@ -8334,10 +8330,18 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
 
         with (
             patch.object(supervisor, "wait_for_openclaw_cli_available") as wait_cli,
+            patch.object(supervisor, "_sync_openclaw_cli_runtime_ownership"),
+            patch.object(
+                supervisor,
+                "_is_codex_subscription_plugin_available",
+                side_effect=lambda: calls.append("codex-inspect") or False,
+            ),
             patch.object(
                 supervisor,
                 "ensure_codex_subscription_plugin_installed",
-                side_effect=fail_codex,
+                side_effect=AssertionError(
+                    "platform-credit binding must not install optional codex plugin"
+                ),
             ),
             patch.object(
                 supervisor,
@@ -8358,7 +8362,7 @@ class PlatformRuntimeSetupTests(unittest.TestCase):
             )
 
         wait_cli.assert_called_once()
-        self.assertEqual(calls, ["codex", "openai", "tinyhat"])
+        self.assertEqual(calls, ["codex-inspect", "openai", "tinyhat"])
         self.assertFalse(result["codex_subscription_plugin_installed"])
         self.assertFalse(result["chatgpt_subscription_provider_available"])
         self.assertTrue(result["tinyhat_plugin_installed"])
