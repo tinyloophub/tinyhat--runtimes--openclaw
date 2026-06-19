@@ -488,9 +488,19 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
-    def test_apply_config_command_fails_closed_when_hot_path_is_missing(self) -> None:
+    def test_apply_config_command_applies_env_block_and_requests_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
+            applied: list[dict] = []
+
+            def fake_apply_runtime_config(**kwargs) -> dict:
+                applied.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": 1,
+                    "reload": {"skipped": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": True,
+                }
 
             runner = RuntimeCommandRunner(
                 ledger=CommandLedger(root=base / "commands"),
@@ -501,12 +511,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                     "revision": 9,
                     "secrets": {"EXA_API_KEY": "exa-test-secret"},
                 },
-                apply_runtime_config=lambda **_kwargs: {
-                    "revision": 9,
-                    "secret_count": 1,
-                    "reload": {"skipped": True, "reason": "dry_run"},
-                    "env_block_changed": True,
-                },
+                apply_runtime_config=fake_apply_runtime_config,
                 service_restart=False,
             )
 
@@ -523,12 +528,12 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["failure_code"], "config_apply_failed")
-            self.assertEqual(result["phase"], "unsupported_interface")
-            self.assertEqual(result["result"]["failure_label"], "unsupported_interface")
-            self.assertEqual(result["result"]["reload"]["reason"], "dry_run")
-            self.assertFalse(result["result"]["restart_requested"])
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["failure_code"], None)
+            self.assertEqual(result["phase"], "hot_reloaded")
+            self.assertEqual([item["dry_run"] for item in applied], [True, False])
+            self.assertTrue(result["result"]["env_block_changed"])
+            self.assertTrue(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
     def test_apply_config_command_reports_typed_failure_on_reload_error(self) -> None:

@@ -8461,6 +8461,95 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
                 }
             )
 
+    def test_apply_config_runtime_command_rebinds_after_result_post(self) -> None:
+        result = {
+            "schema": "tiny_runtime_command_result_v1",
+            "command_id": "cmd-apply-env",
+            "idempotency_key": "idem-apply-env",
+            "kind": "apply_config",
+            "status": "applied",
+            "phase": "hot_reloaded",
+            "failure_code": None,
+            "observed_at": "2026-06-18T19:00:00Z",
+            "result": {
+                "env_block_changed": True,
+                "restart_requested": True,
+                "systemd_restart_requested": False,
+            },
+        }
+        runner = SimpleNamespace(execute=lambda command: result)
+        events: list[str] = []
+
+        def fake_post_json(path: str, body: dict) -> dict:
+            events.append("post")
+            return {"ok": True}
+
+        with (
+            patch.object(
+                supervisor_bridge,
+                "RuntimeCommandRunner",
+                return_value=runner,
+            ),
+            patch.object(supervisor, "post_json", side_effect=fake_post_json),
+            patch.object(
+                supervisor,
+                "_signal_rebind_for_secrets",
+                side_effect=lambda: events.append("rebind"),
+            ),
+        ):
+            supervisor.handle_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-apply-env",
+                        "idempotency_key": "idem-apply-env",
+                        "kind": "apply_config",
+                    },
+                }
+            )
+
+        self.assertEqual(events, ["post", "rebind"])
+
+    def test_apply_config_runtime_command_skips_rebind_when_post_fails(self) -> None:
+        result = {
+            "schema": "tiny_runtime_command_result_v1",
+            "command_id": "cmd-apply-env-retry",
+            "idempotency_key": "idem-apply-env-retry",
+            "kind": "apply_config",
+            "status": "applied",
+            "phase": "hot_reloaded",
+            "failure_code": None,
+            "observed_at": "2026-06-18T19:00:00Z",
+            "result": {
+                "env_block_changed": True,
+                "restart_requested": True,
+                "systemd_restart_requested": False,
+            },
+        }
+        runner = SimpleNamespace(execute=lambda command: result)
+
+        with (
+            patch.object(
+                supervisor_bridge,
+                "RuntimeCommandRunner",
+                return_value=runner,
+            ),
+            patch.object(supervisor, "post_json", side_effect=RuntimeError("offline")),
+            patch.object(supervisor, "_signal_rebind_for_secrets") as rebind,
+        ):
+            supervisor.handle_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-apply-env-retry",
+                        "idempotency_key": "idem-apply-env-retry",
+                        "kind": "apply_config",
+                    },
+                }
+            )
+
+        rebind.assert_not_called()
+
     def test_apply_config_wiring_uses_supervisor_callbacks_with_real_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             applies: list[dict] = []
@@ -8519,7 +8608,57 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
         path, body = post_json.call_args.args
         self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
         self.assertEqual(body["result"]["status"], "applied")
-        self.assertEqual(body["result"]["phase"], "hot_reloaded")
+
+    def test_default_runner_falls_back_when_command_log_root_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            configured_root = root / "commands-root"
+            configured_root.write_text("not a directory", encoding="utf-8")
+            fallback_state_root = root / "state"
+            applies: list[dict] = []
+            posts: list[tuple[str, dict]] = []
+
+            def fake_apply_runtime_secret_map(**kwargs) -> dict:
+                applies.append(kwargs)
+                return {
+                    "revision": kwargs["revision"],
+                    "secret_count": len(kwargs["secrets"]),
+                    "reload": {"ok": True, "dry_run": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": False,
+                }
+
+            with (
+                patch.object(supervisor_bridge.paths, "COMMANDS_LOG_DIR", configured_root),
+                patch.object(supervisor_bridge.paths, "STATE_ROOT", fallback_state_root),
+            ):
+                result = supervisor_bridge.handle_runtime_command(
+                    {
+                        "command_id": "cmd-fallback-log-root",
+                        "idempotency_key": "idem-fallback-log-root",
+                        "kind": "apply_config",
+                        "spec": {
+                            "desired_config_revision": 4,
+                            "hot_required": True,
+                        },
+                    },
+                    post_json=lambda path, body: posts.append((path, body)) or {},
+                    get_json=lambda path: {
+                        "revision": 4,
+                        "secrets": {"OPENAI_API_KEY": "sk-test"},
+                    },
+                    apply_runtime_config=fake_apply_runtime_secret_map,
+                    logger=supervisor.log,
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual([item["dry_run"] for item in applies], [True, False])
+            self.assertEqual(posts[0][0], supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+            self.assertEqual(posts[0][1]["result"]["phase"], "hot_reloaded")
+            command_root = fallback_state_root / "commands"
+            self.assertTrue(
+                (command_root / "cmd-fallback-log-root" / "command.json").exists()
+            )
+            self.assertTrue((command_root / "commands.sqlite").exists())
 
 
 class UpdateComponentCommandTests(unittest.TestCase):

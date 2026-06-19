@@ -440,27 +440,6 @@ class RuntimeCommandRunner:
             "restart_requested": False,
             "systemd_restart_requested": False,
         }
-        if result_payload["env_block_changed"]:
-            result_payload.update(
-                {
-                    "failure_label": "unsupported_interface",
-                    "diagnostic": (
-                        "OpenClaw reported that this credential change needs an "
-                        "env-block refresh. v0.16 requires the official hot "
-                        "SecretRef/reload path, so the runtime refused to "
-                        "restart the gateway."
-                    ),
-                }
-            )
-            return self._finish(
-                command_id=command_id,
-                idempotency_key=idempotency_key,
-                kind=kind,
-                status="failed",
-                phase="unsupported_interface",
-                failure_code="config_apply_failed",
-                result=result_payload,
-            )
 
         self.ledger.update(command_id, status="running", phase="hot_reload")
         try:
@@ -486,6 +465,8 @@ class RuntimeCommandRunner:
                 "secret_count": int(result.get("secret_count") or len(secrets)),
                 "reload": result.get("reload") or {},
                 "env_block_changed": bool(result.get("env_block_changed")),
+                "restart_requested": bool(result.get("env_block_changed")),
+                "systemd_restart_requested": False,
             }
         )
         return self._finish(

@@ -6448,6 +6448,7 @@ def handle_runtime_command(command: dict) -> None:
         get_json=get_json,
         apply_runtime_config=apply_runtime_secret_map,
         start_chatgpt_link=handle_start_chatgpt_link_command,
+        request_runtime_secret_rebind=_signal_rebind_for_secrets,
         logger=log,
     )
 

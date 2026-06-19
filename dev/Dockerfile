@@ -68,10 +68,15 @@ RUN OPENCLAW_INSTALL_SPEC="$(python3 -c 'import json; print(json.load(open("/tmp
 RUN groupadd --system tinyhat \
     && useradd --system --gid tinyhat --create-home \
         --home-dir /home/tinyhat --shell /bin/bash tinyhat \
-    && mkdir -p /home/tinyhat/runtime/openclaw /etc/openclaw \
+    && mkdir -p \
+        /home/tinyhat/runtime/openclaw \
+        /etc/openclaw \
+        /var/log/tinyhat/commands \
+        /var/log/tinyhat/diagnostics \
     && chown -R tinyhat:tinyhat \
         /home/tinyhat \
         /etc/openclaw \
+        /var/log/tinyhat \
         /usr/local/bin \
         /usr/local/lib/node_modules
 

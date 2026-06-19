@@ -7,6 +7,16 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Fixed
+
+- Let typed `apply_config` runtime commands use the existing runtime-secret
+  env-block path for non-OpenAI credentials, post the applied command result,
+  then request the legacy gateway rebind so child shells receive the new
+  environment.
+- Create and own the runtime command log root during bootstrap/dev image setup,
+  and fall back to the runtime state directory if that root is unavailable so
+  local command recording cannot block hot credential application.
+
 ## 0.15.3
 
 Patch release for activating repaired legacy ChatGPT/Codex subscription auth
