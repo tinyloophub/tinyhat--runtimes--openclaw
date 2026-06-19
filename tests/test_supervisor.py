@@ -8609,6 +8609,57 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
         self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
         self.assertEqual(body["result"]["status"], "applied")
 
+    def test_link_chatgpt_wiring_uses_supervisor_callback_with_real_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            starts: list[dict] = []
+
+            def runner_factory(**kwargs) -> RuntimeCommandRunner:
+                return RuntimeCommandRunner(
+                    ledger=CommandLedger(root=Path(tmp) / "commands"),
+                    service_restart=False,
+                    **kwargs,
+                )
+
+            def fake_start_chatgpt_link(spec: dict) -> dict:
+                starts.append(spec)
+                return {"state": "started", "session_id": spec["session_id"]}
+
+            with (
+                patch.object(
+                    supervisor,
+                    "handle_start_chatgpt_link_command",
+                    side_effect=fake_start_chatgpt_link,
+                ) as start_link,
+                patch.object(supervisor_bridge, "RuntimeCommandRunner", runner_factory),
+                patch.object(supervisor, "post_json") as post_json,
+            ):
+                supervisor.handle_runtime_command(
+                    {
+                        "type": "runtime_command",
+                        "command": {
+                            "command_id": "cmd-link-real-runner",
+                            "idempotency_key": "idem-link-real-runner",
+                            "kind": "link_chatgpt",
+                            "spec": {
+                                "session_id": "sess-real-runner",
+                                "provider": "openai",
+                                "model_ref": "openai/gpt-5.5",
+                                "auth_flow": "device_code",
+                                "required_final_auth_path": "chatgpt_subscription",
+                            },
+                        },
+                    }
+                )
+
+        start_link.assert_called_once()
+        self.assertEqual(starts[0]["type"], "start_chatgpt_link")
+        self.assertEqual(starts[0]["session_id"], "sess-real-runner")
+        post_json.assert_called_once()
+        path, body = post_json.call_args.args
+        self.assertEqual(path, supervisor_bridge.RUNTIME_COMMAND_RESULT_ENDPOINT)
+        self.assertEqual(body["result"]["status"], "applied")
+        self.assertEqual(body["result"]["phase"], "device_code_started")
+
     def test_default_runner_falls_back_when_command_log_root_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
