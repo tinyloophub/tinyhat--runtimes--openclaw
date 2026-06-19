@@ -1400,6 +1400,26 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertIn("--json", seen["argv"])
         self.assertEqual(result["patch"], {"state": "would_apply"})
 
+    def test_binding_config_patch_omits_openrouter_provider_base_url(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        patch = openclaw_adapter.binding_config_patch(
+            {
+                "telegram_owner_user_id": "12345",
+                "telegram_bot_token": "123:token",
+                "openrouter_api_key": "sk-or-v1-child",
+                "openrouter_base_url": "https://openrouter.ai/api/v1",
+                "openrouter_default_model": "openai/gpt-5.5",
+            }
+        )
+
+        self.assertEqual(
+            patch["agents"]["defaults"]["model"]["primary"],
+            "openrouter/openai/gpt-5.5",
+        )
+        self.assertEqual(patch["env"], {"OPENROUTER_API_KEY": "sk-or-v1-child"})
+        self.assertNotIn("models", patch)
+
 
 class BakeScriptTests(unittest.TestCase):
     def test_assemble_bundle_round_trip(self) -> None:

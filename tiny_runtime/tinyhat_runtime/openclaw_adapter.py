@@ -202,7 +202,6 @@ def binding_config_patch(
         raise ValueError("binding is missing telegram_bot_token")
 
     openrouter_key = str(binding.get("openrouter_api_key") or "").strip()
-    openrouter_base = str(binding.get("openrouter_base_url") or "").strip()
     openrouter_model = str(binding.get("openrouter_default_model") or "").strip()
     llm_model_ref = str(binding.get("llm_model_ref") or "").strip()
     llm_auth_mode = str(binding.get("llm_auth_mode") or "platform_credits").strip()
@@ -273,10 +272,6 @@ def binding_config_patch(
         },
         "session": {"dmScope": "per-channel-peer"},
     }
-    if openrouter_base:
-        patch.setdefault("models", {}).setdefault("providers", {})["openrouter"] = {
-            "baseURL": openrouter_base
-        }
     if env_block:
         patch["env"] = env_block
     return patch
