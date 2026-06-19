@@ -7,6 +7,16 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.5
+
+Patch release for Tinyloop v0.16 warm-pool image bake provenance.
+
+### Fixed
+
+- Let the `tiny_runtime` bundle assembler take explicit OpenClaw and Tinyhat
+  plugin refs from the platform bake authority so the bundle manifest,
+  attestation, and Tinyloop image catalog agree on the promoted components.
+
 ## 0.15.4
 
 Patch release for the Tinyloop v0.16 warm-pool image train. This is the first
