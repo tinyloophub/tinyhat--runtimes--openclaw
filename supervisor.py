@@ -2800,11 +2800,11 @@ def _apply_runtime_secret_env_block(
 
 
 def _signal_rebind_for_secrets() -> None:
-    """Ask the supervisor's main loop to restart the gateway.
+    """Ask the supervisor's main loop for a local gateway rebind.
 
     ``applyConfigEnvVars`` only runs at OpenClaw gateway boot, so a
     change to ``config["env"]`` does not reach the bash tool's
-    ``process.env`` until the gateway restarts. Reuse the existing
+    ``process.env`` until the gateway is rebound. Reuse the existing
     rebind machinery (stop → poll ``/me/binding`` → fresh config → fresh
     gateway) rather than inventing a parallel restart path; the binding
     watchdog and gateway-health probe already understand that flow.
@@ -2821,7 +2821,7 @@ def sync_openclaw_secret_ref_config(secrets: dict[str, str], *, dry_run: bool = 
     """Update openclaw.json with Tinyhat's file SecretRef surfaces.
 
     Returns ``True`` if the runtime-secret entries in ``config["env"]``
-    changed (a gateway restart is required for ``applyConfigEnvVars`` to
+    changed (a gateway rebind is required for ``applyConfigEnvVars`` to
     re-populate ``process.env``), ``False`` otherwise. Changes that only
     affect SecretRef-resolved fields like ``models.providers.openai.apiKey``
     are handled by ``openclaw secrets reload`` without a restart and
@@ -5494,13 +5494,12 @@ def handle_apply_config_command(command: dict) -> None:
             result["secret_count"],
             "yes" if result.get("env_block_changed") else "no",
         )
-        # The platform now knows the new revision is applied. Restart the
-        # gateway so OpenClaw's applyConfigEnvVars picks up the new env
-        # block; otherwise the agent shell tool's process.env stays stale
-        # and a user-added secret like EXA_API_KEY never reaches `$EXA_API_KEY`.
-        # Skip the restart when only SecretRef-backed config changed (e.g.
-        # an OPENAI_API_KEY-only edit) since `openclaw secrets reload`
-        # already refreshed the runtime snapshot for that path.
+        # The platform now knows the new revision is applied. Rebind the
+        # local gateway so OpenClaw's applyConfigEnvVars picks up the new
+        # env block; otherwise the agent shell tool's process.env stays
+        # stale and a user-added secret like EXA_API_KEY never reaches
+        # `$EXA_API_KEY`. Skip the rebind when only SecretRef-backed config
+        # changed since `openclaw secrets reload` already refreshed that path.
         if result.get("env_block_changed"):
             _signal_rebind_for_secrets()
     except Exception as exc:

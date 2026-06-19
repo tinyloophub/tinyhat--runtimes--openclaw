@@ -13,6 +13,8 @@ runtime's published `VERSION` on each new Computer row.
   env-block path for non-OpenAI credentials, post the applied command result,
   then request the legacy gateway rebind so child shells receive the new
   environment.
+- Report env-block refreshes as `gateway_rebind_requested=true` while keeping
+  `restart_requested=false` and `systemd_restart_requested=false`.
 - Create and own the runtime command log root during bootstrap/dev image setup,
   and fall back to the runtime state directory if that root is unavailable so
   local command recording cannot block hot credential application.

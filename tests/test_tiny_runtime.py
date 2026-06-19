@@ -533,7 +533,8 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["phase"], "hot_reloaded")
             self.assertEqual([item["dry_run"] for item in applied], [True, False])
             self.assertTrue(result["result"]["env_block_changed"])
-            self.assertTrue(result["result"]["restart_requested"])
+            self.assertTrue(result["result"]["gateway_rebind_requested"])
+            self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
     def test_apply_config_command_reports_typed_failure_on_reload_error(self) -> None:

@@ -8473,7 +8473,8 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
             "observed_at": "2026-06-18T19:00:00Z",
             "result": {
                 "env_block_changed": True,
-                "restart_requested": True,
+                "gateway_rebind_requested": True,
+                "restart_requested": False,
                 "systemd_restart_requested": False,
             },
         }
@@ -8522,7 +8523,8 @@ class RuntimeCommandDispatchTests(unittest.TestCase):
             "observed_at": "2026-06-18T19:00:00Z",
             "result": {
                 "env_block_changed": True,
-                "restart_requested": True,
+                "gateway_rebind_requested": True,
+                "restart_requested": False,
                 "systemd_restart_requested": False,
             },
         }
