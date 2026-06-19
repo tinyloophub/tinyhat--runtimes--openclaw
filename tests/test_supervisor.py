@@ -4554,8 +4554,10 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         )
         self.assertEqual(runtime_state_posts[0]["computer_id"], "123")
         self.assertEqual(
-            supervisor.budget_runtime_state_payload(payload),
-            runtime_state_posts[0],
+            supervisor._runtime_state_platform_post_signature(
+                supervisor.budget_runtime_state_payload(payload)
+            ),
+            supervisor._runtime_state_platform_post_signature(runtime_state_posts[0]),
         )
 
     def test_unbound_phase_refreshes_ready_runtime_state_while_waiting(
@@ -4688,8 +4690,10 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
             "awaiting_binding",
         )
         self.assertEqual(
-            supervisor.budget_runtime_state_payload(payload),
-            runtime_state_posts[0],
+            supervisor._runtime_state_platform_post_signature(
+                supervisor.budget_runtime_state_payload(payload)
+            ),
+            supervisor._runtime_state_platform_post_signature(runtime_state_posts[0]),
         )
 
     def test_platform_setup_failure_fails_closed_before_config_apply(self) -> None:
