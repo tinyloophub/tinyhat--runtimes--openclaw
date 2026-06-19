@@ -43,6 +43,9 @@ OPENCLAW_STATE_DIR = _path_from_env(
 OPENCLAW_CONFIG_PATH = _path_from_env(
     "TINYHAT_OPENCLAW_CONFIG_PATH", "/etc/openclaw/openclaw.json"
 )
+OPENCLAW_SECRETS_PATH = _path_from_env(
+    "TINYHAT_OPENCLAW_SECRETS_PATH", "/etc/openclaw/tinyhat-secrets.json"
+)
 BUNDLE_OPENCLAW_DIR = _path_from_env(
     "TINYHAT_BUNDLE_OPENCLAW_DIR", str(CURRENT_LINK / "vendor" / "openclaw")
 )

@@ -10,7 +10,9 @@ runtime. The stable contract is:
 - assemble a content-addressed runtime bundle from public, pinned refs,
   including bundle-local OpenClaw under `vendor/openclaw/`;
 - install the bundle at bake time and expose stable bin shims;
-- run systemd units through `/opt/tinyhat/current`;
+- run systemd units through `/opt/tinyhat/current`; systemd/OpenClaw owns
+  gateway liveness, while the tiny Tinyhat platform loop owns only
+  assignment, heartbeat, ledger dispatch, and timing reports;
 - reuse the platform `/me/*` identity surface;
 - report a non-secret attestation document with `runtime_generation =
   tiny_runtime`;
@@ -77,12 +79,11 @@ Computer-local OpenClaw SecretRef source, and calls the official:
 openclaw secrets reload --json
 ```
 
-SecretRef-backed fields hot-refresh through `openclaw secrets reload`. When an
-env-block credential changes, the runtime writes the new local config, posts the
-applied command result, then sets `gateway_rebind_requested=true` and requests
-the existing local gateway rebind so child shells pick up the new environment.
-It still never asks systemd or the supervisor to restart the Computer runtime;
-`restart_requested` and `systemd_restart_requested` stay `false`.
+SecretRef-backed fields hot-refresh through `openclaw secrets reload`. Tinyhat
+assignment and credential updates never request a gateway restart. Values that
+cannot be refreshed through OpenClaw's official hot surfaces must move to
+SecretRefs or a separate typed maintenance operation; `restart_requested`,
+`gateway_rebind_requested`, and `systemd_restart_requested` stay `false`.
 
 `link_chatgpt` starts the official OpenClaw device-code flow for the local
 Computer. OAuth tokens stay on the Computer; the platform receives only the

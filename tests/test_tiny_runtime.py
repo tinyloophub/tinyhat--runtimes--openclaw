@@ -14,16 +14,17 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "tiny_runtime"))
 
 from tinyhat_runtime import RUNTIME_GENERATION  # noqa: E402
-from tinyhat_runtime import attestation, bundle, launcher, openclaw_adapter  # noqa: E402
+from tinyhat_runtime import attestation, bundle, hot_image, launcher, openclaw_adapter  # noqa: E402
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
 from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
 from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
@@ -91,6 +92,36 @@ class BundleManifestTests(unittest.TestCase):
         self.assertNotIn("npm install -g openclaw@latest", dockerfile)
         self.assertIn("COPY tiny_runtime ./tiny_runtime", dockerfile)
         self.assertIn("COPY tinyhat_cli ./tinyhat_cli", dockerfile)
+
+
+class HotImageTests(unittest.TestCase):
+    def test_existing_plugin_branch_checkout_resets_to_origin_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "tinyhat"
+            (checkout / ".git").mkdir(parents=True)
+            calls: list[list[str]] = []
+
+            def fake_run(args: list[str], *, cwd: Path | None = None) -> str:
+                calls.append(list(args))
+                self.assertEqual(cwd, checkout)
+                if args[:4] == ["git", "rev-parse", "--verify", "origin/main^{commit}"]:
+                    return "b" * 40
+                if args == ["git", "rev-parse", "HEAD"]:
+                    return "b" * 40
+                return ""
+
+            with (
+                patch.object(hot_image, "TINYHAT_PLUGIN_REPO_REF", "main"),
+                patch.object(hot_image, "_plugin_checkout_dir", return_value=checkout),
+                patch.object(hot_image, "_run", side_effect=fake_run),
+            ):
+                resolved_checkout, resolved_sha = hot_image._checkout_tinyhat_plugin()
+
+            self.assertEqual(resolved_checkout, checkout)
+            self.assertEqual(resolved_sha, "b" * 40)
+            self.assertIn(["git", "fetch", "--tags", "--prune", "origin"], calls)
+            self.assertIn(["git", "checkout", "main"], calls)
+            self.assertIn(["git", "reset", "--hard", "origin/main"], calls)
 
 
 class LauncherTests(unittest.TestCase):
@@ -488,7 +519,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
-    def test_apply_config_command_applies_env_block_and_requests_rebind(self) -> None:
+    def test_apply_config_command_records_env_block_without_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             applied: list[dict] = []
@@ -533,7 +564,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["phase"], "hot_reloaded")
             self.assertEqual([item["dry_run"] for item in applied], [True, False])
             self.assertTrue(result["result"]["env_block_changed"])
-            self.assertTrue(result["result"]["gateway_rebind_requested"])
+            self.assertFalse(result["result"]["gateway_rebind_requested"])
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
@@ -861,6 +892,113 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertNotIn("secret-token-value", encoded)
 
 
+class PlatformLoopTests(unittest.TestCase):
+    def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def fail_once() -> dict:
+            loop.stop_requested = True
+            raise RuntimeError("temporary token=secret-value failure")
+
+        with (
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=fail_once),
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        runtime_state_payloads = [
+            payload for path, payload in posts if path == "/hapi/v1/computers/me/runtime-state"
+        ]
+        self.assertEqual(len(runtime_state_payloads), 1)
+        self.assertEqual(runtime_state_payloads[0]["runtime_health"], "degraded_control_plane")
+        self.assertTrue(runtime_state_payloads[0]["binding_poll_failed"])
+        self.assertEqual(
+            runtime_state_payloads[0]["openclaw_control"],
+            "no_restart_requested",
+        )
+
+    def test_unassigned_state_report_failure_does_not_exit_loop(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = Mock()
+        client.post_json.side_effect = RuntimeError("platform unavailable")
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def unassigned_once() -> dict:
+            loop.stop_requested = True
+            return {"assigned": False}
+
+        with (
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=unassigned_once),
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        client.post_json.assert_called_once()
+
+    def test_binding_activation_does_not_restart_openclaw_gateway(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: posts.append((path, payload)) or {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+        binding = {
+            "telegram_owner_user_id": "123456",
+            "telegram_bot_user_id": "654321",
+            "telegram_bot_token": "token=secret-value",
+        }
+        now = time.monotonic()
+
+        with (
+            patch.dict(os.environ, {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"}),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "ready"},
+            ) as apply_config,
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                return_value={"state": "healthy"},
+            ) as gateway_health,
+        ):
+            loop._activate_binding(
+                binding,
+                cycle_started_wall=0.0,
+                cycle_started=now,
+                binding_received=now,
+                phase_spans=[],
+            )
+
+        apply_config.assert_called_once()
+        gateway_health.assert_called_once()
+        self.assertFalse(hasattr(platform_loop.openclaw_adapter, "gateway_restart_once"))
+        startup_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/runtime-state"
+            and payload.get("startup_timings")
+        ]
+        self.assertEqual(len(startup_payloads), 1)
+        sample = startup_payloads[0]["startup_timings"][0]
+        self.assertEqual(
+            sample["sample_metadata"]["gateway_restart"]["state"],
+            "not_requested",
+        )
+        self.assertEqual(
+            sample["sample_metadata"]["restart_policy"],
+            "no_assignment_restart",
+        )
+
+
 class DiagnosticsExportTests(unittest.TestCase):
     def test_export_diagnostics_uses_official_command_and_redacts_zip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -990,6 +1128,47 @@ class SystemdUnitTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ExecStart=/opt/tinyhat/current/bin/tinyhat-attest", unit)
 
+    def test_platform_unit_runs_tiny_runtime_loop_not_legacy_supervisor(self) -> None:
+        unit = (
+            _REPO_ROOT / "tiny_runtime" / "systemd" / "tinyhat-runtime-platform.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "ExecStart=/opt/tinyhat/current/bin/tinyhat-runtime platform loop",
+            unit,
+        )
+        self.assertIn("tinyhat-runtime-gateway.service", unit)
+        self.assertNotIn("supervisor.py", unit)
+        self.assertNotIn("tinyhat-openclaw.service", unit)
+
+    def test_tiny_runtime_tree_does_not_reference_legacy_units(self) -> None:
+        violations: list[str] = []
+        for path in (_REPO_ROOT / "tiny_runtime").rglob("*"):
+            if not path.is_file() or path.suffix in {".pyc", ".sqlite"}:
+                continue
+            rel = os.path.relpath(path, _REPO_ROOT)
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if "tinyhat-openclaw.service" in text or "/supervisor.py" in text:
+                violations.append(rel)
+        self.assertEqual(violations, [])
+
+    def test_tiny_runtime_python_does_not_request_gateway_restart(self) -> None:
+        violations: list[str] = []
+        for path in _tiny_runtime_python_files():
+            rel = os.path.relpath(path, _REPO_ROOT)
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if '"gateway", "restart"' in text or "'gateway', 'restart'" in text:
+                violations.append(rel)
+        self.assertEqual(violations, [])
+
+    def test_tiny_runtime_package_has_no_supervisor_modules(self) -> None:
+        modules = [
+            os.path.relpath(path, _REPO_ROOT)
+            for path in (_REPO_ROOT / "tiny_runtime" / "tinyhat_runtime").glob(
+                "*supervisor*.py"
+            )
+        ]
+        self.assertEqual(modules, [])
+
 
 _ADAPTER_RELPATH = os.path.join("tiny_runtime", "tinyhat_runtime", "openclaw_adapter.py")
 _SUBPROCESS_CALL_NAMES = frozenset({"run", "Popen", "check_output", "check_call", "call"})
@@ -1117,10 +1296,11 @@ class BakeScriptTests(unittest.TestCase):
             self.assertTrue(helper.exists())
             self.assertTrue(os.access(helper, os.X_OK))
             helper_text = helper.read_text(encoding="utf-8")
-            self.assertIn("ensure_codex_subscription_plugin_installed", helper_text)
-            self.assertIn("ensure_tinyhat_plugin_installed", helper_text)
-            self.assertIn("_is_codex_subscription_plugin_available", helper_text)
-            self.assertNotIn("openclaw plugins inspect codex --json", helper_text)
+            self.assertIn("tinyhat_runtime.main bake preinstall-plugins", helper_text)
+            self.assertNotIn("import supervisor", helper_text)
+            self.assertNotIn("ensure_codex_subscription_plugin_installed", helper_text)
+            self.assertNotIn("ensure_tinyhat_plugin_installed", helper_text)
+            self.assertNotIn("_is_codex_subscription_plugin_available", helper_text)
             self.assertNotIn("json.load(sys.stdin)", helper_text)
 
     def test_assemble_bundle_uses_explicit_authority_refs(self) -> None:

@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import attestation, bundle, identity, launcher, openclaw_adapter, paths
+from . import (
+    attestation,
+    bundle,
+    identity,
+    hot_image,
+    launcher,
+    openclaw_adapter,
+    paths,
+    platform_loop,
+)
 from .command_ledger import CommandLedger
 from .runtime_commands import RuntimeCommandRunner, load_command_file
 
@@ -114,6 +123,16 @@ def _cmd_command_run(args: argparse.Namespace) -> int:
     return 0 if payload.get("status") in {"applied", "rolled_back", "canceled"} else 1
 
 
+def _cmd_platform_loop(_args: argparse.Namespace) -> int:
+    return platform_loop.main()
+
+
+def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
+    payload = hot_image.preinstall_hot_image_plugins()
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tinyhat-runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -178,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--start-command")
     run.add_argument("--no-service-restart", action="store_true")
     run.set_defaults(func=_cmd_command_run)
+
+    platform = subparsers.add_parser("platform")
+    platform_sub = platform.add_subparsers(dest="platform_command", required=True)
+    loop = platform_sub.add_parser("loop")
+    loop.set_defaults(func=_cmd_platform_loop)
+
+    bake = subparsers.add_parser("bake")
+    bake_sub = bake.add_subparsers(dest="bake_command", required=True)
+    preinstall_plugins = bake_sub.add_parser("preinstall-plugins")
+    preinstall_plugins.set_defaults(func=_cmd_bake_preinstall_plugins)
     return parser
 
 

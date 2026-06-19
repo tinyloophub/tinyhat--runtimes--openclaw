@@ -15,7 +15,7 @@ export OPENCLAW_STATE_DIR="${state_dir}"
 export TINYHAT_RUNTIME_HOME="${TINYHAT_RUNTIME_HOME:-${state_dir}}"
 export TINYHAT_OPENCLAW_RUNTIME_USER="${runtime_user}"
 export TINYHAT_OPENCLAW_RUNTIME_GROUP="${runtime_group}"
-export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${repo_root}/tiny_runtime${PYTHONPATH:+:${PYTHONPATH}}"
 
 install -d -m 0750 "$(dirname -- "${config_path}")"
 install -d -m 0700 "${state_dir}" "${state_dir}/workspace"
@@ -25,15 +25,7 @@ if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
     "${state_dir}"
 fi
 
-python3 - <<'PY'
-import sys
-import supervisor
-
-supervisor.ensure_codex_subscription_plugin_installed()
-supervisor.ensure_tinyhat_plugin_installed()
-if not supervisor._is_codex_subscription_plugin_available():
-    sys.exit("codex subscription plugin not available after preinstall")
-PY
+python3 -m tinyhat_runtime.main bake preinstall-plugins >/tmp/tinyhat-hot-image-plugins.json
 
 if [[ "$(id -u)" -eq 0 ]] && id -u "${runtime_user}" >/dev/null 2>&1; then
   chown -R "${runtime_user}:${runtime_group}" \
