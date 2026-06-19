@@ -795,10 +795,17 @@ def get_json(path: str, *, timeout: float = PLATFORM_REQUEST_TIMEOUT_SECONDS) ->
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def _binding_poll_path(*, wait_seconds: float = 0.0) -> str:
-    if wait_seconds <= 0:
+def _binding_poll_path(
+    *, wait_seconds: float = 0.0, include_command: bool = False
+) -> str:
+    query: list[str] = []
+    if wait_seconds > 0:
+        query.append(f"wait_seconds={wait_seconds:g}")
+    if include_command:
+        query.append("include_command=true")
+    if not query:
         return "/hapi/v1/computers/me/binding"
-    return f"/hapi/v1/computers/me/binding?wait_seconds={wait_seconds:g}"
+    return "/hapi/v1/computers/me/binding?" + "&".join(query)
 
 
 def _elapsed_ms(start_monotonic: float, end_monotonic: float | None = None) -> int:
@@ -2812,6 +2819,7 @@ def _signal_rebind_for_secrets() -> None:
         "runtime config changed; signaling local gateway rebind so OpenClaw "
         "refreshes gateway-start config"
     )
+    _stop_holder["rebind_reason"] = "runtime_config_changed"
     _stop_holder["rebind"] = True
     _stop_holder["stop"] = True
 
@@ -4494,9 +4502,11 @@ def stop_openclaw_gateway() -> None:
 # ``model_auth_signature`` — model/auth route last written during Phase D.
 #                 Typed apply_config uses this to own platform-credits <->
 #                 ChatGPT subscription rebinds without racing the watchdog.
+# ``rebind_reason`` — optional short reason for the outer rebind loop log.
 _stop_holder = {
     "stop": False,
     "rebind": False,
+    "rebind_reason": None,
     "component_update_restart": False,
     "signature": None,
     "owner_signature": None,
@@ -6603,12 +6613,20 @@ def main() -> int:
             _stop_gateway_on_clean_shutdown()
             return 0
         # Rebind path: clear the per-cycle flags and loop.
+        rebind_reason = _stop_holder.get("rebind_reason") or "unspecified"
         _stop_holder["stop"] = False
         _stop_holder["rebind"] = False
-        log.info(
-            "rebind: platform unassigned this Computer; awaiting a fresh "
-            "/me/binding"
-        )
+        _stop_holder["rebind_reason"] = None
+        if rebind_reason == "platform_unassigned":
+            log.info(
+                "rebind: platform unassigned this Computer; awaiting a fresh "
+                "/me/binding"
+            )
+        else:
+            log.info(
+                "rebind: %s; awaiting a fresh /me/binding",
+                rebind_reason,
+            )
     _stop_gateway_on_clean_shutdown()
     return 0
 
@@ -6927,6 +6945,63 @@ def _run_one_binding_cycle() -> int:
     # outer ``main()`` loops back to a fresh Phase B.
 
     def _heartbeat_loop():
+        def _handle_binding_watchdog_response(resp: dict) -> bool:
+            if resp.get("assigned") is False:
+                log.info(
+                    "binding watchdog: platform reports assigned=false; "
+                    "triggering rebind"
+                )
+                # Issue #23: platform-driven unassign hands the
+                # Computer back to the pool. Wipe the previous
+                # owner's per-agent OAuth credential before the
+                # supervisor releases control, so the next owner
+                # can't inherit a linked-subscription state from
+                # the prior binding.
+                _wipe_on_owner_release(reason="unassign")
+                _stop_holder["rebind_reason"] = "platform_unassigned"
+                _stop_holder["rebind"] = True
+                _stop_holder["stop"] = True
+                notify_watchdog_checkpoint("phase-d-rebind-unassigned")
+                return True
+
+            new_binding = resp.get("binding") or {}
+            new_sig = _binding_signature(new_binding)
+            cached_sig = _stop_holder.get("signature")
+            if cached_sig and new_sig != cached_sig:
+                log.info(
+                    "binding watchdog: identity changed (bot=@%s owner=%s); "
+                    "triggering rebind",
+                    new_binding.get("telegram_bot_username"),
+                    new_binding.get("telegram_owner_user_id"),
+                )
+                # Issue #23: only wipe when the OWNER changed,
+                # not when the same owner flipped llm_auth_mode
+                # or rotated their OpenRouter key. A mode flip
+                # for the same owner triggers a rebind (so the
+                # supervisor rewrites openclaw.json) but the
+                # OAuth credential they just linked should
+                # survive into the next config.
+                new_owner_sig = _owner_identity_signature(new_binding)
+                cached_owner_sig = _stop_holder.get("owner_signature")
+                if cached_owner_sig and new_owner_sig != cached_owner_sig:
+                    _wipe_on_owner_release(reason="reassign")
+                _stop_holder["rebind_reason"] = "binding_identity_changed"
+                _stop_holder["rebind"] = True
+                _stop_holder["stop"] = True
+                notify_watchdog_checkpoint("phase-d-rebind-identity-changed")
+                return True
+
+            binding_command = resp.get("command") if isinstance(resp, dict) else None
+            if isinstance(binding_command, dict):
+                log.info(
+                    "binding watchdog: handling piggybacked command type=%r",
+                    binding_command.get("type"),
+                )
+                handle_heartbeat_command(binding_command, binding=binding)
+                if _stop_holder["stop"]:
+                    return True
+            return False
+
         while not _stop_holder["stop"]:
             gateway_alive = is_openclaw_gateway_active()
             local_manifest = local_watchdog_manifest_snapshot()
@@ -6939,6 +7014,8 @@ def _run_one_binding_cycle() -> int:
                     oom_delta_status,
                 )
                 _stop_holder["rebind"] = oom_delta_status == "hold_down"
+                if _stop_holder["rebind"]:
+                    _stop_holder["rebind_reason"] = "gateway_oom_hold_down"
                 _stop_holder["stop"] = True
                 notify_watchdog_checkpoint(
                     "phase-d-gateway-recovery-" + oom_delta_status
@@ -7004,48 +7081,11 @@ def _run_one_binding_cycle() -> int:
             # so it works in every state the heartbeat could find us
             # in.
             try:
-                resp = get_json(_binding_poll_path(wait_seconds=0))
+                resp = get_json(
+                    _binding_poll_path(wait_seconds=0, include_command=True)
+                )
                 binding_status = "ok"
-                if resp.get("assigned") is False:
-                    log.info(
-                        "binding watchdog: platform reports assigned=false; "
-                        "triggering rebind"
-                    )
-                    # Issue #23: platform-driven unassign hands the
-                    # Computer back to the pool. Wipe the previous
-                    # owner's per-agent OAuth credential before the
-                    # supervisor releases control, so the next owner
-                    # can't inherit a linked-subscription state from
-                    # the prior binding.
-                    _wipe_on_owner_release(reason="unassign")
-                    _stop_holder["rebind"] = True
-                    _stop_holder["stop"] = True
-                    notify_watchdog_checkpoint("phase-d-rebind-unassigned")
-                    return
-                new_binding = resp.get("binding") or {}
-                new_sig = _binding_signature(new_binding)
-                cached_sig = _stop_holder.get("signature")
-                if cached_sig and new_sig != cached_sig:
-                    log.info(
-                        "binding watchdog: identity changed (bot=@%s owner=%s); "
-                        "triggering rebind",
-                        new_binding.get("telegram_bot_username"),
-                        new_binding.get("telegram_owner_user_id"),
-                    )
-                    # Issue #23: only wipe when the OWNER changed,
-                    # not when the same owner flipped llm_auth_mode
-                    # or rotated their OpenRouter key. A mode flip
-                    # for the same owner triggers a rebind (so the
-                    # supervisor rewrites openclaw.json) but the
-                    # OAuth credential they just linked should
-                    # survive into the next config.
-                    new_owner_sig = _owner_identity_signature(new_binding)
-                    cached_owner_sig = _stop_holder.get("owner_signature")
-                    if cached_owner_sig and new_owner_sig != cached_owner_sig:
-                        _wipe_on_owner_release(reason="reassign")
-                    _stop_holder["rebind"] = True
-                    _stop_holder["stop"] = True
-                    notify_watchdog_checkpoint("phase-d-rebind-identity-changed")
+                if _handle_binding_watchdog_response(resp):
                     return
             except Exception as exc:
                 # Transient — don't trip rebind on a single GET
@@ -7093,10 +7133,27 @@ def _run_one_binding_cycle() -> int:
                 active_reconfirm_status,
             )
             notify_watchdog_checkpoint("phase-d-heartbeat")
-            for _ in range(HEARTBEAT_INTERVAL_SECONDS):
+            heartbeat_deadline = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
+            while not _stop_holder["stop"]:
+                remaining = heartbeat_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait_seconds = min(float(BINDING_LONG_POLL_WAIT_SECONDS), remaining)
+                try:
+                    resp = get_json(
+                        _binding_poll_path(
+                            wait_seconds=wait_seconds,
+                            include_command=True,
+                        ),
+                        timeout=BINDING_LONG_POLL_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    if _handle_binding_watchdog_response(resp):
+                        return
+                except Exception as exc:
+                    log.warning("/me/binding command long-poll failed: %s", exc)
                 if _stop_holder["stop"]:
                     return
-                time.sleep(1)
+                time.sleep(min(1.0, max(0.0, heartbeat_deadline - time.monotonic())))
 
     heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     heartbeat_thread.start()
@@ -7139,6 +7196,7 @@ def _run_one_binding_cycle() -> int:
         except Exception:
             pass
         if mode == "hold_down":
+            _stop_holder["rebind_reason"] = "gateway_recovery_hold_down"
             _stop_holder["rebind"] = True
             return 0
         return 1

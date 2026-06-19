@@ -4002,6 +4002,7 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         # Reset the module-level rebind flags so the test is order-independent.
         supervisor._stop_holder["rebind"] = False
         supervisor._stop_holder["stop"] = False
+        supervisor._stop_holder["rebind_reason"] = None
         supervisor._config_apply_state["failed_revision"] = None
         supervisor._config_apply_state["failed_diagnostic"] = None
         supervisor._config_apply_state["failed_reported"] = False
@@ -4031,6 +4032,10 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
 
         self.assertTrue(supervisor._stop_holder["rebind"])
         self.assertTrue(supervisor._stop_holder["stop"])
+        self.assertEqual(
+            supervisor._stop_holder["rebind_reason"],
+            "runtime_config_changed",
+        )
         posted.assert_called_once()
         self.assertEqual(posted.call_args.kwargs["revision"], 5)
         self.assertEqual(posted.call_args.kwargs["status"], "applied")
@@ -4038,6 +4043,7 @@ class RuntimeSecretEnvBlockTests(unittest.TestCase):
         # Cleanup so unrelated tests are not affected.
         supervisor._stop_holder["rebind"] = False
         supervisor._stop_holder["stop"] = False
+        supervisor._stop_holder["rebind_reason"] = None
 
     def test_handle_apply_config_skips_rebind_when_env_unchanged(self) -> None:
         supervisor._stop_holder["rebind"] = False
@@ -5014,6 +5020,14 @@ class BindingCycleSubscriptionProviderWiringTests(unittest.TestCase):
         self.assertEqual(
             supervisor._binding_poll_path(wait_seconds=8),
             "/hapi/v1/computers/me/binding?wait_seconds=8",
+        )
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=8, include_command=True),
+            "/hapi/v1/computers/me/binding?wait_seconds=8&include_command=true",
+        )
+        self.assertEqual(
+            supervisor._binding_poll_path(wait_seconds=0, include_command=True),
+            "/hapi/v1/computers/me/binding?include_command=true",
         )
 
 
