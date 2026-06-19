@@ -86,6 +86,10 @@ assignment and credential updates never request a gateway restart. Values that
 cannot be refreshed through OpenClaw's official hot surfaces must move to
 SecretRefs or a separate typed maintenance operation; `restart_requested`,
 `gateway_rebind_requested`, and `systemd_restart_requested` stay `false`.
+Same-owner rebinds merge new secrets into the existing Tinyhat secrets file so
+Mini App credential updates do not wipe user keys. If the platform ever sends a
+different owner on an in-place rebind, the runtime replaces the file before
+patching OpenClaw so stale owner secrets are not carried across.
 
 `link_chatgpt` starts the official OpenClaw device-code flow for the local
 Computer. OAuth tokens stay on the Computer; the platform receives only the

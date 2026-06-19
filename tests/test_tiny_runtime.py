@@ -1083,6 +1083,7 @@ class PlatformLoopTests(unittest.TestCase):
             )
 
         apply_config.assert_called_once()
+        self.assertIs(apply_config.call_args.kwargs["preserve_existing_secrets"], True)
         gateway_health.assert_called_once()
         self.assertFalse(hasattr(platform_loop.openclaw_adapter, "gateway_restart_once"))
         startup_payloads = [
@@ -1163,6 +1164,57 @@ class PlatformLoopTests(unittest.TestCase):
             runtime_state_payloads[1]["gateway"]["liveness_owner"],
             "systemd",
         )
+
+    def test_active_rebind_replaces_secrets_when_owner_changes(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = Mock()
+        client.post_json.return_value = {}
+        original_binding = {
+            "telegram_owner_user_id": "owner-1",
+            "telegram_bot_user_id": "bot-1",
+            "telegram_bot_token": "token=secret-value",
+        }
+        next_binding = {
+            **original_binding,
+            "telegram_owner_user_id": "owner-2",
+        }
+
+        responses = [{"assigned": True, "binding": next_binding}]
+
+        def get_json(path: str, **_kwargs):
+            return responses.pop(0)
+
+        client.get_json.side_effect = get_json
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TINYHAT_PLATFORM_BASE_URL": "https://platform.example"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_status",
+                return_value={"state": "healthy"},
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "apply_binding_config",
+                return_value={"state": "ready"},
+            ) as apply_config,
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_health",
+                return_value={"state": "healthy"},
+            ),
+            patch.object(platform_loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                loop._active_loop(original_binding)
+
+        apply_config.assert_called_once()
+        self.assertIs(apply_config.call_args.kwargs["preserve_existing_secrets"], False)
 
     def test_gateway_ready_wait_covers_openclaw_self_restart(self) -> None:
         from tinyhat_runtime import platform_loop
@@ -1715,6 +1767,43 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             self.assertEqual(
                 secrets_payload["providers"]["openrouter"]["apiKey"],
                 "sk-or-v1-child",
+            )
+
+    def test_apply_binding_config_can_replace_secrets_for_cross_owner_rebind(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets_path = Path(tmp) / "tinyhat-secrets.json"
+            secrets_path.write_text(
+                json.dumps({"EXA_API_KEY": "stale-owner-secret"}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            def runner(argv, **_kwargs):
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with patch.object(
+                openclaw_adapter.paths,
+                "OPENCLAW_SECRETS_PATH",
+                secrets_path,
+            ):
+                result = openclaw_adapter.apply_binding_config(
+                    {
+                        "telegram_owner_user_id": "67890",
+                        "telegram_bot_token": "456:token",
+                    },
+                    preserve_existing_secrets=False,
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            secrets_payload = json.loads(secrets_path.read_text(encoding="utf-8"))
+            self.assertNotIn("EXA_API_KEY", secrets_payload)
+            self.assertEqual(
+                secrets_payload["channels"]["telegram"]["botToken"],
+                "456:token",
             )
 
     def test_write_openclaw_secrets_preserves_binding_refs_on_user_secret_update(

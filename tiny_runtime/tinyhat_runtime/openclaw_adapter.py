@@ -415,6 +415,7 @@ def apply_binding_config(
     *,
     platform_base_url: str | None = None,
     backend_audience: str | None = None,
+    preserve_existing_secrets: bool = True,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
     patch = binding_config_patch(
@@ -422,7 +423,10 @@ def apply_binding_config(
         platform_base_url=platform_base_url,
         backend_audience=backend_audience,
     )
-    secrets_result = write_openclaw_secrets(binding_secrets_payload(binding))
+    secrets_result = write_openclaw_secrets(
+        binding_secrets_payload(binding),
+        merge=preserve_existing_secrets,
+    )
     patch_result = config_patch(
         patch,
         replace_paths=("channels.telegram",),

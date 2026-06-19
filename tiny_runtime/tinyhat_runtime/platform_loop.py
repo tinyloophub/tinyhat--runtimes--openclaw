@@ -169,12 +169,14 @@ class TinyRuntimePlatformLoop:
         cycle_started: float,
         binding_received: float,
         phase_spans: list[dict[str, Any]],
+        preserve_existing_secrets: bool = True,
     ) -> None:
         config_started = time.monotonic()
         config_result = openclaw_adapter.apply_binding_config(
             binding,
             platform_base_url=platform_base_url_from_env(),
             backend_audience=backend_audience_from_env(),
+            preserve_existing_secrets=preserve_existing_secrets,
         )
         if config_result.get("state") != "ready":
             raise RuntimeError(f"OpenClaw config patch failed: {config_result}")
@@ -256,14 +258,19 @@ class TinyRuntimePlatformLoop:
             next_binding = response.get("binding")
             if isinstance(next_binding, dict) and self._binding_signature(next_binding) != current_signature:
                 LOG.info("binding changed; applying new identity bind")
+                preserve_existing_secrets = (
+                    self._binding_owner_id(next_binding) == self._binding_owner_id(binding)
+                )
                 self._activate_binding(
                     next_binding,
                     cycle_started_wall=time.time(),
                     cycle_started=time.monotonic(),
                     binding_received=time.monotonic(),
                     phase_spans=[],
+                    preserve_existing_secrets=preserve_existing_secrets,
                 )
                 current_signature = self._binding_signature(next_binding)
+                binding = next_binding
             elapsed = time.monotonic() - started
             time.sleep(max(1.0, HEARTBEAT_SECONDS - elapsed))
 
@@ -460,6 +467,10 @@ class TinyRuntimePlatformLoop:
             str(binding.get("llm_auth_mode") or ""),
             str(binding.get("llm_model_ref") or ""),
         )
+
+    @staticmethod
+    def _binding_owner_id(binding: dict[str, Any]) -> str:
+        return str(binding.get("telegram_owner_user_id") or "")
 
 
 def main() -> int:
