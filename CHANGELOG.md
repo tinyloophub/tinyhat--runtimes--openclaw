@@ -7,8 +7,22 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.15.4
+
+Patch release for the Tinyloop v0.16 warm-pool image train. This is the first
+final runtime release that carries the content-addressed `tiny_runtime` bundle
+tooling needed by `tiny_runtime_bundle` Computer images.
+
+### Added
+
+- Add the `tiny_runtime` bundle, installer, attestation, gateway launcher, and
+  content manifest tooling used by baked Computer images.
+- Add the command ledger runner used by hot component and credential commands.
+
 ### Fixed
 
+- Normalize activated bundle ownership after install so root-baked bundles keep
+  stable file ownership when moved into `/opt/tinyhat/current`.
 - Let typed `apply_config` runtime commands use the existing runtime-secret
   env-block path for non-OpenAI credentials, post the applied command result,
   then request the legacy gateway rebind so child shells receive the new
