@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import shutil
@@ -1795,6 +1796,69 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         env = openclaw_adapter.openclaw_env()
         self.assertTrue(env["PATH"].split(os.pathsep)[0].endswith("/vendor/openclaw/bin"))
         self.assertTrue(env["OPENCLAW_BUNDLE_DIR"].endswith("/vendor/openclaw"))
+
+    def test_openclaw_paths_follow_dev_runtime_home(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_DEV_RUNTIME": "1",
+                        "TINYHAT_RUNTIME_HOME": tmp,
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                env = openclaw_adapter.openclaw_env()
+                self.assertEqual(env["HOME"], tmp)
+                self.assertEqual(env["OPENCLAW_STATE_DIR"], tmp)
+                self.assertEqual(
+                    env["OPENCLAW_CONFIG_PATH"],
+                    str(Path(tmp) / "openclaw" / "openclaw.json"),
+                )
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
+    def test_openclaw_path_overrides_keep_tinyhat_env_precedence(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            config = Path(tmp) / "config" / "openclaw.json"
+            secrets = Path(tmp) / "secrets.json"
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "OPENCLAW_STATE_DIR": "/ignored/openclaw-state",
+                        "OPENCLAW_CONFIG_PATH": "/ignored/openclaw.json",
+                        "OPENCLAW_SECRETS_PATH": "/ignored/secrets.json",
+                        "TINYHAT_OPENCLAW_STATE_DIR": str(state),
+                        "TINYHAT_OPENCLAW_CONFIG_PATH": str(config),
+                        "TINYHAT_SECRETS_PATH": str(secrets),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                env = openclaw_adapter.openclaw_env()
+                self.assertEqual(env["OPENCLAW_STATE_DIR"], str(state))
+                self.assertEqual(env["HOME"], str(state))
+                self.assertEqual(env["OPENCLAW_CONFIG_PATH"], str(config))
+                self.assertEqual(runtime_paths.OPENCLAW_SECRETS_PATH, secrets)
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
 
     def test_adapter_reports_missing_openclaw_without_raising(self) -> None:
         from tinyhat_runtime import openclaw_adapter
