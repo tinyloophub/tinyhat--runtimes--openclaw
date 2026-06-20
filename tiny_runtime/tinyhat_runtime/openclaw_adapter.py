@@ -188,6 +188,71 @@ def secrets_reload(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     return {"state": "ready", "secrets": redact_json(result.json_payload())}
 
 
+def backup_create(
+    *,
+    output_path: Path,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    """Create and verify an OpenClaw backup archive on this Computer."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = run_openclaw(
+        (
+            "backup",
+            "create",
+            "--output",
+            str(output_path),
+            "--verify",
+            "--json",
+        ),
+        timeout=300,
+        runner=runner,
+    )
+    payload: dict[str, Any] = {}
+    if result.stdout.strip():
+        try:
+            payload = redact_json(result.json_payload())
+        except (json.JSONDecodeError, ValueError):
+            payload = {"stdout": redact_text(result.stdout)}
+    archive_exists = output_path.exists()
+    return {
+        "state": "ready"
+        if result.ok and archive_exists and payload.get("verified") is True
+        else "failed",
+        "archive_path": str(output_path) if archive_exists else None,
+        "archive_bytes": output_path.stat().st_size if archive_exists else None,
+        "backup": payload,
+        "detail": result.public_summary(),
+    }
+
+
+def doctor_repair(*, runner: Runner = subprocess.run) -> dict[str, Any]:
+    """Run OpenClaw's non-interactive safe repair path."""
+    result = run_openclaw(
+        ("doctor", "--fix", "--non-interactive", "--yes"),
+        timeout=300,
+        runner=runner,
+    )
+    return {
+        "state": "ready" if result.ok else "failed",
+        "detail": result.public_summary(),
+    }
+
+
+def status_json(*, runner: Runner = subprocess.run) -> dict[str, Any]:
+    result = run_openclaw(("status", "--json"), timeout=30, runner=runner)
+    if not result.ok:
+        return {"state": "unavailable", "detail": result.public_summary()}
+    try:
+        status_payload = redact_json(result.json_payload())
+    except (json.JSONDecodeError, ValueError):
+        status_payload = {"stdout": redact_text(result.stdout)}
+    return {
+        "state": "ready",
+        "status": status_payload,
+        "detail": result.public_summary(),
+    }
+
+
 def _tinyhat_file_secret_ref(pointer: str) -> dict[str, str]:
     return {"source": "file", "provider": "tinyhat", "id": pointer}
 

@@ -40,6 +40,41 @@ PY
   exit 0
 fi
 
+if [[ "$*" == backup\ create* ]]; then
+  output=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --output)
+        output="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "${output}" ]]; then
+    printf 'missing --output\n' >&2
+    exit 64
+  fi
+  mkdir -p -- "$(dirname -- "${output}")"
+  printf '%s\n' "fake backup" >"${output}"
+  python3 - "${output}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+print(json.dumps({
+    "archivePath": str(path),
+    "archiveRoot": "fake-openclaw-backup",
+    "verified": True,
+    "assets": [{"kind": "state", "archivePath": "payload/state"}],
+}))
+PY
+  exit 0
+fi
+
 case "$*" in
   "plugins inspect tinyhat --json")
     printf '%s\n' '{"plugin":{"id":"tinyhat","enabled":true,"status":"loaded"}}'
@@ -55,6 +90,12 @@ case "$*" in
     ;;
   "secrets reload --json")
     printf '%s\n' '{"reloaded":true}'
+    ;;
+  "doctor --fix --non-interactive --yes")
+    printf '%s\n' "fake doctor repair ok"
+    ;;
+  "status --json")
+    printf '%s\n' '{"state":"ready","gateway":{"status":"healthy"}}'
     ;;
   "--version")
     printf '%s\n' "openclaw 2026.6.8"

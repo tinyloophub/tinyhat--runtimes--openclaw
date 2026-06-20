@@ -25,7 +25,7 @@ runtime. The stable contract is:
   on-box listing/querying;
 - execute only the closed runtime command set:
   `activate_bundle`, `rollback_bundle`, `export_diagnostics`,
-  `apply_config`, and `link_chatgpt`.
+  `apply_config`, `link_chatgpt`, and `rebuild_app_layer`.
 
 Bundle verification proves the local files match the declared manifest and
 bundle id. It is not a signature system; production promotion should still pin
@@ -95,6 +95,15 @@ patching OpenClaw so stale owner secrets are not carried across.
 Computer. OAuth tokens stay on the Computer; the platform receives only the
 public device-code state and later runtime verification that the active auth
 path is `chatgpt_subscription`.
+
+`rebuild_app_layer` is an explicit admin maintenance operation for a
+`tiny_runtime` Computer. It creates and verifies a local OpenClaw backup under
+the runtime state directory, reactivates the current content-addressed bundle
+once, runs the official non-interactive OpenClaw doctor repair/status checks,
+and re-attests the active bundle. The backup archive stays on the Computer and
+is not uploaded to the platform. This command may stop/start the Gateway once;
+it is not used by assignment or secret updates and it does not implement an
+automatic restart loop.
 
 ## Local proof
 

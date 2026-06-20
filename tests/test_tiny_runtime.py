@@ -811,6 +811,143 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                 self.assertEqual(result["failure_code"], "invalid_command")
                 self.assertIn(expected_detail, result["result"]["detail"])
 
+    def test_rebuild_app_layer_snapshots_reactivates_and_attests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, manifest = _install_bundle_under_id(
+                bundles,
+                base / "current-bundle",
+                marker="rebuild-target",
+            )
+            current = base / "current"
+            os.symlink(target, current)
+            backup_paths: list[Path] = []
+            doctor_calls: list[bool] = []
+
+            def fake_backup_create(*, output_path: Path) -> dict:
+                backup_paths.append(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"local backup bytes")
+                return {
+                    "state": "ready",
+                    "archive_path": str(output_path),
+                    "archive_bytes": output_path.stat().st_size,
+                    "backup": {"verified": True},
+                }
+
+            def fake_doctor_repair() -> dict:
+                doctor_calls.append(True)
+                return {"state": "ready", "detail": {"command": ["openclaw", "doctor"]}}
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                rebuild_backup_dir=base / "rebuild-backups",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            with (
+                patch.object(openclaw_adapter, "backup_create", fake_backup_create),
+                patch.object(openclaw_adapter, "doctor_repair", fake_doctor_repair),
+                patch.object(
+                    openclaw_adapter,
+                    "status_json",
+                    lambda: {"state": "ready", "status": {"ok": True}},
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "adapter_attestation",
+                    lambda: {"state": "ready"},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-rebuild",
+                        "idempotency_key": "idem-rebuild",
+                        "kind": "rebuild_app_layer",
+                        "spec": {"reason": "manual_canary_repair"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "attested")
+            self.assertEqual(result["result"]["bundle_id"], manifest["bundle_id"])
+            self.assertEqual(result["result"]["backup"]["state"], "ready")
+            self.assertEqual(len(backup_paths), 1)
+            self.assertEqual(backup_paths[0].parent, base / "rebuild-backups")
+            self.assertEqual(doctor_calls, [True])
+            self.assertEqual(os.readlink(current), str(target.resolve()))
+            self.assertTrue(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["systemd_restart_requested"])
+            self.assertFalse(result["result"]["automatic_restart_loop"])
+            mirror = json.loads(
+                (base / "commands" / "cmd-rebuild" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["status"], "applied")
+            self.assertEqual(mirror["phase"], "attested")
+
+    def test_rebuild_app_layer_stops_before_restart_when_snapshot_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, _manifest = _install_bundle_under_id(
+                bundles,
+                base / "current-bundle",
+                marker="rebuild-target",
+            )
+            current = base / "current"
+            os.symlink(target, current)
+            doctor_calls: list[bool] = []
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                rebuild_backup_dir=base / "rebuild-backups",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            with (
+                patch.object(
+                    openclaw_adapter,
+                    "backup_create",
+                    lambda *, output_path: {
+                        "state": "failed",
+                        "archive_path": str(output_path),
+                        "detail": {"stderr": "backup failed"},
+                    },
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "doctor_repair",
+                    lambda: doctor_calls.append(True) or {"state": "ready"},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-rebuild-fail",
+                        "idempotency_key": "idem-rebuild-fail",
+                        "kind": "rebuild_app_layer",
+                        "spec": {"reason": "manual_canary_repair"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "snapshot")
+            self.assertEqual(result["failure_code"], "backup_failed")
+            self.assertEqual(doctor_calls, [])
+            self.assertEqual(Path(os.readlink(current)).resolve(), target.resolve())
+
     def test_duplicate_link_chatgpt_command_does_not_respawn_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1541,6 +1678,56 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         payload = openclaw_adapter.gateway_health(runner=runner)
         self.assertEqual(payload["state"], "healthy")
         self.assertEqual(runner.call_args.args[0][:3], ["openclaw", "gateway", "health"])
+
+    def test_rebuild_adapter_commands_use_official_openclaw_surfaces(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        calls: list[list[str]] = []
+
+        def fake_runner(args, **_kwargs):
+            argv = list(args)
+            calls.append(argv)
+            if argv[1:3] == ["backup", "create"]:
+                output = Path(argv[argv.index("--output") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"backup")
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps({"verified": True}),
+                    stderr="",
+                )
+            if argv[1] == "doctor":
+                return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+            if argv[1:3] == ["status", "--json"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout='{"state":"ready"}',
+                    stderr="",
+                )
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = openclaw_adapter.backup_create(
+                output_path=Path(tmp) / "backup.tar.gz",
+                runner=fake_runner,
+            )
+            doctor = openclaw_adapter.doctor_repair(runner=fake_runner)
+            status = openclaw_adapter.status_json(runner=fake_runner)
+
+        self.assertEqual(backup["state"], "ready")
+        self.assertEqual(doctor["state"], "ready")
+        self.assertEqual(status["state"], "ready")
+        self.assertIn(
+            ["openclaw", "backup", "create", "--output", calls[0][4], "--verify", "--json"],
+            calls,
+        )
+        self.assertIn(
+            ["openclaw", "doctor", "--fix", "--non-interactive", "--yes"],
+            calls,
+        )
+        self.assertIn(["openclaw", "status", "--json"], calls)
 
     def test_adapter_prefers_bundle_local_openclaw_path(self) -> None:
         from tinyhat_runtime import openclaw_adapter
