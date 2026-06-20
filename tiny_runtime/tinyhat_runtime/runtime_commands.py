@@ -24,13 +24,16 @@ ALLOWED_COMMAND_KINDS = frozenset(
         "export_diagnostics",
         "apply_config",
         "link_chatgpt",
+        "rebuild_app_layer",
     }
 )
 FAILURE_CODES = frozenset(
     {
         "activation_failed",
+        "app_layer_rebuild_failed",
         "attestation_failed",
         "attestation_mismatch",
+        "backup_failed",
         "bundle_not_found",
         "bundle_verification_failed",
         "canceled",
@@ -96,11 +99,13 @@ class RuntimeCommandRunner:
         platform_get_json: Callable[[str], dict[str, Any]] | None = None,
         apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
         start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rebuild_backup_dir: Path = paths.REBUILD_BACKUP_DIR,
     ) -> None:
         self.ledger = ledger or CommandLedger()
         self.bundles_dir = bundles_dir
         self.current_link = current_link
         self.diagnostics_dir = diagnostics_dir
+        self.rebuild_backup_dir = rebuild_backup_dir
         self.platform_get_json = platform_get_json
         self.apply_runtime_config = apply_runtime_config
         self.start_chatgpt_link = start_chatgpt_link
@@ -210,6 +215,8 @@ class RuntimeCommandRunner:
                 return self._apply_config(command)
             if kind == "link_chatgpt":
                 return self._link_chatgpt(command)
+            if kind == "rebuild_app_layer":
+                return self._rebuild_app_layer(command)
         except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
             return self._finish(
                 command_id=command_id,
@@ -562,6 +569,138 @@ class RuntimeCommandRunner:
                 "systemd_restart_requested": False,
                 "start": start,
             },
+        )
+
+    def _rebuild_app_layer(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        requested_bundle_id = str(spec.get("bundle_id") or "").strip()
+        bundle_dir = (
+            self._bundle_dir_for_id(requested_bundle_id)
+            if requested_bundle_id
+            else self.current_link
+        )
+        if not bundle_dir.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_not_found",
+                result={"bundle_id": requested_bundle_id or None},
+            )
+
+        self.ledger.update(command_id, status="running", phase="verify_current_bundle")
+        manifest = bundle.load_manifest(bundle_dir)
+        bundle.verify_manifest(bundle_dir, manifest)
+        bundle_id = str(manifest.get("bundle_id") or "")
+        if requested_bundle_id and bundle_id != requested_bundle_id:
+            raise RuntimeCommandError("bundle_id does not match staged manifest")
+
+        self.ledger.update(command_id, status="running", phase="snapshot")
+        self.rebuild_backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.rebuild_backup_dir.chmod(0o700)
+        except OSError:
+            pass
+        backup_path = self.rebuild_backup_dir / f"{command_id}-openclaw-backup.tar.gz"
+        backup_result = openclaw_adapter.backup_create(output_path=backup_path)
+        result_payload: dict[str, Any] = {
+            "bundle_id": bundle_id,
+            "reason": str(spec.get("reason") or "admin_rebuild_app_layer"),
+            "backup": backup_result,
+            "systemd_restart_requested": self.stop_command is not None
+            or self.start_command is not None,
+            "restart_reason": "explicit_rebuild_app_layer_command",
+            "automatic_restart_loop": False,
+        }
+        result_payload["restart_requested"] = bool(
+            result_payload["systemd_restart_requested"]
+        )
+        if backup_result.get("state") != "ready":
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="snapshot",
+                failure_code="backup_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="reactivate_bundle")
+        activation = launcher.activate_bundle(
+            bundle_dir,
+            current_link=self.current_link,
+            stop_command=self.stop_command,
+            start_command=self.start_command,
+            health_command=self.health_command,
+        )
+        result_payload["activation"] = activation.__dict__
+        if not activation.activated:
+            status = "rolled_back" if activation.rolled_back else "failed"
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status=status,
+                phase=activation.phase,
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="openclaw_doctor")
+        doctor = openclaw_adapter.doctor_repair()
+        result_payload["doctor"] = doctor
+        if doctor.get("state") != "ready":
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="openclaw_doctor",
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="openclaw_status")
+        # Status is diagnostic evidence; the fresh attestation below is the
+        # success gate because it verifies the active bundle and OpenClaw health.
+        result_payload["status"] = openclaw_adapter.status_json()
+
+        self.ledger.update(command_id, status="running", phase="attest")
+        try:
+            result_payload["attestation"] = self._current_attestation()
+        except Exception as exc:  # noqa: BLE001 - final safety gate
+            result_payload["attestation_error"] = redact_text(str(exc), limit=1000)
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="attestation_gate",
+                failure_code="attestation_failed",
+                result=result_payload,
+            )
+        if result_payload["attestation"].get("bundle_id") != bundle_id:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="attestation_gate",
+                failure_code="attestation_mismatch",
+                result=result_payload,
+            )
+
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="attested",
+            result=result_payload,
         )
 
     def _bundle_dir_for_id(self, bundle_id: str) -> Path:

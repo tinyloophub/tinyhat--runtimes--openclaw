@@ -31,6 +31,9 @@ COMMANDS_LOG_DIR = _path_from_env(
 DIAGNOSTICS_DIR = _path_from_env(
     "TINYHAT_RUNTIME_DIAGNOSTICS_DIR", str(LOG_ROOT / "diagnostics")
 )
+REBUILD_BACKUP_DIR = _path_from_env(
+    "TINYHAT_RUNTIME_REBUILD_BACKUP_DIR", str(STATE_ROOT / "rebuild-backups")
+)
 IDENTITY_FILE = _path_from_env(
     "TINYHAT_RUNTIME_IDENTITY_FILE", str(STATE_ROOT / "identity.json")
 )
