@@ -24,6 +24,9 @@ Minor release for the Tinyloop v0.16 `tiny_runtime` release train.
 
 - Harden the hot image assignment lifecycle so assignment stays on the fast path
   while preserving the no-restart tiny runtime model.
+- Align dev OpenClaw state/config path resolution with baked
+  `TINYHAT_RUNTIME_HOME` environments so runtime commands use the same
+  OpenClaw state as the gateway.
 
 ## 0.15.6
 

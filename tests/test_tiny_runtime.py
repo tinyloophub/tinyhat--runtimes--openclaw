@@ -1826,6 +1826,59 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 os.environ.update(original_env)
                 importlib.reload(runtime_paths)
 
+    def test_openclaw_paths_keep_production_defaults(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        try:
+            os.environ.clear()
+            os.environ.update({"PATH": original_env.get("PATH", "")})
+            importlib.reload(runtime_paths)
+
+            env = openclaw_adapter.openclaw_env()
+            self.assertEqual(env["HOME"], "/var/lib/tinyhat-openclaw")
+            self.assertEqual(env["OPENCLAW_STATE_DIR"], "/var/lib/tinyhat-openclaw")
+            self.assertEqual(
+                env["OPENCLAW_CONFIG_PATH"], "/etc/openclaw/openclaw.json"
+            )
+            self.assertEqual(
+                runtime_paths.OPENCLAW_SECRETS_PATH,
+                Path("/etc/openclaw/tinyhat-secrets.json"),
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            importlib.reload(runtime_paths)
+
+    def test_openclaw_paths_follow_openclaw_env_without_tinyhat_overrides(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "openclaw-state"
+            config = Path(tmp) / "openclaw.json"
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "OPENCLAW_STATE_DIR": str(state),
+                        "OPENCLAW_CONFIG_PATH": str(config),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                env = openclaw_adapter.openclaw_env()
+                self.assertEqual(env["OPENCLAW_STATE_DIR"], str(state))
+                self.assertEqual(env["HOME"], str(state))
+                self.assertEqual(env["OPENCLAW_CONFIG_PATH"], str(config))
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
     def test_openclaw_path_overrides_keep_tinyhat_env_precedence(self) -> None:
         from tinyhat_runtime import openclaw_adapter
         from tinyhat_runtime import paths as runtime_paths
