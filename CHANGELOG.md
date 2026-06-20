@@ -7,6 +7,27 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.0
+
+Minor release for the Tinyloop v0.16 `tiny_runtime` release train.
+
+### Added
+
+- Add the explicit `rebuild_app_layer` command for `tiny_runtime` Computers,
+  including a verified local OpenClaw backup, one-shot bundle reactivation,
+  doctor/status checks, command-ledger reporting, and no automatic restart
+  loop.
+- Add the hot-assignment platform loop used by warm Computers to bind with the
+  minimum post-assignment work.
+
+### Fixed
+
+- Harden the hot image assignment lifecycle so assignment stays on the fast path
+  while preserving the no-restart tiny runtime model.
+- Align dev OpenClaw state/config path resolution with baked
+  `TINYHAT_RUNTIME_HOME` environments so runtime commands use the same
+  OpenClaw state as the gateway.
+
 ## 0.15.6
 
 Patch release for Tinyloop `tiny_runtime_bundle` image bakes that preinstall
