@@ -610,12 +610,14 @@ class RuntimeCommandRunner:
             "bundle_id": bundle_id,
             "reason": str(spec.get("reason") or "admin_rebuild_app_layer"),
             "backup": backup_result,
-            "restart_requested": True,
             "systemd_restart_requested": self.stop_command is not None
             or self.start_command is not None,
             "restart_reason": "explicit_rebuild_app_layer_command",
             "automatic_restart_loop": False,
         }
+        result_payload["restart_requested"] = bool(
+            result_payload["systemd_restart_requested"]
+        )
         if backup_result.get("state") != "ready":
             return self._finish(
                 command_id=command_id,
@@ -663,6 +665,8 @@ class RuntimeCommandRunner:
             )
 
         self.ledger.update(command_id, status="running", phase="openclaw_status")
+        # Status is diagnostic evidence; the fresh attestation below is the
+        # success gate because it verifies the active bundle and OpenClaw health.
         result_payload["status"] = openclaw_adapter.status_json()
 
         self.ledger.update(command_id, status="running", phase="attest")

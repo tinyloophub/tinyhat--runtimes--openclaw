@@ -882,7 +882,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(backup_paths[0].parent, base / "rebuild-backups")
             self.assertEqual(doctor_calls, [True])
             self.assertEqual(os.readlink(current), str(target.resolve()))
-            self.assertTrue(result["result"]["restart_requested"])
+            self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
             self.assertFalse(result["result"]["automatic_restart_loop"])
             mirror = json.loads(
@@ -947,6 +947,66 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["failure_code"], "backup_failed")
             self.assertEqual(doctor_calls, [])
             self.assertEqual(Path(os.readlink(current)).resolve(), target.resolve())
+
+    def test_rebuild_app_layer_reports_doctor_failure_without_false_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, _manifest = _install_bundle_under_id(
+                bundles,
+                base / "current-bundle",
+                marker="rebuild-target",
+            )
+            current = base / "current"
+            os.symlink(target, current)
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                rebuild_backup_dir=base / "rebuild-backups",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            with (
+                patch.object(
+                    openclaw_adapter,
+                    "backup_create",
+                    lambda *, output_path: {
+                        "state": "ready",
+                        "archive_path": str(output_path),
+                        "archive_bytes": 12,
+                        "backup": {"verified": True},
+                    },
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "doctor_repair",
+                    lambda: {"state": "failed", "detail": {"stderr": "doctor failed"}},
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "status_json",
+                    lambda: {"state": "ready", "status": {"ok": True}},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-rebuild-doctor-fail",
+                        "idempotency_key": "idem-rebuild-doctor-fail",
+                        "kind": "rebuild_app_layer",
+                        "spec": {"reason": "manual_canary_repair"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "openclaw_doctor")
+            self.assertEqual(result["failure_code"], "app_layer_rebuild_failed")
+            self.assertEqual(result["result"]["doctor"]["state"], "failed")
+            self.assertNotIn("attestation", result["result"])
 
     def test_duplicate_link_chatgpt_command_does_not_respawn_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -101,9 +101,12 @@ path is `chatgpt_subscription`.
 the runtime state directory, reactivates the current content-addressed bundle
 once, runs the official non-interactive OpenClaw doctor repair/status checks,
 and re-attests the active bundle. The backup archive stays on the Computer and
-is not uploaded to the platform. This command may stop/start the Gateway once;
-it is not used by assignment or secret updates and it does not implement an
-automatic restart loop.
+is not uploaded to the platform; support should prune old
+`rebuild-backups/` archives after incident evidence is no longer needed. This
+command may stop/start the Gateway once; it is not used by assignment or secret
+updates and it does not implement an automatic restart loop. If the active
+bundle files fail manifest verification, the command fails closed; restoring
+bundle files remains the job of `activate_bundle` with a staged bundle id.
 
 ## Local proof
 
