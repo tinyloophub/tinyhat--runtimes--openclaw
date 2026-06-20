@@ -7316,6 +7316,104 @@ class BootstrapSystemdIsolationTests(unittest.TestCase):
             script,
         )
 
+    def test_bootstrap_source_reinstall_hands_off_to_tiny_runtime(self) -> None:
+        script = _bootstrap_script_text()
+        helper_script = _bootstrap_function_definitions(
+            "remove_legacy_openclaw_units",
+            "fail_tiny_runtime_source_reinstall",
+            "write_tiny_runtime_source_env",
+            "install_tiny_runtime_from_source",
+        )
+
+        self.assertIn(
+            'INSTALL_TINY_RUNTIME_FROM_SOURCE="${TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE:-0}"',
+            script,
+        )
+        self.assertNotIn("if install_tiny_runtime_from_source; then", script)
+        self.assertIn(
+            'if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" == "1" ]]; then',
+            script,
+        )
+        self.assertLess(
+            script.index('if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" == "1" ]]'),
+            script.index(
+                'echo "[tinyhat-runtime] installing subscription provider plugin'
+            ),
+        )
+        self.assertLess(
+            script.index('if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" == "1" ]]'),
+            script.index('TINYHAT_CLI_WRAPPER="/usr/local/bin/tinyhat"'),
+        )
+        self.assertIn("fail_tiny_runtime_source_reinstall", helper_script)
+        self.assertIn('rm -f -- \\', helper_script)
+        self.assertIn('"${SUPERVISOR_UNIT}"', helper_script)
+        self.assertIn('"${GATEWAY_UNIT}"', helper_script)
+        self.assertIn('"${WORKLOAD_SLICE_UNIT}"', helper_script)
+        self.assertIn(
+            "TINYHAT_FRAMEWORK_INSTALL_SPEC=${OPENCLAW_INSTALL_SPEC:-}",
+            helper_script,
+        )
+        self.assertIn('openclaw_bin="$(command -v openclaw', helper_script)
+        self.assertIn('readlink -f "${openclaw_bin}"', helper_script)
+        self.assertIn('TINYHAT_OPENCLAW_BIN="${openclaw_bin}"', helper_script)
+        remove_legacy_call_index = helper_script.index(
+            "\n  remove_legacy_openclaw_units\n"
+        )
+        self.assertLess(
+            helper_script.index('"${assembler}" "${bundle_out}"'),
+            helper_script.index('rm -rf -- "${bundle_out}"'),
+        )
+        install_call_index = helper_script.index('"${bundle_out}/install.sh"')
+        success_cleanup_index = helper_script.index(
+            'rm -rf -- "${bundle_out}"',
+            install_call_index,
+        )
+        self.assertLess(
+            install_call_index,
+            success_cleanup_index,
+        )
+        self.assertLess(
+            helper_script.index(
+                "/opt/tinyhat/current/bin/tinyhat-runtime bake preinstall-plugins"
+            ),
+            remove_legacy_call_index,
+        )
+        self.assertLess(
+            helper_script.index(
+                "/opt/tinyhat/current/bin/tinyhat-runtime platform warm-config"
+            ),
+            remove_legacy_call_index,
+        )
+        self.assertLess(
+            helper_script.index("systemctl daemon-reload"),
+            remove_legacy_call_index,
+        )
+        self.assertLess(
+            remove_legacy_call_index,
+            helper_script.index("systemctl enable --now"),
+        )
+        self.assertIn(
+            "tinyhat-runtime-gateway.service \\",
+            helper_script,
+        )
+        self.assertIn(
+            "tinyhat-runtime-attestation.service \\",
+            helper_script,
+        )
+        self.assertIn(
+            "tinyhat-runtime-platform.service",
+            helper_script,
+        )
+        self.assertIn(
+            "/opt/tinyhat/current/bin/tinyhat-runtime bake preinstall-plugins",
+            helper_script,
+        )
+        self.assertIn("tiny_runtime source reinstall complete", helper_script)
+        self.assertIn(
+            "TINYHAT_RUNTIME_STARTUP_IMAGE_MODE=source_reinstall",
+            helper_script,
+        )
+
     def test_bootstrap_hard_reset_restores_only_user_state(self) -> None:
         helper_script = _bootstrap_function_definitions(
             "remove_path_if_present",

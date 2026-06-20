@@ -24,6 +24,10 @@
 #   TINYHAT_HARD_RESET_USER_STATE_MIGRATION_TOKEN — optional one-shot token;
 #       change this value to intentionally run another hard-reset migration
 #   TINYHAT_HARD_RESET_BACKUP_RETENTION — number of hard-reset backups to keep
+#   TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE — when 1, this legacy bootstrap
+#       stops/removes old tinyhat-openclaw units, assembles a tiny_runtime bundle
+#       from the checked-out runtime source, installs it, starts only the
+#       tinyhat-runtime-* services, and exits.
 #
 # Optional private-access material is passed by the platform startup
 # script through env and consumed here:
@@ -62,6 +66,7 @@ TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"
 HARD_RESET_USER_STATE_MIGRATION="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION:-0}"
 HARD_RESET_USER_STATE_MIGRATION_TOKEN="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION_TOKEN:-default}"
 HARD_RESET_BACKUP_RETENTION="${TINYHAT_HARD_RESET_BACKUP_RETENTION:-3}"
+INSTALL_TINY_RUNTIME_FROM_SOURCE="${TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE:-0}"
 
 echo "[tinyhat-runtime] bootstrap starting from ${RUNTIME_DIR}"
 
@@ -102,6 +107,126 @@ chown_runtime_paths() {
     "${OPENCLAW_CONFIG_DIR}" \
     "${OPENCLAW_STATE_DIR}" \
     "${TINYHAT_RUNTIME_LOG_ROOT}"
+}
+
+remove_legacy_openclaw_units() {
+  echo "[tinyhat-runtime] removing legacy tinyhat-openclaw supervisor units"
+  systemctl stop \
+    "${SUPERVISOR_UNIT_NAME}" \
+    "${GATEWAY_UNIT_NAME}" \
+    "${WORKLOAD_SLICE_UNIT_NAME}" >/dev/null 2>&1 || true
+  systemctl disable \
+    "${SUPERVISOR_UNIT_NAME}" \
+    "${GATEWAY_UNIT_NAME}" >/dev/null 2>&1 || true
+  rm -f -- \
+    "${SUPERVISOR_UNIT}" \
+    "${GATEWAY_UNIT}" \
+    "${WORKLOAD_SLICE_UNIT}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed \
+    "${SUPERVISOR_UNIT_NAME}" \
+    "${GATEWAY_UNIT_NAME}" >/dev/null 2>&1 || true
+}
+
+fail_tiny_runtime_source_reinstall() {
+  local diagnostic="$1"
+  write_runtime_bootstrap_status "error" "${diagnostic}"
+  echo "[tinyhat-runtime] ERROR: ${diagnostic}" >&2
+  exit 1
+}
+
+write_tiny_runtime_source_env() {
+  install -d -m 0755 "$(dirname "${RUNTIME_ENV_FILE}")"
+  cat > "${RUNTIME_ENV_FILE}" <<TINY_RUNTIME_ENV
+TINYHAT_BACKEND_AUDIENCE=${TINYHAT_BACKEND_AUDIENCE:-}
+TINYHAT_PLATFORM_BASE_URL=${TINYHAT_PLATFORM_BASE_URL:-}
+TINYHAT_FRAMEWORK_INSTALL_SPEC=${OPENCLAW_INSTALL_SPEC:-}
+TINYHAT_PLATFORM_PLUGIN_REPO_URL=${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}
+TINYHAT_PLATFORM_PLUGIN_REPO_REF=${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}
+TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH=${TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH:-}
+TINYHAT_HARD_RESET_USER_STATE_MIGRATION=${HARD_RESET_USER_STATE_MIGRATION}
+TINYHAT_PRIVATE_ACCESS_PROVIDER=${PRIVATE_ACCESS_PROVIDER}
+TINYHAT_RUNTIME_EXPECTED_REPO_REF=$(git -C "${RUNTIME_DIR}" rev-parse HEAD 2>/dev/null || printf '%s' "${TINYHAT_RUNTIME_EXPECTED_REPO_REF:-unknown}")
+TINYHAT_RUNTIME_INSTALL_ROOT=/opt/tinyhat
+TINYHAT_RUNTIME_CURRENT_LINK=/opt/tinyhat/current
+TINYHAT_OPENCLAW_RUNTIME_USER=${TINYHAT_RUNTIME_USER}
+TINYHAT_OPENCLAW_RUNTIME_GROUP=${TINYHAT_RUNTIME_GROUP}
+TINYHAT_RUNTIME_LOG_ROOT=${TINYHAT_RUNTIME_LOG_ROOT}
+TINYHAT_RUNTIME_GENERATION=tiny_runtime
+TINYHAT_RUNTIME_STARTUP_IMAGE_MODE=source_reinstall
+TINY_RUNTIME_ENV
+  chmod 0600 "${RUNTIME_ENV_FILE}"
+}
+
+install_tiny_runtime_from_source() {
+  if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then
+    return 1
+  fi
+
+  local assembler="${RUNTIME_DIR}/tiny_runtime/bake/assemble-bundle.sh"
+  local bundle_out
+  local runtime_ref
+  local openclaw_ref
+  local openclaw_bin
+  local plugin_ref
+  local installed
+  if [[ ! -x "${assembler}" ]]; then
+    write_runtime_bootstrap_status "error" "tiny_runtime source assembler missing"
+    echo "[tinyhat-runtime] ERROR: tiny_runtime assembler missing at ${assembler}" >&2
+    exit 1
+  fi
+
+  runtime_ref="$(git -C "${RUNTIME_DIR}" rev-parse HEAD 2>/dev/null || printf '%s' "${TINYHAT_RUNTIME_EXPECTED_REPO_REF:-unknown}")"
+  openclaw_ref="${OPENCLAW_INSTALL_SPEC:-openclaw}"
+  openclaw_bin="$(command -v openclaw 2>/dev/null || true)"
+  if [[ -n "${openclaw_bin}" ]]; then
+    openclaw_bin="$(readlink -f "${openclaw_bin}" 2>/dev/null || printf '%s' "${openclaw_bin}")"
+  fi
+  plugin_ref="${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-unknown}"
+  mkdir -p /opt/tinyhat/source-bundles
+  bundle_out="$(mktemp -d /opt/tinyhat/source-bundles/tiny-runtime-bundle.XXXXXX)"
+
+  write_tiny_runtime_source_env
+  echo "[tinyhat-runtime] assembling tiny_runtime source bundle at ${bundle_out}"
+  TINYHAT_RUNTIME_REF="${runtime_ref}" \
+  TINYHAT_OPENCLAW_REF="${openclaw_ref}" \
+  TINYHAT_OPENCLAW_BIN="${openclaw_bin}" \
+  TINYHAT_PLUGIN_REF="${plugin_ref}" \
+    "${assembler}" "${bundle_out}" \
+    || {
+      rm -rf -- "${bundle_out}"
+      fail_tiny_runtime_source_reinstall "tiny_runtime source bundle assembly failed"
+    }
+
+  echo "[tinyhat-runtime] installing tiny_runtime source bundle"
+  installed="$(TINYHAT_RUNTIME_BUNDLE_DIR="${bundle_out}" "${bundle_out}/install.sh")" \
+    || {
+      rm -rf -- "${bundle_out}"
+      fail_tiny_runtime_source_reinstall "tiny_runtime source bundle install failed"
+    }
+  rm -rf -- "${bundle_out}"
+  echo "[tinyhat-runtime] ${installed}"
+
+  echo "[tinyhat-runtime] preinstalling tiny_runtime OpenClaw plugins"
+  /opt/tinyhat/current/bin/tinyhat-runtime bake preinstall-plugins \
+    || fail_tiny_runtime_source_reinstall "tiny_runtime plugin preinstall failed"
+
+  echo "[tinyhat-runtime] warming tiny_runtime platform config"
+  /opt/tinyhat/current/bin/tinyhat-runtime platform warm-config \
+    --platform-base-url "${TINYHAT_PLATFORM_BASE_URL:-}" \
+    --backend-audience "${TINYHAT_BACKEND_AUDIENCE:-}" \
+    || fail_tiny_runtime_source_reinstall "tiny_runtime platform warm-config failed"
+  systemctl daemon-reload \
+    || fail_tiny_runtime_source_reinstall "systemd daemon reload failed"
+  remove_legacy_openclaw_units
+  systemctl enable --now \
+    tinyhat-runtime-gateway.service \
+    tinyhat-runtime-attestation.service \
+    tinyhat-runtime-platform.service \
+    || fail_tiny_runtime_source_reinstall "tiny_runtime systemd services failed to start"
+  write_runtime_bootstrap_status "ready" "tiny_runtime source reinstall complete"
+  echo "[tinyhat-runtime] tiny_runtime source reinstall complete"
+  return 0
 }
 
 verify_codex_subscription_plugin() {
@@ -508,6 +633,12 @@ else
   write_runtime_bootstrap_status "error" "openclaw CLI failed after bootstrap"
   echo "[tinyhat-runtime] ERROR: openclaw CLI failed after bootstrap" >&2
   exit 1
+fi
+
+if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" == "1" ]]; then
+  install_tiny_runtime_from_source
+  echo "[tinyhat-runtime] bootstrap complete"
+  exit 0
 fi
 
 echo "[tinyhat-runtime] installing subscription provider plugin: ${CODEX_SUBSCRIPTION_PLUGIN_PACKAGE}"
