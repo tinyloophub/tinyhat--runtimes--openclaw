@@ -7,8 +7,18 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.1
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This keeps
+production upgrades and hot-pool Computers on the isolated tiny runtime while
+restoring the access/auth prerequisites expected by manual assignment,
+terminal, and subscription flows.
+
 ### Added
 
+- Add the source-reinstall bootstrap mode for data-preserving upgrades of
+  legacy Ubuntu-baseline Computers into the tiny-runtime model, removing legacy
+  supervisor units and starting only `tinyhat-runtime-*` services.
 - Add tiny-runtime Tailscale enrollment/reporting for `tiny_runtime_bundle`
   Computers so hot-pool rows become private-access-ready before assignment.
 - Add the tiny-runtime ChatGPT/Codex device-code worker and runtime model-status
