@@ -255,9 +255,13 @@ class PrivateAccessTests(unittest.TestCase):
 
             self.assertEqual(result["state"], "ready")
             self.assertEqual(json.loads(status_path.read_text())["state"], "ready")
+            tailscale_logout = next(
+                call for call in calls if call[:2] == ["tailscale", "logout"]
+            )
             tailscale_up = next(
                 call for call in calls if call[:2] == ["tailscale", "up"]
             )
+            self.assertLess(calls.index(tailscale_logout), calls.index(tailscale_up))
             self.assertIn("--hostname=computer-abc123ef", tailscale_up)
             self.assertIn("--ssh", tailscale_up)
             self.assertIn("--advertise-tags=tag:tinyhat-computer", tailscale_up)
@@ -1660,6 +1664,39 @@ class PlatformLoopTests(unittest.TestCase):
             timeout=10,
         )
 
+    def test_ready_report_defers_gated_ready_edge_without_crashing(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 409: Conflict")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "provisioning", "assigned": False}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+
+        self.assertFalse(loop.ready_reported)
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+            ],
+        )
+        self.assertEqual(posts[0][1]["runtime_health"], "healthy")
+        self.assertFalse(posts[0][1]["assigned"])
+        client.get_json.assert_called_once_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+
     def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -1695,6 +1732,13 @@ class PlatformLoopTests(unittest.TestCase):
             runtime_state_payloads[0]["openclaw_control"],
             "no_restart_requested",
         )
+        heartbeat_payloads = [
+            payload
+            for path, payload in posts
+            if path == "/hapi/v1/computers/me/heartbeat"
+        ]
+        self.assertEqual(len(heartbeat_payloads), 1)
+        self.assertFalse(heartbeat_payloads[0]["metrics"]["assigned"])
 
     def test_unassigned_state_report_failure_does_not_exit_loop(self) -> None:
         from tinyhat_runtime import platform_loop
@@ -1714,6 +1758,76 @@ class PlatformLoopTests(unittest.TestCase):
             self.assertEqual(loop.run_forever(), 0)
 
         self.assertGreaterEqual(client.post_json.call_count, 2)
+
+    def test_unassigned_heartbeat_dispatches_runtime_command(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        command = {
+            "type": "runtime_command",
+            "command": {
+                "command_id": "cmd-private-access",
+                "idempotency_key": "enroll_private_access:abc123",
+                "kind": "enroll_private_access",
+                "spec": {"reason": "heartbeat_private_access_not_ready"},
+            },
+        }
+        client = Mock()
+        client.post_json.return_value = {"command": command}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def unassigned_once() -> dict:
+            loop.stop_requested = True
+            return {"assigned": False}
+
+        with (
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=unassigned_once),
+            patch.object(loop, "_dispatch_runtime_command") as dispatch,
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        client.post_json.assert_called_once()
+        self.assertEqual(
+            client.post_json.call_args.args[0],
+            "/hapi/v1/computers/me/heartbeat",
+        )
+        dispatch.assert_called_once_with(command)
+
+    def test_unassigned_command_dispatch_failure_does_not_exit_loop(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        command = {
+            "type": "runtime_command",
+            "command": {
+                "command_id": "cmd-private-access",
+                "idempotency_key": "enroll_private_access:abc123",
+                "kind": "enroll_private_access",
+                "spec": {"reason": "heartbeat_private_access_not_ready"},
+            },
+        }
+        client = Mock()
+        client.post_json.return_value = {"command": command}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        def unassigned_once() -> dict:
+            loop.stop_requested = True
+            return {"assigned": False}
+
+        with (
+            patch.object(loop, "_report_ready"),
+            patch.object(loop, "_poll_binding", side_effect=unassigned_once),
+            patch.object(
+                loop,
+                "_dispatch_runtime_command",
+                side_effect=RuntimeError("HTTP Error 409: Conflict"),
+            ) as dispatch,
+            patch.object(platform_loop.time, "sleep"),
+        ):
+            self.assertEqual(loop.run_forever(), 0)
+
+        dispatch.assert_called_once_with(command)
+        self.assertTrue(loop.stop_requested)
 
     def test_binding_activation_does_not_restart_openclaw_gateway(self) -> None:
         from tinyhat_runtime import platform_loop
@@ -1810,6 +1924,34 @@ class PlatformLoopTests(unittest.TestCase):
             payload["metrics"]["private_access"]["tailnet_ip"],
             "100.101.102.103",
         )
+
+    def test_runtime_state_includes_private_access_report(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with patch.object(
+            platform_loop.private_access,
+            "private_access_report",
+            return_value={
+                "provider": "tailscale",
+                "state": "ready",
+                "tailnet_ip": "100.101.102.103",
+            },
+        ):
+            loop._post_runtime_state(
+                "healthy",
+                "control plane ready; awaiting binding",
+                {"assigned": False},
+            )
+
+        self.assertEqual(client.posts[0][0], "/hapi/v1/computers/me/runtime-state")
+        payload = client.posts[0][1]
+        self.assertFalse(payload["assigned"])
+        self.assertEqual(payload["private_access"]["provider"], "tailscale")
+        self.assertEqual(payload["private_access"]["state"], "ready")
+        self.assertEqual(payload["private_access"]["tailnet_ip"], "100.101.102.103")
 
     def test_subscription_runtime_verification_uses_models_status(self) -> None:
         from tinyhat_runtime import platform_loop
@@ -2271,6 +2413,8 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertIn('== "tiny_runtime"', entrypoint)
         self.assertIn("python3 -m tinyhat_runtime.main gateway run", entrypoint)
         self.assertIn("python3 -m tinyhat_runtime.main platform loop", entrypoint)
+        self.assertIn("tailscale logout", entrypoint)
+        self.assertIn('"node_name": os.environ.get("TINYHAT_TAILSCALE_NODE_NAME")', entrypoint)
         branch = entrypoint[
             entrypoint.index('== "tiny_runtime"') : entrypoint.index(
                 'echo "[dev-entrypoint] starting supervisor as tinyhat..."'
@@ -3384,6 +3528,51 @@ class BakeScriptTests(unittest.TestCase):
                 manifest["components"]["tinyhat_openclaw_plugin"]["ref"],
                 "0d79c3ca35161c05b4987cff286f85e2c988a29d",
             )
+
+    def test_assemble_bundle_copies_openclaw_package_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            package_dir = tmp_path / "node_modules" / "openclaw"
+            bin_dir = package_dir / "bin"
+            dist_dir = package_dir / "dist"
+            bin_dir.mkdir(parents=True)
+            dist_dir.mkdir()
+            (package_dir / "package.json").write_text(
+                json.dumps({"name": "openclaw", "version": "2026.6.9"}),
+                encoding="utf-8",
+            )
+            (bin_dir / "openclaw").write_text(
+                "#!/usr/bin/env node\nimport '../dist/entry.mjs';\n",
+                encoding="utf-8",
+            )
+            os.chmod(bin_dir / "openclaw", 0o755)
+            (dist_dir / "entry.mjs").write_text(
+                "export default {};\n",
+                encoding="utf-8",
+            )
+            out_dir = tmp_path / "bundle"
+            env = {
+                **os.environ,
+                "TINYHAT_OPENCLAW_BIN": str(bin_dir / "openclaw"),
+                "TINYHAT_OPENCLAW_REF": "openclaw@2026.6.9",
+            }
+
+            completed = subprocess.run(
+                [
+                    str(_REPO_ROOT / "tiny_runtime" / "bake" / "assemble-bundle.sh"),
+                    str(out_dir),
+                ],
+                cwd=_REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((out_dir / "vendor" / "openclaw" / "package.json").exists())
+            self.assertTrue((out_dir / "vendor" / "openclaw" / "dist" / "entry.mjs").exists())
+            self.assertTrue((out_dir / "vendor" / "openclaw" / "bin" / "openclaw").exists())
 
 
 class GceStartupScriptTests(unittest.TestCase):

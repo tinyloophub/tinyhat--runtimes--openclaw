@@ -37,7 +37,24 @@ cp -a -- \
 
 mkdir -p "${out_dir}/vendor/openclaw/bin"
 if [[ -n "${TINYHAT_OPENCLAW_BIN:-}" ]]; then
-  cp -a -- "${TINYHAT_OPENCLAW_BIN}" "${out_dir}/vendor/openclaw/bin/openclaw"
+  openclaw_bin="$(
+    readlink -f "${TINYHAT_OPENCLAW_BIN}" 2>/dev/null \
+      || realpath "${TINYHAT_OPENCLAW_BIN}" 2>/dev/null \
+      || printf '%s' "${TINYHAT_OPENCLAW_BIN}"
+  )"
+  openclaw_package_dir=""
+  if [[ -f "$(dirname "${openclaw_bin}")/../package.json" ]]; then
+    openclaw_package_dir="$(cd -- "$(dirname "${openclaw_bin}")/.." && pwd)"
+  elif [[ -f "$(dirname "${openclaw_bin}")/package.json" ]]; then
+    openclaw_package_dir="$(cd -- "$(dirname "${openclaw_bin}")" && pwd)"
+  fi
+  if [[ -n "${openclaw_package_dir}" ]]; then
+    rm -rf -- "${out_dir}/vendor/openclaw"
+    mkdir -p "${out_dir}/vendor/openclaw"
+    cp -a -- "${openclaw_package_dir}/." "${out_dir}/vendor/openclaw/"
+  else
+    cp -a -- "${openclaw_bin}" "${out_dir}/vendor/openclaw/bin/openclaw"
+  fi
 fi
 
 chmod +x "${out_dir}/install.sh" "${out_dir}"/bin/tinyhat-* "${out_dir}"/bake/*.sh
