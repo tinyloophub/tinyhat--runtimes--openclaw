@@ -146,31 +146,12 @@ class TinyRuntimePlatformLoop:
             return
         if self.ready_reported:
             return
-        try:
-            state_posted = self._post_lifecycle_state(
-                "ready",
-                "tiny_runtime platform loop ready",
-                already_state="ready",
-            )
-        except Exception as exc:  # noqa: BLE001 - assigned restart should continue
-            try:
-                status = self.client.get_json(
-                    "/hapi/v1/computers/me/platform-status",
-                    timeout=10,
-                )
-            except Exception:
-                raise exc
-            if (
-                status.get("state") in {"assigned", "active"}
-                and status.get("assigned") is True
-            ):
-                self.ready_reported = True
-                LOG.info(
-                    "state=ready skipped; platform already %s",
-                    status.get("state"),
-                )
-                return
-            raise exc
+        state_posted = self._post_lifecycle_state(
+            "ready",
+            "tiny_runtime platform loop ready",
+            already_state="ready",
+            ready_allows_assigned_current=True,
+        )
         self.ready_reported = True
         if state_posted:
             LOG.info("confirmed state=ready")
@@ -303,6 +284,7 @@ class TinyRuntimePlatformLoop:
         detail: str,
         *,
         already_state: str,
+        ready_allows_assigned_current: bool = False,
     ) -> bool:
         try:
             self.client.post_json(
@@ -324,6 +306,17 @@ class TinyRuntimePlatformLoop:
                 LOG.info(
                     "state=%s already satisfied by platform; continuing",
                     state,
+                )
+                return False
+            if (
+                ready_allows_assigned_current
+                and state == "ready"
+                and status.get("state") in {"assigned", "active"}
+                and status.get("assigned") is True
+            ):
+                LOG.info(
+                    "state=ready skipped; platform already %s",
+                    status.get("state"),
                 )
                 return False
             raise exc

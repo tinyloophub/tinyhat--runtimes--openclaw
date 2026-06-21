@@ -124,10 +124,9 @@ def dev_runtime_identity_token() -> str | None:
 
 
 def default_platform_client() -> PlatformClient:
+    is_dev_runtime = (os.environ.get("TINYHAT_DEV_RUNTIME") or "").strip() == "1"
     token_provider = (
-        dev_runtime_identity_token
-        if (os.environ.get("TINYHAT_DEV_RUNTIME") or "").strip() == "1"
-        else fetch_gce_identity_token
+        dev_runtime_identity_token if is_dev_runtime else fetch_gce_identity_token
     )
     return PlatformClient(
         platform_base_url_from_env(),

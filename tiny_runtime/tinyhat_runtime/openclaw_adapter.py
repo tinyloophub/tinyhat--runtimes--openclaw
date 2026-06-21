@@ -495,6 +495,7 @@ def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
             payload.get("gateway", {}).get("reachable") is True
             and payload.get("error", {}).get("type") == "gateway_credentials_required"
         ):
+            # The gateway is serving; this CLI only lacks read-scope credentials.
             return {
                 "state": "healthy",
                 "gateway": redact_json(payload),
