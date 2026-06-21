@@ -7,6 +7,22 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.5
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This hardens
+data-preserving upgrades of existing customer Computers so the legacy
+supervisor path cannot survive beside the tiny runtime.
+
+### Fixed
+
+- Terminate orphaned legacy supervisor and unauthenticated legacy gateway
+  processes during source reinstall before enabling the tiny-runtime systemd
+  services.
+- Materialize the pinned Tinyhat OpenClaw plugin during `rebuild_app_layer`
+  before bundle activation, failing closed if the plugin cannot be made ready.
+- Make the local tiny-runtime Docker canary image boot through the
+  `tiny_runtime` platform loop without carrying or invoking `supervisor.py`.
+
 ## 0.16.4
 
 Patch release for the Tinyloop v0.16 `tiny_runtime` train. This lets
