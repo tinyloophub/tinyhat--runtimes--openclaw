@@ -2184,6 +2184,29 @@ class PlatformClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.me_url("../admin")
 
+    def test_client_only_builds_computer_me_api_urls(self) -> None:
+        client = PlatformClient("https://platform.example")
+        self.assertEqual(
+            client.api_url("/hapi/v1/computers/me/private-access/enrollment"),
+            (
+                "https://platform.example/"
+                "hapi/v1/computers/me/private-access/enrollment"
+            ),
+        )
+        self.assertEqual(
+            client.api_url("hapi/v1/computers/me/runtime-secrets"),
+            "https://platform.example/hapi/v1/computers/me/runtime-secrets",
+        )
+
+        for path in (
+            "/hapi/v1/admin/computers/1",
+            "/hapi/v1/computers/42/binding",
+            "/hapi/v1/computers/me/../admin",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    client.api_url(path)
+
     def test_dev_runtime_identity_token_is_dev_only_marker(self) -> None:
         with patch.dict(os.environ, {"TINYHAT_DEV_RUNTIME": "1"}, clear=False):
             self.assertEqual(dev_runtime_identity_token(), DEV_RUNTIME_BEARER)
