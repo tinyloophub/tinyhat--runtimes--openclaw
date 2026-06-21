@@ -7,6 +7,25 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.4
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This lets
+ready-pool Computers accept platform runtime commands before assignment,
+so private-access repair can complete while the Computer is still hot and
+unassigned.
+
+### Fixed
+
+- Dispatch runtime commands from unassigned ready-pool Computers, including
+  `enroll_private_access`, without waiting for an agent binding cycle.
+- Treat `409` ready acknowledgements as a safe deferral so the tiny runtime
+  keeps polling rather than exiting while platform prerequisites are still
+  converging.
+- Re-authenticate Tailscale enrollment with a logout-before-up sequence to
+  avoid stale local node bindings during private-access repair.
+- Resolve bundled OpenClaw package paths robustly when the CLI binary is nested
+  inside the package root, preserving hot-image bundle assembly.
+
 ## 0.16.3
 
 Patch release for the Tinyloop v0.16 `tiny_runtime` train. This keeps
