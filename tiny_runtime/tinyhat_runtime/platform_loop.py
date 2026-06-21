@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from . import openclaw_adapter
+from . import openclaw_adapter, private_access, subscription_link
 from .platform_client import (
     PlatformClient,
     backend_audience_from_env,
@@ -91,6 +91,7 @@ class TinyRuntimePlatformLoop:
                 self._dispatch_runtime_command(command)
             if response.get("assigned") is not True:
                 self._report_ready()
+                self._safe_post_heartbeat(assigned=False)
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
             binding = response.get("binding")
@@ -227,22 +228,13 @@ class TinyRuntimePlatformLoop:
                 "assignment_elapsed_ms": _elapsed_ms(cycle_started, active_done),
             },
         )
+        self._report_subscription_runtime_verification(binding)
 
     def _active_loop(self, binding: dict[str, Any]) -> None:
         current_signature = self._binding_signature(binding)
         while not self.stop_requested:
             started = time.monotonic()
-            heartbeat = self.client.post_json(
-                "/hapi/v1/computers/me/heartbeat",
-                {
-                    "metrics": {
-                        "runtime_generation": "tiny_runtime",
-                        "gateway_liveness_owner": "systemd",
-                        "openclaw_control": "official_cli_only",
-                    },
-                    "openclaw_status": openclaw_adapter.gateway_status(),
-                },
-            )
+            heartbeat = self._post_heartbeat(assigned=True)
             command = heartbeat.get("command")
             if isinstance(command, dict):
                 self._dispatch_runtime_command(command)
@@ -363,14 +355,70 @@ class TinyRuntimePlatformLoop:
         }
 
     def _start_chatgpt_link(self, command: dict[str, Any]) -> dict[str, Any]:
-        # The full device-code worker is deliberately routed through OpenClaw's
-        # official model auth command and tracked by a typed ledger command.
-        # The streaming URL/code relay remains the M3 command implementation.
-        return {
-            "state": "deferred",
-            "detail": "link_chatgpt device-code relay is handled by the runtime command implementation",
-            "command": command,
+        # Runs OpenClaw's official device-code CLI in a background worker. The
+        # worker posts public URL/code and terminal link state; OAuth tokens stay
+        # on this Computer.
+        return subscription_link.start_chatgpt_link(command, client=self.client)
+
+    def _post_heartbeat(self, *, assigned: bool) -> dict[str, Any]:
+        metrics: dict[str, Any] = {
+            "runtime_generation": "tiny_runtime",
+            "gateway_liveness_owner": "systemd",
+            "openclaw_control": "official_cli_only",
+            "assigned": bool(assigned),
         }
+        private_report = private_access.private_access_report()
+        if private_report is not None:
+            metrics["private_access"] = private_report
+        return self.client.post_json(
+            "/hapi/v1/computers/me/heartbeat",
+            {
+                "metrics": metrics,
+                "openclaw_status": openclaw_adapter.gateway_status(),
+            },
+        )
+
+    def _safe_post_heartbeat(self, *, assigned: bool) -> None:
+        try:
+            self._post_heartbeat(assigned=assigned)
+        except Exception as exc:  # noqa: BLE001 - heartbeat must not churn OpenClaw
+            LOG.warning(
+                "heartbeat failed assigned=%s error=%s",
+                assigned,
+                redact_text(str(exc), limit=500),
+            )
+
+    def _report_subscription_runtime_verification(self, binding: dict[str, Any]) -> None:
+        if str(binding.get("llm_auth_mode") or "") != "chatgpt_subscription":
+            return
+        expected = str(binding.get("llm_model_ref") or "openai/gpt-5.5").strip()
+        status = openclaw_adapter.models_status()
+        observed = _observed_model_ref_from_status(status)
+        body: dict[str, Any] = {
+            "expected_model_ref": expected,
+            "observed_model_ref": observed,
+            "command": "openclaw models status --json",
+            "verified": observed == expected,
+        }
+        if status.get("state") != "ready":
+            body["detail"] = redact_text(str(status.get("detail") or status), limit=512)
+        elif observed is None:
+            detail = (
+                "openclaw models status did not expose a default model "
+                f"(shape={_status_shape_for_log(status)})"
+            )
+            LOG.warning(detail)
+            body["detail"] = detail
+        try:
+            self.client.post_json(
+                "/hapi/v1/computers/me/subscription-link/runtime-verification",
+                body,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness retry happens platform-side
+            LOG.warning(
+                "subscription runtime verification POST failed: %s",
+                redact_text(str(exc), limit=500),
+            )
 
     def _post_runtime_state(
         self,
@@ -471,6 +519,68 @@ class TinyRuntimePlatformLoop:
     @staticmethod
     def _binding_owner_id(binding: dict[str, Any]) -> str:
         return str(binding.get("telegram_owner_user_id") or "")
+
+
+def _observed_model_ref_from_status(status: dict[str, Any]) -> str | None:
+    if not isinstance(status, dict):
+        return None
+    models = status.get("models")
+    if isinstance(models, dict):
+        value = _observed_model_ref_from_payload(models)
+        if value:
+            return value
+    return _observed_model_ref_from_payload(status)
+
+
+def _observed_model_ref_from_payload(payload: dict[str, Any]) -> str | None:
+    for key in ("resolvedDefault", "defaultModel", "default", "currentModel"):
+        value = _model_ref_from_value(payload.get(key))
+        if value:
+            return value
+    nested = payload.get("models")
+    if isinstance(nested, dict):
+        value = _observed_model_ref_from_payload(nested)
+        if value:
+            return value
+    if isinstance(nested, list):
+        for item in nested:
+            if not isinstance(item, dict):
+                continue
+            if item.get("default") is True or item.get("isDefault") is True:
+                value = _model_ref_from_value(item)
+                if value:
+                    return value
+    return None
+
+
+def _model_ref_from_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if not isinstance(value, dict):
+        return None
+    provider = str(value.get("provider") or "").strip()
+    model = str(value.get("model") or value.get("modelId") or "").strip()
+    if provider and model:
+        return f"{provider}/{model}"
+    for key in ("ref", "id", "label", "name"):
+        candidate = str(value.get(key) or "").strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _status_shape_for_log(status: dict[str, Any]) -> str:
+    if not isinstance(status, dict):
+        return type(status).__name__
+    keys = sorted(str(key) for key in status.keys())
+    models = status.get("models")
+    if isinstance(models, dict):
+        model_shape = ",".join(sorted(str(key) for key in models.keys())[:8])
+        return f"top={','.join(keys[:8])};models={model_shape}"
+    if isinstance(models, list):
+        return f"top={','.join(keys[:8])};models=list[{len(models)}]"
+    return f"top={','.join(keys[:8])};models={type(models).__name__}"
 
 
 def main() -> int:

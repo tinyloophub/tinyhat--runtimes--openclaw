@@ -92,6 +92,31 @@ def run_openclaw(
     )
 
 
+def spawn_models_auth_login_device_code(
+    *,
+    stdin: int,
+    stdout: int,
+    stderr: int,
+) -> subprocess.Popen[bytes]:
+    """Spawn OpenClaw's official ChatGPT/Codex device-code auth CLI."""
+    return subprocess.Popen(
+        [
+            "openclaw",
+            "models",
+            "auth",
+            "login",
+            "--provider",
+            "openai",
+            "--device-code",
+        ],
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        env=openclaw_env(),
+        start_new_session=True,
+    )
+
+
 def inspect_plugin(plugin_id: str, *, runner: Runner = subprocess.run) -> dict[str, Any]:
     result = run_openclaw(("plugins", "inspect", plugin_id, "--json"), runner=runner)
     if not result.ok:

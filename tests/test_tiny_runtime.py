@@ -19,6 +19,7 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Callable
 from unittest.mock import Mock, patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,10 +33,29 @@ from tinyhat_runtime import (  # noqa: E402
     launcher,
     main,
     openclaw_adapter,
+    platform_loop,
+    private_access,
+    subscription_link,
 )
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
 from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
 from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
+
+
+class _Completed:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakePlatformClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+
+    def post_json(self, path: str, body: dict, **_kwargs: object) -> dict:
+        self.posts.append((path, body))
+        return {}
 
 
 def _write_minimal_bundle(root: Path, *, marker: str = "") -> dict:
@@ -163,6 +183,143 @@ class HotImageTests(unittest.TestCase):
         apply_warm.assert_called_once_with()
         write_marker.assert_called_once_with(checkout=checkout, resolved_sha="a" * 40)
         self.assertEqual(result["warm_config"], {"state": "ready"})
+
+
+class PrivateAccessTests(unittest.TestCase):
+    def test_enroll_from_env_runs_tailscale_up_and_writes_ready_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "bootstrap-status.json"
+            calls: list[list[str]] = []
+            auth_paths: list[Path] = []
+
+            def fake_runner(args, **_kwargs):
+                argv = list(args)
+                calls.append(argv)
+                if argv[:2] == ["tailscale", "up"]:
+                    auth_arg = next(arg for arg in argv if arg.startswith("--auth-key=file:"))
+                    auth_path = Path(auth_arg.removeprefix("--auth-key=file:"))
+                    auth_paths.append(auth_path)
+                    self.assertEqual(auth_path.parent, status_path.parent / "secrets")
+                    self.assertEqual(auth_path.read_text(encoding="utf-8"), "tskey-secret")
+                    self.assertEqual(auth_path.stat().st_mode & 0o777, 0o600)
+                return _Completed(returncode=0, stdout="ok\n")
+
+            def fake_which(name: str) -> str | None:
+                if name == "tailscale":
+                    return "/usr/bin/tailscale"
+                if name == "systemctl":
+                    return None
+                return None
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "TINYHAT_PRIVATE_ACCESS_PROVIDER": "tailscale",
+                        "TINYHAT_TAILSCALE_AUTH_KEY": "tskey-secret",
+                        "TINYHAT_TAILSCALE_NODE_NAME": "computer-abc123ef",
+                        "TINYHAT_TAILSCALE_TAGS": "tag:tinyhat-computer",
+                        "TINYHAT_PRIVATE_ACCESS_STATUS_PATH": str(status_path),
+                    },
+                    clear=False,
+                ),
+                patch.object(private_access.shutil, "which", side_effect=fake_which),
+            ):
+                result = private_access.enroll_from_env(runner=fake_runner)
+
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(json.loads(status_path.read_text())["state"], "ready")
+            tailscale_up = next(call for call in calls if call[:2] == ["tailscale", "up"])
+            self.assertIn("--hostname=computer-abc123ef", tailscale_up)
+            self.assertIn("--ssh", tailscale_up)
+            self.assertIn("--advertise-tags=tag:tinyhat-computer", tailscale_up)
+            self.assertTrue(any(arg.startswith("--auth-key=file:") for arg in tailscale_up))
+            self.assertFalse(any("tskey-secret" in arg for arg in tailscale_up))
+            self.assertEqual(result["ssh_enabled"], True)
+            self.assertEqual(len(auth_paths), 1)
+            self.assertFalse(auth_paths[0].exists())
+            self.assertEqual((status_path.parent / "secrets").stat().st_mode & 0o777, 0o700)
+
+    def test_private_access_report_parses_tailscale_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "bootstrap-status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "provider": "tailscale",
+                        "state": "ready",
+                        "node_name": "computer-abc123ef",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_runner(args, **_kwargs):
+                self.assertEqual(args, ["tailscale", "status", "--json"])
+                return _Completed(
+                    stdout=json.dumps(
+                        {
+                            "BackendState": "Running",
+                            "Self": {
+                                "HostName": "computer-abc123ef",
+                                "Online": True,
+                                "TailscaleIPs": ["100.101.102.103"],
+                            },
+                        }
+                    )
+                )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"TINYHAT_PRIVATE_ACCESS_STATUS_PATH": str(status_path)},
+                    clear=False,
+                ),
+                patch.object(private_access.shutil, "which", return_value="/usr/bin/tailscale"),
+            ):
+                report = private_access.private_access_report(runner=fake_runner)
+
+            self.assertEqual(report["provider"], "tailscale")
+            self.assertEqual(report["state"], "ready")
+            self.assertEqual(report["tailnet_ip"], "100.101.102.103")
+            self.assertEqual(report["node_name"], "computer-abc123ef")
+
+
+class SubscriptionLinkTests(unittest.TestCase):
+    def test_extract_public_device_code_ignores_terminal_controls(self) -> None:
+        buffer = (
+            "\x1b[32mOpen this URL:\x1b[0m "
+            "https://auth.openai.com/codex/device\n"
+            "Code: ABCD-12345\n"
+        )
+
+        url, code = subscription_link.extract_public_device_code(buffer)
+
+        self.assertEqual(url, "https://auth.openai.com/codex/device")
+        self.assertEqual(code, "ABCD-12345")
+
+    def test_start_chatgpt_link_dedupes_active_session(self) -> None:
+        client = _FakePlatformClient()
+        launched: list[Callable[[], None]] = []
+
+        first = subscription_link.start_chatgpt_link(
+            {"session_id": "sess-dedupe"},
+            client=client,
+            launcher=launched.append,
+        )
+        second = subscription_link.start_chatgpt_link(
+            {"session_id": "sess-dedupe"},
+            client=client,
+            launcher=launched.append,
+        )
+
+        try:
+            self.assertEqual(first["state"], "started")
+            self.assertEqual(second["state"], "already_running")
+            self.assertEqual(len(launched), 1)
+        finally:
+            with subscription_link._active_lock:
+                subscription_link._active_sessions.discard("sess-dedupe")
 
 
 class LauncherTests(unittest.TestCase):
@@ -1301,6 +1458,107 @@ class PlatformLoopTests(unittest.TestCase):
             "no_assignment_restart",
         )
 
+    def test_heartbeat_includes_private_access_report(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.private_access,
+                "private_access_report",
+                return_value={
+                    "provider": "tailscale",
+                    "state": "ready",
+                    "tailnet_ip": "100.101.102.103",
+                },
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_status",
+                return_value={"state": "ready"},
+            ),
+        ):
+            result = loop._post_heartbeat(assigned=False)
+
+        self.assertEqual(result, {})
+        self.assertEqual(client.posts[0][0], "/hapi/v1/computers/me/heartbeat")
+        payload = client.posts[0][1]
+        self.assertFalse(payload["metrics"]["assigned"])
+        self.assertEqual(
+            payload["metrics"]["private_access"]["tailnet_ip"],
+            "100.101.102.103",
+        )
+
+    def test_subscription_runtime_verification_uses_models_status(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with patch.object(
+            platform_loop.openclaw_adapter,
+            "models_status",
+            return_value={
+                "state": "ready",
+                "models": {
+                    "defaultModel": "openai/gpt-5.5",
+                    "resolvedDefault": "openai/gpt-5.5",
+                },
+            },
+        ):
+            loop._report_subscription_runtime_verification(
+                {
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                }
+            )
+
+        self.assertEqual(
+            client.posts,
+            [
+                (
+                    "/hapi/v1/computers/me/subscription-link/runtime-verification",
+                    {
+                        "expected_model_ref": "openai/gpt-5.5",
+                        "observed_model_ref": "openai/gpt-5.5",
+                        "command": "openclaw models status --json",
+                        "verified": True,
+                    },
+                )
+            ],
+        )
+
+    def test_subscription_runtime_verification_reports_unknown_status_shape(
+        self,
+    ) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "models_status",
+                return_value={"state": "ready", "models": {"models": []}},
+            ),
+            self.assertLogs(platform_loop.LOG, level="WARNING") as logs,
+        ):
+            loop._report_subscription_runtime_verification(
+                {
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                }
+            )
+
+        self.assertIn("did not expose a default model", "\n".join(logs.output))
+        payload = client.posts[0][1]
+        self.assertIsNone(payload["observed_model_ref"])
+        self.assertFalse(payload["verified"])
+        self.assertIn("shape=top=models,state;models=models", payload["detail"])
+
     def test_binding_activation_treats_existing_active_state_as_idempotent(
         self,
     ) -> None:
@@ -1739,6 +1997,43 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         payload = openclaw_adapter.gateway_health(runner=runner)
         self.assertEqual(payload["state"], "healthy")
         self.assertEqual(runner.call_args.args[0][:3], ["openclaw", "gateway", "health"])
+
+    def test_adapter_spawns_official_device_code_command(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        process = object()
+        with (
+            patch.object(
+                openclaw_adapter,
+                "openclaw_env",
+                return_value={"HOME": "/tmp/state"},
+            ),
+            patch.object(
+                openclaw_adapter.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            result = openclaw_adapter.spawn_models_auth_login_device_code(
+                stdin=1,
+                stdout=2,
+                stderr=3,
+            )
+
+        self.assertIs(result, process)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "openclaw",
+                "models",
+                "auth",
+                "login",
+                "--provider",
+                "openai",
+                "--device-code",
+            ],
+        )
+        self.assertEqual(popen.call_args.kwargs["env"], {"HOME": "/tmp/state"})
 
     def test_rebuild_adapter_commands_use_official_openclaw_surfaces(self) -> None:
         from tinyhat_runtime import openclaw_adapter
