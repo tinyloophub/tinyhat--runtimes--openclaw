@@ -18,6 +18,7 @@ from . import (
     openclaw_adapter,
     paths,
     platform_loop,
+    private_access,
 )
 from .command_ledger import CommandLedger
 from .platform_client import backend_audience_from_env, platform_base_url_from_env
@@ -137,6 +138,12 @@ def _cmd_platform_warm_config(args: argparse.Namespace) -> int:
     return 0 if payload.get("state") == "ready" else 1
 
 
+def _cmd_private_access_enroll(_args: argparse.Namespace) -> int:
+    payload = private_access.enroll_from_env()
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("state") in {"disabled", "ready"} else 1
+
+
 def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
     payload = hot_image.preinstall_hot_image_plugins()
     print(json.dumps(payload, sort_keys=True))
@@ -216,6 +223,14 @@ def build_parser() -> argparse.ArgumentParser:
     warm_config.add_argument("--platform-base-url")
     warm_config.add_argument("--backend-audience")
     warm_config.set_defaults(func=_cmd_platform_warm_config)
+
+    private_access_parser = subparsers.add_parser("private-access")
+    private_access_sub = private_access_parser.add_subparsers(
+        dest="private_access_command",
+        required=True,
+    )
+    private_access_enroll = private_access_sub.add_parser("enroll")
+    private_access_enroll.set_defaults(func=_cmd_private_access_enroll)
 
     bake = subparsers.add_parser("bake")
     bake_sub = bake.add_subparsers(dest="bake_command", required=True)

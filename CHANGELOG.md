@@ -7,6 +7,13 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Added
+
+- Add tiny-runtime Tailscale enrollment/reporting for `tiny_runtime_bundle`
+  Computers so hot-pool rows become private-access-ready before assignment.
+- Add the tiny-runtime ChatGPT/Codex device-code worker and runtime model-status
+  verification using OpenClaw's official CLI surfaces.
+
 ## 0.16.0
 
 Minor release for the Tinyloop v0.16 `tiny_runtime` release train.
