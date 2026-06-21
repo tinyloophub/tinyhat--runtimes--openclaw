@@ -7,6 +7,28 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.2
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This lets
+Computers that booted from the tiny-runtime image repair missing Tailscale
+private access without falling back to legacy supervisor behavior.
+
+### Added
+
+- Add the `enroll_private_access` tiny-runtime command, allowing the Computer
+  to fetch a fresh one-time Tailscale enrollment payload through its
+  Computer-authenticated platform channel and report the sanitized result back
+  to the command ledger.
+
+### Fixed
+
+- Ensure private-access repair never requests an OpenClaw or runtime gateway
+  restart, keeping the no-destructive-restart-loop invariant for the v0.16
+  tiny-runtime model.
+- Keep Tailscale auth material out of local command mirrors and runtime command
+  results while still reporting `ready`/`tailnet_ip` state for admin
+  assignment gates.
+
 ## 0.16.1
 
 Patch release for the Tinyloop v0.16 `tiny_runtime` train. This keeps
