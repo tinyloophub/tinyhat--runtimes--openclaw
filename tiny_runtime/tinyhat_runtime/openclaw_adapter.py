@@ -44,6 +44,11 @@ class AdapterResult:
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
+TINYHAT_PLUGIN_ID = "tinyhat"
+TINYHAT_PLUGIN_REPO_URL = "https://github.com/tinyhat-ai/tinyhat.git"
+TINYHAT_PLUGIN_REPO_REF = "main"
+TINYHAT_PLUGIN_MARKER = "tinyhat-plugin.version"
+
 
 def openclaw_env(
     *,
@@ -135,6 +140,322 @@ def install_plugin(source: str, *, runner: Runner = subprocess.run) -> dict[str,
     return {"state": "ready", "detail": result.public_summary()}
 
 
+def _run_host_command(
+    args: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 120,
+    runner: Runner = subprocess.run,
+) -> AdapterResult:
+    argv = tuple(args)
+    try:
+        completed = runner(
+            list(argv),
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return AdapterResult(command=argv, returncode=127, stdout="", stderr=str(exc))
+    return AdapterResult(
+        command=argv,
+        returncode=int(completed.returncode),
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+    )
+
+
+def _plugin_checkout_dir() -> Path:
+    configured = (os.environ.get("TINYHAT_PLUGIN_CHECKOUT_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    return paths.OPENCLAW_STATE_DIR / "platform-plugins" / TINYHAT_PLUGIN_ID
+
+
+def _plugin_marker_path() -> Path:
+    return paths.OPENCLAW_STATE_DIR / TINYHAT_PLUGIN_MARKER
+
+
+def _plugin_version(checkout: Path) -> str:
+    package_json = checkout / "package.json"
+    if not package_json.exists():
+        return "unknown"
+    try:
+        payload = json.loads(package_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return "unknown"
+    if not isinstance(payload, dict):
+        return "unknown"
+    return str(payload.get("version") or "unknown")
+
+
+def _tinyhat_plugin_contract(binding: dict[str, Any]) -> dict[str, Any]:
+    platform = binding.get("tinyhat_platform")
+    if not isinstance(platform, dict):
+        return {}
+    plugin = platform.get("plugin")
+    return plugin if isinstance(plugin, dict) else {}
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _tinyhat_plugin_source(binding: dict[str, Any]) -> dict[str, str | None]:
+    plugin = _tinyhat_plugin_contract(binding)
+    repo_url = (
+        _text(os.environ.get("TINYHAT_PLATFORM_PLUGIN_REPO_URL"))
+        or _text(plugin.get("repo_url"))
+        or TINYHAT_PLUGIN_REPO_URL
+    )
+    requested_ref = (
+        _text(os.environ.get("TINYHAT_PLATFORM_PLUGIN_REPO_REF"))
+        or _text(plugin.get("repo_ref"))
+        or _text(plugin.get("requested_ref"))
+        or _text(plugin.get("version"))
+        or TINYHAT_PLUGIN_REPO_REF
+    )
+    resolved_sha = _text(plugin.get("resolved_commit_sha")) or None
+    checkout_ref = resolved_sha or requested_ref or TINYHAT_PLUGIN_REPO_REF
+    return {
+        "plugin_id": _text(plugin.get("id")) or TINYHAT_PLUGIN_ID,
+        "repo_url": repo_url,
+        "requested_ref": requested_ref,
+        "resolved_commit_sha": resolved_sha,
+        "checkout_ref": checkout_ref,
+    }
+
+
+def _read_tinyhat_plugin_marker() -> dict[str, Any]:
+    try:
+        payload = json.loads(_plugin_marker_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _marker_matches_source(
+    marker: dict[str, Any],
+    source: dict[str, str | None],
+) -> bool:
+    if marker.get("plugin_id") != TINYHAT_PLUGIN_ID:
+        return False
+    if marker.get("repo_url") != source.get("repo_url"):
+        return False
+    source_sha = source.get("resolved_commit_sha")
+    if source_sha:
+        return marker.get("resolved_commit_sha") == source_sha
+    return marker.get("requested_ref") == source.get("requested_ref") or marker.get(
+        "repo_ref"
+    ) == source.get("requested_ref")
+
+
+def _write_tinyhat_plugin_marker(
+    *,
+    source: dict[str, str | None],
+    checkout: Path,
+    resolved_sha: str,
+) -> None:
+    marker = _plugin_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "schema": "tinyhat_plugin_install_marker_v1",
+        "plugin_id": TINYHAT_PLUGIN_ID,
+        "repo_url": source.get("repo_url"),
+        "repo_ref": source.get("checkout_ref"),
+        "requested_ref": source.get("requested_ref"),
+        "resolved_commit_sha": resolved_sha,
+        "version": _plugin_version(checkout),
+        "checkout_dir": str(checkout),
+    }
+    marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _git_stdout(
+    args: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 120,
+    runner: Runner = subprocess.run,
+) -> tuple[str | None, dict[str, Any] | None]:
+    result = _run_host_command(args, cwd=cwd, timeout=timeout, runner=runner)
+    if not result.ok:
+        return None, result.public_summary()
+    return result.stdout.strip(), None
+
+
+def _latest_git_tag(
+    checkout: Path,
+    *,
+    runner: Runner = subprocess.run,
+) -> str | None:
+    stdout, detail = _git_stdout(
+        ("git", "tag", "--sort=-v:refname"),
+        cwd=checkout,
+        runner=runner,
+    )
+    if detail is not None or not stdout:
+        return None
+    for line in stdout.splitlines():
+        tag = line.strip()
+        if tag:
+            return tag
+    return None
+
+
+def _default_remote_ref(
+    checkout: Path,
+    *,
+    runner: Runner = subprocess.run,
+) -> str:
+    stdout, detail = _git_stdout(
+        ("git", "rev-parse", "--abbrev-ref", "origin/HEAD"),
+        cwd=checkout,
+        runner=runner,
+    )
+    if detail is None and stdout and stdout.startswith("origin/"):
+        return stdout
+    return "origin/main"
+
+
+def _checkout_tinyhat_plugin(
+    source: dict[str, str | None],
+    *,
+    runner: Runner = subprocess.run,
+) -> tuple[Path | None, str | None, dict[str, Any] | None]:
+    checkout = _plugin_checkout_dir()
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    repo_url = str(source.get("repo_url") or TINYHAT_PLUGIN_REPO_URL)
+    if (checkout / ".git").exists():
+        set_url = _run_host_command(
+            ("git", "remote", "set-url", "origin", repo_url),
+            cwd=checkout,
+            runner=runner,
+        )
+        if not set_url.ok:
+            return None, None, set_url.public_summary()
+        fetch = _run_host_command(
+            ("git", "fetch", "--tags", "--prune", "origin"),
+            cwd=checkout,
+            runner=runner,
+        )
+        if not fetch.ok:
+            return None, None, fetch.public_summary()
+    else:
+        if checkout.exists():
+            return None, None, {"error": f"plugin checkout exists but is not a git repo: {checkout}"}
+        clone = _run_host_command(("git", "clone", repo_url, str(checkout)), runner=runner)
+        if not clone.ok:
+            return None, None, clone.public_summary()
+
+    checkout_ref = str(source.get("checkout_ref") or TINYHAT_PLUGIN_REPO_REF)
+    if checkout_ref == "latest":
+        checkout_ref = _latest_git_tag(checkout, runner=runner) or _default_remote_ref(
+            checkout,
+            runner=runner,
+        )
+    checkout_result = _run_host_command(
+        ("git", "checkout", checkout_ref),
+        cwd=checkout,
+        runner=runner,
+    )
+    if not checkout_result.ok:
+        return None, None, checkout_result.public_summary()
+    remote_ref = f"origin/{checkout_ref}"
+    remote_sha, _detail = _git_stdout(
+        ("git", "rev-parse", "--verify", f"{remote_ref}^{{commit}}"),
+        cwd=checkout,
+        runner=runner,
+    )
+    if remote_sha:
+        reset = _run_host_command(
+            ("git", "reset", "--hard", remote_ref),
+            cwd=checkout,
+            runner=runner,
+        )
+        if not reset.ok:
+            return None, None, reset.public_summary()
+    resolved_sha, detail = _git_stdout(
+        ("git", "rev-parse", "HEAD"),
+        cwd=checkout,
+        runner=runner,
+    )
+    if detail is not None:
+        return None, None, detail
+    return checkout, resolved_sha, None
+
+
+def materialize_tinyhat_plugin(
+    binding: dict[str, Any],
+    *,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    """Make the public Tinyhat OpenClaw plugin available before activation."""
+    source = _tinyhat_plugin_source(binding)
+    if source.get("plugin_id") != TINYHAT_PLUGIN_ID:
+        return {
+            "state": "failed",
+            "detail": f"unsupported Tinyhat plugin id: {source.get('plugin_id')}",
+        }
+
+    existing = inspect_plugin(TINYHAT_PLUGIN_ID, runner=runner)
+    marker = _read_tinyhat_plugin_marker()
+    if existing.get("state") == "ready" and _marker_matches_source(marker, source):
+        return {
+            "state": "ready",
+            "action": "skipped",
+            "source": redact_json(source),
+            "plugin": existing,
+            "marker": redact_json(marker),
+        }
+
+    checkout, resolved_sha, checkout_error = _checkout_tinyhat_plugin(
+        source,
+        runner=runner,
+    )
+    if checkout_error is not None or checkout is None or not resolved_sha:
+        return {
+            "state": "failed",
+            "stage": "checkout",
+            "source": redact_json(source),
+            "detail": checkout_error or "checkout did not resolve a commit",
+        }
+    install = install_plugin(str(checkout), runner=runner)
+    if install.get("state") != "ready":
+        return {
+            "state": "failed",
+            "stage": "install",
+            "source": redact_json(source),
+            "resolved_commit_sha": resolved_sha,
+            "detail": install,
+        }
+    inspected = inspect_plugin(TINYHAT_PLUGIN_ID, runner=runner)
+    if inspected.get("state") != "ready":
+        return {
+            "state": "failed",
+            "stage": "inspect",
+            "source": redact_json(source),
+            "resolved_commit_sha": resolved_sha,
+            "detail": inspected,
+        }
+    _write_tinyhat_plugin_marker(
+        source=source,
+        checkout=checkout,
+        resolved_sha=resolved_sha,
+    )
+    return {
+        "state": "ready",
+        "action": "installed",
+        "source": redact_json(source),
+        "resolved_commit_sha": resolved_sha,
+        "checkout_dir": str(checkout),
+        "install": install,
+        "plugin": inspected,
+    }
+
+
 def config_patch(
     patch: dict[str, Any],
     *,
@@ -166,6 +487,19 @@ def config_patch(
 def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     result = run_openclaw(("gateway", "health", "--json"), runner=runner)
     if not result.ok:
+        try:
+            payload = result.json_payload()
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        if (
+            payload.get("gateway", {}).get("reachable") is True
+            and payload.get("error", {}).get("type") == "gateway_credentials_required"
+        ):
+            return {
+                "state": "healthy",
+                "gateway": redact_json(payload),
+                "readiness": "reachable_auth_required",
+            }
         return {"state": "unhealthy", "detail": result.public_summary()}
     return {"state": "healthy", "gateway": redact_json(result.json_payload())}
 
@@ -517,12 +851,21 @@ def apply_binding_config(
         binding_secrets_payload(binding),
         merge=preserve_existing_secrets,
     )
+    plugin_result = materialize_tinyhat_plugin(binding, runner=runner)
+    if plugin_result.get("state") != "ready":
+        return {
+            "state": "failed",
+            "stage": "tinyhat_plugin",
+            "secrets": secrets_result,
+            "tinyhat_plugin": plugin_result,
+        }
     patch_result = config_patch(
         patch,
         replace_paths=("channels.telegram",),
         runner=runner,
     )
     patch_result["secrets"] = secrets_result
+    patch_result["tinyhat_plugin"] = plugin_result
     return patch_result
 
 

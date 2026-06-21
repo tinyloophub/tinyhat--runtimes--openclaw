@@ -1,19 +1,25 @@
 # Local development for the Tinyhat Computer runtime
 
 This directory holds the local development surface for the
-Tinyhat Computer runtime: a Docker image that runs the same
-`supervisor.py` and the real OpenClaw npm package, pointed at a
-dev backend instead of a production GCE VM.
+Tinyhat Computer runtime: a Docker image that can run either the
+legacy `supervisor.py` loop or the v0.16 `tiny_runtime` platform
+loop with the real OpenClaw npm package, pointed at a dev backend
+instead of a production GCE VM.
 
 The goal is to let runtime contributors (and the agents who help
-them) iterate on `supervisor.py` without provisioning a fresh GCE
-Computer for every test.
+them) iterate on Computer-side runtime behavior without provisioning
+a fresh GCE Computer for every test.
+
+For new v0.16 work, use `TINYHAT_RUNTIME_MODE=tiny_runtime`. The
+legacy supervisor mode remains available for compatibility tests and
+older component-update flows that still target `supervisor.py`.
 
 ## What "dev mode" means here
 
-The supervisor is the same file the GCE bootstrap clones at boot.
-When `TINYHAT_DEV_RUNTIME=1` is set in its environment, four
-production-only paths are swapped for local equivalents:
+In legacy supervisor mode, the supervisor is the same file the source
+bootstrap path used to clone at boot. When `TINYHAT_DEV_RUNTIME=1`
+is set in its environment, four production-only paths are swapped for
+local equivalents:
 
 | Production | Dev mode |
 | --- | --- |
@@ -22,7 +28,17 @@ production-only paths are swapped for local equivalents:
 | Fetches a Google-signed VM identity JWT from the metadata server and sends it as `Authorization: Bearer …`. | Sends a constant marker bearer. The platform's `computer_identity_verifier` ignores the bearer body entirely when `DEV_AUTO_COMPUTER_ID` is set under `ENV=development`. |
 | Runs the OpenClaw gateway as a `systemd` unit (`tinyhat-openclaw-gateway.service`). Health probe reads `journalctl`. | Runs `openclaw gateway run …` as a subprocess of the supervisor. Health probe tails a flat log file under `$TINYHAT_RUNTIME_HOME`. |
 
-Everything else — the `/me/state` → `/me/binding` → `write_openclaw_config` → `start_openclaw_gateway` → `/me/heartbeat` state machine, the rebind watchdog, the OpenClaw config shape — is identical to production. That's the point: any change to `supervisor.py` that breaks the dev loop will break the prod loop too.
+Everything else in that mode — the `/me/state` → `/me/binding` →
+`write_openclaw_config` → `start_openclaw_gateway` → `/me/heartbeat`
+state machine, the rebind watchdog, the OpenClaw config shape — is
+kept for compatibility testing.
+
+In `TINYHAT_RUNTIME_MODE=tiny_runtime`, the dev entrypoint starts the
+isolated tiny runtime platform loop instead. That is the preferred
+mode for v0.16+ work because it matches the image-owned runtime model:
+OpenClaw gateway process ownership stays outside platform binding
+logic, and the platform loop only applies config, reports state, and
+dispatches safe runtime commands.
 
 Runtime secrets follow the production path too. When the supervisor
 receives an `apply_config` heartbeat command, it writes the Computer's
@@ -88,11 +104,12 @@ real OpenAI device code or mutate a ChatGPT account.
 
 ## Run
 
-The minimum env the supervisor needs:
+The minimum env the dev runtime needs:
 
 ```bash
 docker run --rm -it \
   -e TINYHAT_DEV_RUNTIME=1 \
+  -e TINYHAT_RUNTIME_MODE=tiny_runtime \
   -e TINYHAT_PLATFORM_BASE_URL=https://<your-dev-base-url> \
   -e TINYHAT_BACKEND_AUDIENCE=https://<your-dev-base-url> \
   tinyhat-openclaw-runtime:dev
@@ -110,6 +127,15 @@ docker run --rm -it \
   at `main`.
 - The platform must have a `tinyhat_computers` row in `state=ready`
   with `DEV_AUTO_COMPUTER_ID=<that row id>` in its environment.
+
+In `tiny_runtime` mode the entrypoint starts `openclaw gateway run`
+as a background process, then runs `python3 -m tinyhat_runtime.main
+platform loop`. That exercises the isolated tiny runtime path: the
+loop posts ready/active/heartbeat, receives `apply_config` and
+`start_chatgpt_link` commands, and does not use `supervisor.py`.
+The dev platform client sends the same `dev-runtime` marker bearer
+used by the platform's development-only Computer verifier; production
+deployments still use the GCE metadata identity token path.
 
 Live edits to `supervisor.py`: mount the host file into the image
 at the same path:
