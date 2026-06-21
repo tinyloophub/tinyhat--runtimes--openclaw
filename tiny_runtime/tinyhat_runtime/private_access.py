@@ -27,7 +27,9 @@ def _status_path() -> Path:
     return Path(os.environ.get("TINYHAT_PRIVATE_ACCESS_STATUS_PATH") or STATUS_PATH)
 
 
-def _write_status(payload: dict[str, Any], *, path: Path | None = None) -> dict[str, Any]:
+def _write_status(
+    payload: dict[str, Any], *, path: Path | None = None
+) -> dict[str, Any]:
     target = path or _status_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
@@ -67,7 +69,53 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     source bootstrap block that historically ran ``tailscale up``.
     """
 
-    provider = (os.environ.get("TINYHAT_PRIVATE_ACCESS_PROVIDER") or "").strip().lower()
+    return enroll_from_config(
+        provider=os.environ.get("TINYHAT_PRIVATE_ACCESS_PROVIDER"),
+        auth_key=os.environ.get("TINYHAT_TAILSCALE_AUTH_KEY"),
+        node_name=os.environ.get("TINYHAT_TAILSCALE_NODE_NAME"),
+        tags=os.environ.get("TINYHAT_TAILSCALE_TAGS"),
+        ssh_enabled=_truthy_env("TINYHAT_TAILSCALE_SSH", default=True),
+        runner=runner,
+    )
+
+
+def enroll_from_payload(
+    payload: dict[str, Any],
+    *,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    """Enroll using a one-time platform-issued payload.
+
+    Runtime commands use this path so the Tailscale auth key is pulled directly
+    by the authenticated Computer and never lands in the platform command
+    ledger or the local command SQLite mirror.
+    """
+
+    tags = payload.get("tailscale_tags")
+    if isinstance(tags, list):
+        tags = ",".join(str(tag).strip() for tag in tags if str(tag).strip())
+    return enroll_from_config(
+        provider=payload.get("provider"),
+        auth_key=payload.get("tailscale_auth_key"),
+        node_name=payload.get("tailscale_node_name"),
+        tags=tags,
+        ssh_enabled=bool(payload.get("tailscale_ssh", True)),
+        runner=runner,
+    )
+
+
+def enroll_from_config(
+    *,
+    provider: Any,
+    auth_key: Any,
+    node_name: Any,
+    tags: Any = None,
+    ssh_enabled: bool = True,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    """Enroll into the configured private-access provider."""
+
+    provider = str(provider or "").strip().lower()
     if provider != "tailscale":
         return _write_status(
             {
@@ -77,9 +125,9 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
             }
         )
 
-    auth_key = (os.environ.get("TINYHAT_TAILSCALE_AUTH_KEY") or "").strip()
-    node_name = (os.environ.get("TINYHAT_TAILSCALE_NODE_NAME") or "").strip()
-    tags = (os.environ.get("TINYHAT_TAILSCALE_TAGS") or "").strip()
+    auth_key = str(auth_key or "").strip()
+    node_name = str(node_name or "").strip()
+    tags = str(tags or "").strip()
     if not auth_key or not node_name:
         return _write_status(
             {
@@ -134,7 +182,6 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
         secret_dir.chmod(0o700)
     except OSError:
         pass
-    ssh_enabled = _truthy_env("TINYHAT_TAILSCALE_SSH", default=True)
     with tempfile.NamedTemporaryFile(
         "w",
         prefix="tailscale-auth.",
@@ -199,11 +246,15 @@ def private_access_report(*, runner: Runner = subprocess.run) -> dict[str, Any] 
     """Return a heartbeat-safe private-access report."""
 
     bootstrap = _load_bootstrap_status()
-    provider = str(
-        bootstrap.get("provider")
-        or os.environ.get("TINYHAT_PRIVATE_ACCESS_PROVIDER")
-        or ""
-    ).strip().lower()
+    provider = (
+        str(
+            bootstrap.get("provider")
+            or os.environ.get("TINYHAT_PRIVATE_ACCESS_PROVIDER")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     if provider != "tailscale":
         return None
 
@@ -231,7 +282,9 @@ def private_access_report(*, runner: Runner = subprocess.run) -> dict[str, Any] 
             **base,
             "state": "unreachable",
             "diagnostic_code": "tailscale_status_failed",
-            "diagnostic": redact_text((result.stderr or result.stdout or "").strip())[:500],
+            "diagnostic": redact_text((result.stderr or result.stdout or "").strip())[
+                :500
+            ],
         }
 
     try:
@@ -253,7 +306,11 @@ def private_access_report(*, runner: Runner = subprocess.run) -> dict[str, Any] 
 
     self_node = payload.get("Self") if isinstance(payload.get("Self"), dict) else {}
     ips = self_node.get("TailscaleIPs")
-    tailnet_ip = next((str(ip).strip() for ip in ips if str(ip).strip()), None) if isinstance(ips, list) else None
+    tailnet_ip = (
+        next((str(ip).strip() for ip in ips if str(ip).strip()), None)
+        if isinstance(ips, list)
+        else None
+    )
     node_name = (
         str(self_node.get("HostName") or "").strip()
         or str(base.get("node_name") or "").strip()
