@@ -582,7 +582,11 @@ ensure_runtime_user
 hard_reset_openclaw_user_state_layout
 mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access "${TINYHAT_RUNTIME_LOG_ROOT}"
 chown_runtime_paths
-enroll_private_access_from_platform_source
+if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then
+  enroll_private_access_from_platform_source
+else
+  echo "[tinyhat-runtime] source reinstall will enroll private access after installing tiny_runtime"
+fi
 
 if [[ -n "${OPENCLAW_INSTALL_SPEC}" ]]; then
   if install_openclaw_framework_package "${OPENCLAW_INSTALL_SPEC}"; then

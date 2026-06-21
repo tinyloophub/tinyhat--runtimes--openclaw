@@ -267,6 +267,56 @@ class PrivateAccessTests(unittest.TestCase):
                 (status_path.parent / "secrets").stat().st_mode & 0o777, 0o700
             )
 
+    def test_enroll_from_payload_never_persists_one_time_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "bootstrap-status.json"
+            calls: list[list[str]] = []
+
+            def fake_runner(args, **_kwargs):
+                argv = list(args)
+                calls.append(argv)
+                if argv[:2] == ["tailscale", "up"]:
+                    auth_arg = next(
+                        arg for arg in argv if arg.startswith("--auth-key=file:")
+                    )
+                    auth_path = Path(auth_arg.removeprefix("--auth-key=file:"))
+                    self.assertEqual(
+                        auth_path.read_text(encoding="utf-8"), "tskey-secret"
+                    )
+                return _Completed(returncode=0, stdout="ok\n")
+
+            def fake_which(name: str) -> str | None:
+                if name == "tailscale":
+                    return "/usr/bin/tailscale"
+                if name == "systemctl":
+                    return None
+                return None
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"TINYHAT_PRIVATE_ACCESS_STATUS_PATH": str(status_path)},
+                    clear=False,
+                ),
+                patch.object(private_access.shutil, "which", side_effect=fake_which),
+            ):
+                result = private_access.enroll_from_payload(
+                    {
+                        "provider": "tailscale",
+                        "tailscale_auth_key": "tskey-secret",
+                        "tailscale_node_name": "computer-abc123ef",
+                        "tailscale_tags": ["tag:tinyhat-computer"],
+                        "tailscale_ssh": True,
+                    },
+                    runner=fake_runner,
+                )
+
+            status_text = status_path.read_text(encoding="utf-8")
+            self.assertEqual(result["state"], "ready")
+            self.assertIn("--advertise-tags=tag:tinyhat-computer", calls[-1])
+            self.assertNotIn("tskey-secret", repr(result))
+            self.assertNotIn("tskey-secret", status_text)
+
     def test_private_access_report_parses_tailscale_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             status_path = Path(tmp) / "bootstrap-status.json"
@@ -2107,6 +2157,15 @@ class SystemdUnitTests(unittest.TestCase):
         )
         self.assertIn("private-access enroll-platform", script)
         self.assertIn("PYTHONPATH=\"${RUNTIME_DIR}/tiny_runtime\"", script)
+        self.assertIn(
+            'if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then\n'
+            "  enroll_private_access_from_platform_source\n"
+            "else\n"
+            "  echo \"[tinyhat-runtime] source reinstall will enroll private "
+            "access after installing tiny_runtime\"\n"
+            "fi",
+            script,
+        )
         self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
         self.assertNotIn("TAILSCALE_AUTH_KEY", script)
         self.assertNotIn("tailscale_auth_file", script)

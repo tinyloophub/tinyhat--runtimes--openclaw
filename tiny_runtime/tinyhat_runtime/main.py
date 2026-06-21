@@ -21,8 +21,11 @@ from . import (
     private_access,
 )
 from .command_ledger import CommandLedger
-from .platform_client import backend_audience_from_env, platform_base_url_from_env
-from .platform_client import default_platform_client
+from .platform_client import (
+    backend_audience_from_env,
+    default_platform_client,
+    platform_base_url_from_env,
+)
 from .runtime_commands import RuntimeCommandRunner, load_command_file
 
 
