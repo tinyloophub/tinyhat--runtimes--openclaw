@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import attestation, bundle, launcher, openclaw_adapter, paths
+from . import attestation, bundle, launcher, openclaw_adapter, paths, private_access
 from .command_ledger import (
     TERMINAL_STATUSES,
     CommandLedger,
@@ -25,6 +25,7 @@ ALLOWED_COMMAND_KINDS = frozenset(
         "apply_config",
         "link_chatgpt",
         "rebuild_app_layer",
+        "enroll_private_access",
     }
 )
 FAILURE_CODES = frozenset(
@@ -39,6 +40,7 @@ FAILURE_CODES = frozenset(
         "canceled",
         "config_apply_failed",
         "diagnostics_export_failed",
+        "private_access_enroll_failed",
         "idempotency_mismatch",
         "invalid_command",
         "link_chatgpt_failed",
@@ -217,6 +219,8 @@ class RuntimeCommandRunner:
                 return self._link_chatgpt(command)
             if kind == "rebuild_app_layer":
                 return self._rebuild_app_layer(command)
+            if kind == "enroll_private_access":
+                return self._enroll_private_access(command)
         except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
             return self._finish(
                 command_id=command_id,
@@ -304,7 +308,9 @@ class RuntimeCommandRunner:
                 status="rolled_back" if rollback and rollback.activated else "failed",
                 phase="attestation_gate",
                 failure_code=(
-                    "attestation_failed" if rollback and rollback.activated else "rollback_failed"
+                    "attestation_failed"
+                    if rollback and rollback.activated
+                    else "rollback_failed"
                 ),
                 result=result_payload,
             )
@@ -319,7 +325,9 @@ class RuntimeCommandRunner:
                 status="rolled_back" if rollback and rollback.activated else "failed",
                 phase="attestation_gate",
                 failure_code=(
-                    "attestation_mismatch" if rollback and rollback.activated else "rollback_failed"
+                    "attestation_mismatch"
+                    if rollback and rollback.activated
+                    else "rollback_failed"
                 ),
                 result=result_payload,
             )
@@ -416,7 +424,9 @@ class RuntimeCommandRunner:
         revision = int(payload.get("revision") or desired_revision)
         raw_secrets = payload.get("secrets") or {}
         if not isinstance(raw_secrets, dict):
-            raise RuntimeCommandError("/me/runtime-secrets returned a non-object secrets map")
+            raise RuntimeCommandError(
+                "/me/runtime-secrets returned a non-object secrets map"
+            )
         secrets = {str(key): str(value) for key, value in raw_secrets.items()}
 
         self.ledger.update(command_id, status="running", phase="check_hot_support")
@@ -703,6 +713,71 @@ class RuntimeCommandRunner:
             result=result_payload,
         )
 
+    def _enroll_private_access(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id, idempotency_key, kind = _ids(command)
+        if self.platform_get_json is None:
+            raise RuntimeCommandError("platform_get_json callback is required")
+
+        self.ledger.update(command_id, status="running", phase="pull_enrollment")
+        try:
+            payload = self.platform_get_json(
+                "/hapi/v1/computers/me/private-access/enrollment"
+            )
+        except RuntimeCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - platform boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="pull_enrollment",
+                failure_code="private_access_enroll_failed",
+                result={
+                    "detail": redact_text(str(exc), limit=1000),
+                    "restart_requested": False,
+                    "systemd_restart_requested": False,
+                },
+            )
+
+        self.ledger.update(command_id, status="running", phase="tailscale_up")
+        try:
+            enrollment = private_access.enroll_from_payload(payload)
+            report = private_access.private_access_report()
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="tailscale_up",
+                failure_code="private_access_enroll_failed",
+                result={
+                    "detail": redact_text(str(exc), limit=1000),
+                    "restart_requested": False,
+                    "systemd_restart_requested": False,
+                },
+            )
+        result_access = report if isinstance(report, dict) else enrollment
+        state = str(result_access.get("state") or "").strip().lower()
+        tailnet_ip = str(result_access.get("tailnet_ip") or "").strip()
+        applied = state == "ready" and bool(tailnet_ip)
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied" if applied else "failed",
+            phase="tailscale_ready" if applied else "tailscale_up",
+            failure_code=None if applied else "private_access_enroll_failed",
+            result={
+                "provider": "tailscale",
+                "enrollment": enrollment,
+                "private_access": result_access,
+                "restart_requested": False,
+                "systemd_restart_requested": False,
+            },
+        )
+
     def _bundle_dir_for_id(self, bundle_id: str) -> Path:
         if not bundle_id.startswith("sha256:"):
             raise RuntimeCommandError("bundle_id must use sha256:<hex> format")
@@ -725,7 +800,9 @@ class RuntimeCommandRunner:
             openclaw=openclaw_adapter.adapter_attestation(),
         )
 
-    def _rollback_to_previous(self, previous_target: str | None) -> launcher.ActivationResult | None:
+    def _rollback_to_previous(
+        self, previous_target: str | None
+    ) -> launcher.ActivationResult | None:
         if not previous_target:
             return None
         return launcher.activate_bundle(
@@ -738,7 +815,10 @@ class RuntimeCommandRunner:
 
     @staticmethod
     def _cancel_requested(command: dict[str, Any]) -> bool:
-        return bool(command.get("cancel_requested") is True or command.get("cancel_requested_at"))
+        return bool(
+            command.get("cancel_requested") is True
+            or command.get("cancel_requested_at")
+        )
 
     def _finish(
         self,
