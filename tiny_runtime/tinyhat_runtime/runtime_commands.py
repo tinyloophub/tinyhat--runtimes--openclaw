@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -45,6 +46,7 @@ FAILURE_CODES = frozenset(
         "invalid_command",
         "link_chatgpt_failed",
         "rollback_failed",
+        "tinyhat_plugin_failed",
         "unsupported_kind",
     }
 )
@@ -639,6 +641,22 @@ class RuntimeCommandRunner:
                 result=result_payload,
             )
 
+        self.ledger.update(command_id, status="running", phase="tinyhat_plugin")
+        tinyhat_plugin = openclaw_adapter.materialize_tinyhat_plugin(
+            _plugin_binding_from_manifest(manifest)
+        )
+        result_payload["tinyhat_plugin"] = tinyhat_plugin
+        if tinyhat_plugin.get("state") != "ready":
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="tinyhat_plugin",
+                failure_code="tinyhat_plugin_failed",
+                result=result_payload,
+            )
+
         self.ledger.update(command_id, status="running", phase="reactivate_bundle")
         activation = launcher.activate_bundle(
             bundle_dir,
@@ -865,6 +883,29 @@ def _spec(command: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise RuntimeCommandError("command spec must be a JSON object")
     return spec
+
+
+def _plugin_binding_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    components = manifest.get("components")
+    plugin = (
+        components.get("tinyhat_openclaw_plugin")
+        if isinstance(components, dict)
+        else None
+    )
+    plugin = plugin if isinstance(plugin, dict) else {}
+    plugin_ref = str(plugin.get("ref") or "").strip()
+    plugin_contract: dict[str, str] = {
+        "id": "tinyhat",
+        "repo_url": str(
+            plugin.get("repo") or "https://github.com/tinyhat-ai/tinyhat.git"
+        ),
+    }
+    if plugin_ref:
+        plugin_contract["repo_ref"] = plugin_ref
+        plugin_contract["requested_ref"] = plugin_ref
+        if re.fullmatch(r"[0-9a-f]{40}", plugin_ref):
+            plugin_contract["resolved_commit_sha"] = plugin_ref
+    return {"tinyhat_platform": {"plugin": plugin_contract}}
 
 
 def _ids(command: dict[str, Any]) -> tuple[str, str, str]:
