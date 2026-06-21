@@ -21,7 +21,11 @@ from . import (
     private_access,
 )
 from .command_ledger import CommandLedger
-from .platform_client import backend_audience_from_env, platform_base_url_from_env
+from .platform_client import (
+    backend_audience_from_env,
+    default_platform_client,
+    platform_base_url_from_env,
+)
 from .runtime_commands import RuntimeCommandRunner, load_command_file
 
 
@@ -144,6 +148,22 @@ def _cmd_private_access_enroll(_args: argparse.Namespace) -> int:
     return 0 if payload.get("state") in {"disabled", "ready"} else 1
 
 
+def _cmd_private_access_enroll_platform(_args: argparse.Namespace) -> int:
+    client = default_platform_client()
+    payload = client.get_json("/hapi/v1/computers/me/private-access/enrollment")
+    enrollment = private_access.enroll_from_payload(payload)
+    report = private_access.private_access_report()
+    result_access = report if isinstance(report, dict) else enrollment
+    result = {
+        "provider": result_access.get("provider") or enrollment.get("provider"),
+        "state": result_access.get("state") or enrollment.get("state"),
+        "enrollment": enrollment,
+        "private_access": result_access,
+    }
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("state") in {"disabled", "ready"} else 1
+
+
 def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
     payload = hot_image.preinstall_hot_image_plugins()
     print(json.dumps(payload, sort_keys=True))
@@ -231,6 +251,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     private_access_enroll = private_access_sub.add_parser("enroll")
     private_access_enroll.set_defaults(func=_cmd_private_access_enroll)
+    private_access_enroll_platform = private_access_sub.add_parser(
+        "enroll-platform"
+    )
+    private_access_enroll_platform.set_defaults(
+        func=_cmd_private_access_enroll_platform
+    )
 
     bake = subparsers.add_parser("bake")
     bake_sub = bake.add_subparsers(dest="bake_command", required=True)

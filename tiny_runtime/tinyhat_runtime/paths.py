@@ -82,6 +82,17 @@ OPENCLAW_SECRETS_PATH = _path_from_env_any(
     ),
     "/etc/openclaw/tinyhat-secrets.json",
 )
+_OPENCLAW_GATEWAY_TOKEN_HOME = _dev_runtime_home()
+OPENCLAW_GATEWAY_TOKEN_FILE = _path_from_env(
+    "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE",
+    str(
+        Path(_OPENCLAW_GATEWAY_TOKEN_HOME)
+        / "tinyhat-control"
+        / "openclaw-gateway-token"
+        if _OPENCLAW_GATEWAY_TOKEN_HOME
+        else Path("/etc/tinyhat/openclaw-gateway-token")
+    ),
+)
 BUNDLE_OPENCLAW_DIR = _path_from_env(
     "TINYHAT_BUNDLE_OPENCLAW_DIR", str(CURRENT_LINK / "vendor" / "openclaw")
 )

@@ -81,5 +81,23 @@ if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
   fi
 fi
 
+if [[ "${TINYHAT_RUNTIME_MODE:-legacy_supervisor}" == "tiny_runtime" ]]; then
+  echo "[dev-entrypoint] starting tiny_runtime platform loop as tinyhat..."
+  export PYTHONPATH="/opt/tinyhat-runtime/tiny_runtime${PYTHONPATH:+:${PYTHONPATH}}"
+  exec gosu tinyhat bash -lc '
+    set -euo pipefail
+    runtime_home="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
+    mkdir -p "${runtime_home}/openclaw" "${runtime_home}/tinyhat-control"
+    python3 -m tinyhat_runtime.main platform warm-config >/dev/null
+    gateway_log="${runtime_home}/openclaw-gateway.log"
+    : > "${gateway_log}"
+    echo "[dev-entrypoint] tiny_runtime gateway log: ${gateway_log}"
+    python3 -m tinyhat_runtime.main gateway run >>"${gateway_log}" 2>&1 &
+    gateway_pid="$!"
+    trap '\''kill "${gateway_pid}" 2>/dev/null || true; wait "${gateway_pid}" 2>/dev/null || true'\'' EXIT INT TERM
+    python3 -m tinyhat_runtime.main platform loop
+  '
+fi
+
 echo "[dev-entrypoint] starting supervisor as tinyhat..."
 exec gosu tinyhat python3 /opt/tinyhat-runtime/supervisor.py

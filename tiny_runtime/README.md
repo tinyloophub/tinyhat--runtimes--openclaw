@@ -16,6 +16,9 @@ runtime. The stable contract is:
 - keep attestation as a boot/update proof, not a dependency of every
   OpenClaw gateway restart;
 - reuse the platform `/me/*` identity surface;
+- keep platform-granted material on the Computer: private access enrollment
+  and runtime secrets are fetched with Computer identity, while the local
+  OpenClaw Gateway token is generated on-box and never posted to the platform;
 - report a non-secret attestation document with `runtime_generation =
   tiny_runtime`;
 - keep every OpenClaw command behind `tinyhat_runtime/openclaw_adapter.py`;
@@ -75,11 +78,21 @@ settling the command. The expected support bundle includes `summary.md`,
 `stability/latest.json`.
 
 `apply_config` pulls the latest `/me/runtime-secrets` map, writes the
-Computer-local OpenClaw SecretRef source, and calls the official:
+Computer-local OpenClaw SecretRef source, and calls OpenClaw's public
+`openclaw/plugin-sdk/gateway-runtime` gateway helper for `secrets.reload` as
+the local backend client:
 
-```bash
-openclaw secrets reload --json
+```text
+method=secrets.reload client=gateway-client mode=backend scopes=operator.admin
 ```
+
+The Gateway runs with OpenClaw's official token auth. The token lives in
+`TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE` (default:
+`/etc/tinyhat/openclaw-gateway-token`, or under `$TINYHAT_RUNTIME_HOME` for
+dev containers) with mode `0600`; runtime-owned local gateway calls pass it
+through `OPENCLAW_GATEWAY_TOKEN` so command ledgers do not expose secret argv
+values. User or external clients still use OpenClaw's normal device-pairing
+scope model.
 
 SecretRef-backed fields hot-refresh through `openclaw secrets reload`. Tinyhat
 assignment and credential updates never request a gateway restart. Values that

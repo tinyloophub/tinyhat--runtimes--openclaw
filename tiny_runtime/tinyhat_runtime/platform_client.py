@@ -8,6 +8,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+DEV_RUNTIME_BEARER = "dev-runtime"
+
 
 class PlatformClient:
     def __init__(
@@ -115,8 +117,18 @@ def fetch_gce_identity_token(*, timeout: int = 5) -> str | None:
         return response.read().decode("utf-8").strip()
 
 
+def dev_runtime_identity_token() -> str | None:
+    if (os.environ.get("TINYHAT_DEV_RUNTIME") or "").strip() == "1":
+        return DEV_RUNTIME_BEARER
+    return None
+
+
 def default_platform_client() -> PlatformClient:
+    is_dev_runtime = (os.environ.get("TINYHAT_DEV_RUNTIME") or "").strip() == "1"
+    token_provider = (
+        dev_runtime_identity_token if is_dev_runtime else fetch_gce_identity_token
+    )
     return PlatformClient(
         platform_base_url_from_env(),
-        token_provider=fetch_gce_identity_token,
+        token_provider=token_provider,
     )

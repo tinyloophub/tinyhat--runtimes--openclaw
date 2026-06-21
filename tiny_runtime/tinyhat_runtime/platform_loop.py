@@ -8,6 +8,7 @@ this loop never restarts OpenClaw as part of assignment activation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -150,6 +151,7 @@ class TinyRuntimePlatformLoop:
             "ready",
             "tiny_runtime platform loop ready",
             already_state="ready",
+            ready_allows_assigned_current=True,
         )
         self.ready_reported = True
         if state_posted:
@@ -283,6 +285,7 @@ class TinyRuntimePlatformLoop:
         detail: str,
         *,
         already_state: str,
+        ready_allows_assigned_current: bool = False,
     ) -> bool:
         try:
             self.client.post_json(
@@ -304,6 +307,17 @@ class TinyRuntimePlatformLoop:
                 LOG.info(
                     "state=%s already satisfied by platform; continuing",
                     state,
+                )
+                return False
+            if (
+                ready_allows_assigned_current
+                and state == "ready"
+                and status.get("state") in {"assigned", "active"}
+                and status.get("assigned") is True
+            ):
+                LOG.info(
+                    "state=ready skipped; platform already %s",
+                    status.get("state"),
                 )
                 return False
             raise exc
@@ -344,6 +358,11 @@ class TinyRuntimePlatformLoop:
             if dry_run
             else openclaw_adapter.secrets_reload()
         )
+        if not dry_run and reload_result.get("state") != "ready":
+            raise RuntimeError(
+                "OpenClaw secrets reload failed: "
+                + redact_text(json.dumps(reload_result, sort_keys=True), limit=1000)
+            )
         return {
             "revision": revision,
             "secret_count": len(secrets),

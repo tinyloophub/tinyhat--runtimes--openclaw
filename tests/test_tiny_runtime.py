@@ -7,6 +7,8 @@ Usage:
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import importlib
 import json
 import os
@@ -33,12 +35,17 @@ from tinyhat_runtime import (  # noqa: E402
     launcher,
     main,
     openclaw_adapter,
+    platform_client,
     platform_loop,
     private_access,
     subscription_link,
 )
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
-from tinyhat_runtime.platform_client import PlatformClient  # noqa: E402
+from tinyhat_runtime.platform_client import (  # noqa: E402
+    DEV_RUNTIME_BEARER,
+    PlatformClient,
+    dev_runtime_identity_token,
+)
 from tinyhat_runtime.runtime_commands import RuntimeCommandRunner  # noqa: E402
 
 
@@ -52,10 +59,16 @@ class _Completed:
 class _FakePlatformClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.gets: list[str] = []
+        self.get_payload: dict = {}
 
     def post_json(self, path: str, body: dict, **_kwargs: object) -> dict:
         self.posts.append((path, body))
         return {}
+
+    def get_json(self, path: str, **_kwargs: object) -> dict:
+        self.gets.append(path)
+        return dict(self.get_payload)
 
 
 def _write_minimal_bundle(root: Path, *, marker: str = "") -> dict:
@@ -258,6 +271,56 @@ class PrivateAccessTests(unittest.TestCase):
             self.assertEqual(
                 (status_path.parent / "secrets").stat().st_mode & 0o777, 0o700
             )
+
+    def test_enroll_from_payload_never_persists_one_time_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "bootstrap-status.json"
+            calls: list[list[str]] = []
+
+            def fake_runner(args, **_kwargs):
+                argv = list(args)
+                calls.append(argv)
+                if argv[:2] == ["tailscale", "up"]:
+                    auth_arg = next(
+                        arg for arg in argv if arg.startswith("--auth-key=file:")
+                    )
+                    auth_path = Path(auth_arg.removeprefix("--auth-key=file:"))
+                    self.assertEqual(
+                        auth_path.read_text(encoding="utf-8"), "tskey-secret"
+                    )
+                return _Completed(returncode=0, stdout="ok\n")
+
+            def fake_which(name: str) -> str | None:
+                if name == "tailscale":
+                    return "/usr/bin/tailscale"
+                if name == "systemctl":
+                    return None
+                return None
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"TINYHAT_PRIVATE_ACCESS_STATUS_PATH": str(status_path)},
+                    clear=False,
+                ),
+                patch.object(private_access.shutil, "which", side_effect=fake_which),
+            ):
+                result = private_access.enroll_from_payload(
+                    {
+                        "provider": "tailscale",
+                        "tailscale_auth_key": "tskey-secret",
+                        "tailscale_node_name": "computer-abc123ef",
+                        "tailscale_tags": ["tag:tinyhat-computer"],
+                        "tailscale_ssh": True,
+                    },
+                    runner=fake_runner,
+                )
+
+            status_text = status_path.read_text(encoding="utf-8")
+            self.assertEqual(result["state"], "ready")
+            self.assertIn("--advertise-tags=tag:tinyhat-computer", calls[-1])
+            self.assertNotIn("tskey-secret", repr(result))
+            self.assertNotIn("tskey-secret", status_text)
 
     def test_private_access_report_parses_tailscale_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -852,6 +915,53 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertFalse(result["result"]["systemd_restart_requested"])
             self.assertNotIn("tskey-secret", repr(result))
 
+    def test_private_access_cli_pulls_enrollment_with_computer_identity(
+        self,
+    ) -> None:
+        client = _FakePlatformClient()
+        client.get_payload = {
+            "provider": "tailscale",
+            "tailscale_auth_key": "tskey-secret",
+            "tailscale_node_name": "computer-abc123ef",
+            "tailscale_tags": ["tag:tinyhat-computer-prod"],
+        }
+        output = io.StringIO()
+
+        with (
+            patch.object(main, "default_platform_client", return_value=client),
+            patch.object(
+                private_access,
+                "enroll_from_payload",
+                return_value={
+                    "provider": "tailscale",
+                    "state": "ready",
+                    "node_name": "computer-abc123ef",
+                },
+            ) as enroll,
+            patch.object(
+                private_access,
+                "private_access_report",
+                return_value={
+                    "provider": "tailscale",
+                    "state": "ready",
+                    "node_name": "computer-abc123ef",
+                    "tailnet_ip": "100.101.102.103",
+                },
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            rc = main.main(["private-access", "enroll-platform"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            client.gets, ["/hapi/v1/computers/me/private-access/enrollment"]
+        )
+        enroll.assert_called_once_with(client.get_payload)
+        rendered = output.getvalue()
+        self.assertIn('"state": "ready"', rendered)
+        self.assertIn('"tailnet_ip": "100.101.102.103"', rendered)
+        self.assertNotIn("tskey-secret", rendered)
+
     def test_apply_config_command_records_env_block_without_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -947,6 +1057,31 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertIn("[REDACTED]", result["result"]["detail"])
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
+
+    def test_apply_runtime_config_treats_failed_secret_reload_as_failed(self) -> None:
+        loop = platform_loop.TinyRuntimePlatformLoop(client=_FakePlatformClient())
+
+        with (
+            patch.object(openclaw_adapter, "write_openclaw_secrets") as write_secrets,
+            patch.object(
+                openclaw_adapter,
+                "secrets_reload",
+                return_value={
+                    "state": "failed",
+                    "detail": {
+                        "stderr": "gateway rejected token=secret-value",
+                    },
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "OpenClaw secrets reload failed"):
+                loop._apply_runtime_config(
+                    revision=2,
+                    secrets={"OPENAI_API_KEY": "sk-test-secret"},
+                    dry_run=False,
+                )
+
+        write_secrets.assert_called_once()
 
     def test_apply_config_command_rejects_invalid_spec_values(self) -> None:
         cases = [
@@ -1494,6 +1629,37 @@ class PlatformLoopTests(unittest.TestCase):
             timeout=10,
         )
 
+    def test_ready_report_skips_ready_edge_when_already_assigned(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/state":
+                raise RuntimeError("HTTP Error 400: Bad Request")
+            return {}
+
+        client.post_json.side_effect = post_json
+        client.get_json.return_value = {"state": "assigned", "assigned": True}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._report_ready()
+
+        self.assertTrue(loop.ready_reported)
+        self.assertEqual(
+            [path for path, _payload in posts],
+            [
+                "/hapi/v1/computers/me/runtime-state",
+                "/hapi/v1/computers/me/state",
+            ],
+        )
+        client.get_json.assert_called_with(
+            "/hapi/v1/computers/me/platform-status",
+            timeout=10,
+        )
+
     def test_poll_failure_is_reported_without_exiting_loop(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -2018,6 +2184,57 @@ class PlatformClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.me_url("../admin")
 
+    def test_client_only_builds_computer_me_api_urls(self) -> None:
+        client = PlatformClient("https://platform.example")
+        self.assertEqual(
+            client.api_url("/hapi/v1/computers/me/private-access/enrollment"),
+            (
+                "https://platform.example/"
+                "hapi/v1/computers/me/private-access/enrollment"
+            ),
+        )
+        self.assertEqual(
+            client.api_url("hapi/v1/computers/me/runtime-secrets"),
+            "https://platform.example/hapi/v1/computers/me/runtime-secrets",
+        )
+
+        for path in (
+            "/hapi/v1/admin/computers/1",
+            "/hapi/v1/computers/42/binding",
+            "/hapi/v1/computers/me/../admin",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    client.api_url(path)
+
+    def test_dev_runtime_identity_token_is_dev_only_marker(self) -> None:
+        with patch.dict(os.environ, {"TINYHAT_DEV_RUNTIME": "1"}, clear=False):
+            self.assertEqual(dev_runtime_identity_token(), DEV_RUNTIME_BEARER)
+
+        with patch.dict(os.environ, {"TINYHAT_DEV_RUNTIME": ""}, clear=False):
+            self.assertIsNone(dev_runtime_identity_token())
+
+    def test_default_client_uses_dev_marker_without_metadata(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TINYHAT_DEV_RUNTIME": "1",
+                    "TINYHAT_PLATFORM_BASE_URL": "https://dev.example.test",
+                    "TINYHAT_BACKEND_AUDIENCE": "https://dev.example.test",
+                },
+                clear=False,
+            ),
+            patch.object(
+                platform_client,
+                "fetch_gce_identity_token",
+                side_effect=AssertionError("metadata must not be called in dev"),
+            ),
+        ):
+            client = platform_client.default_platform_client()
+            self.assertEqual(client.base_url, "https://dev.example.test")
+            self.assertEqual(client.token_provider(), DEV_RUNTIME_BEARER)
+
 
 class SystemdUnitTests(unittest.TestCase):
     def test_install_normalizes_root_owned_bundle_copy(self) -> None:
@@ -2029,6 +2246,81 @@ class SystemdUnitTests(unittest.TestCase):
             'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"'
         )
         self.assertLess(chown_pos, verify_pos)
+
+    def test_computer_startup_script_owns_bundle_boot_path(self) -> None:
+        script_path = _REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-computer-startup"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertTrue(os.access(script_path, os.X_OK))
+        self.assertIn("metadata_get()", script)
+        self.assertIn("tinyhat-platform-base-url", script)
+        self.assertIn("tinyhat-backend-audience", script)
+        self.assertIn('private-access enroll-platform', script)
+        self.assertIn("tinyhat-runtime-platform.service", script)
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("tskey-", script)
+
+    def test_dev_entrypoint_can_run_tiny_runtime_loop_without_supervisor(
+        self,
+    ) -> None:
+        entrypoint = (_REPO_ROOT / "dev" / "entrypoint.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('TINYHAT_RUNTIME_MODE:-legacy_supervisor', entrypoint)
+        self.assertIn('== "tiny_runtime"', entrypoint)
+        self.assertIn("python3 -m tinyhat_runtime.main gateway run", entrypoint)
+        self.assertIn("python3 -m tinyhat_runtime.main platform loop", entrypoint)
+        branch = entrypoint[
+            entrypoint.index('== "tiny_runtime"') : entrypoint.index(
+                'echo "[dev-entrypoint] starting supervisor as tinyhat..."'
+            )
+        ]
+        self.assertNotIn("supervisor.py", branch)
+
+    def test_source_bootstrap_pulls_private_access_with_computer_identity(self) -> None:
+        script = (_REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "/hapi/v1/computers/me/private-access/enrollment",
+            script,
+        )
+        self.assertIn("private-access enroll-platform", script)
+        self.assertIn("PYTHONPATH=\"${RUNTIME_DIR}/tiny_runtime\"", script)
+        self.assertIn(
+            'if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then\n'
+            "  enroll_private_access_from_platform_source\n"
+            "else\n"
+            "  echo \"[tinyhat-runtime] source reinstall will enroll private "
+            "access after installing tiny_runtime\"\n"
+            "fi",
+            script,
+        )
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("tailscale_auth_file", script)
+
+    def test_assembled_bundle_carries_computer_startup_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "bundle"
+            completed = subprocess.run(
+                [
+                    str(_REPO_ROOT / "tiny_runtime" / "bake" / "assemble-bundle.sh"),
+                    str(out_dir),
+                ],
+                cwd=_REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entrypoint = out_dir / "bin" / "tinyhat-computer-startup"
+            self.assertTrue(entrypoint.exists())
+            self.assertTrue(os.access(entrypoint, os.X_OK))
+            self.assertIn(
+                "private-access enroll-platform",
+                entrypoint.read_text(encoding="utf-8"),
+            )
 
     def test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot(self) -> None:
         unit = (
@@ -2172,6 +2464,156 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             runner.call_args.args[0][:3], ["openclaw", "gateway", "health"]
         )
 
+    def test_gateway_health_accepts_reachable_auth_required_probe(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        runner = Mock(
+            return_value=subprocess.CompletedProcess(
+                ["openclaw"],
+                1,
+                stdout=json.dumps(
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "gateway_credentials_required",
+                            "message": "read-scope health RPC requires identity",
+                        },
+                        "gateway": {"reachable": True},
+                    }
+                ),
+                stderr="",
+            )
+        )
+
+        payload = openclaw_adapter.gateway_health(runner=runner)
+
+        self.assertEqual(payload["state"], "healthy")
+        self.assertEqual(payload["readiness"], "reachable_auth_required")
+        self.assertTrue(payload["gateway"]["gateway"]["reachable"])
+
+    def test_gateway_run_uses_local_token_auth_without_argv_secret(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with (
+            patch.object(
+                openclaw_adapter,
+                "ensure_gateway_token",
+                return_value="local-gateway-token",
+            ),
+            patch.object(
+                openclaw_adapter,
+                "openclaw_env",
+                return_value={"OPENCLAW_GATEWAY_TOKEN": "local-gateway-token"},
+            ),
+            patch.object(openclaw_adapter.subprocess, "call", return_value=0) as call,
+        ):
+            rc = openclaw_adapter.gateway_run()
+
+        self.assertEqual(rc, 0)
+        argv = call.call_args.args[0]
+        self.assertIn("--auth", argv)
+        self.assertIn("token", argv)
+        self.assertNotIn("local-gateway-token", argv)
+        self.assertEqual(
+            call.call_args.kwargs["env"]["OPENCLAW_GATEWAY_TOKEN"],
+            "local-gateway-token",
+        )
+
+    def test_secret_argv_values_are_redacted_from_command_summary(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        result = openclaw_adapter.AdapterResult(
+            command=("openclaw", "secrets", "reload", "--token", "plain-secret"),
+            returncode=1,
+            stdout="",
+            stderr="failed",
+        )
+
+        self.assertEqual(
+            result.public_summary()["command"],
+            ["openclaw", "secrets", "reload", "--token", "[REDACTED]"],
+        )
+
+    def test_secrets_reload_uses_backend_gateway_sdk_with_local_token(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "gateway-token"
+            token_path.write_text("runtime-token\n", encoding="utf-8")
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(token_path),
+                    }
+                )
+                importlib.reload(runtime_paths)
+                seen: dict[str, object] = {}
+
+                def runner(args: list[str], **kwargs: object):
+                    seen["args"] = args
+                    seen["env"] = kwargs.get("env")
+                    seen["input"] = kwargs.get("input")
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        stdout='{"warningCount":0}',
+                        stderr="",
+                    )
+
+                payload = openclaw_adapter.secrets_reload(runner=runner)
+
+                self.assertEqual(payload["state"], "ready")
+                self.assertEqual(seen["args"], ["node", "--input-type=module"])
+                env = seen["env"]
+                self.assertIsInstance(env, dict)
+                self.assertEqual(env["OPENCLAW_GATEWAY_TOKEN"], "runtime-token")
+                self.assertIn("/usr/local/lib/node_modules", env["NODE_PATH"])
+                request = json.loads(env["TINYHAT_OPENCLAW_GATEWAY_CALL"])
+                self.assertEqual(request["method"], "secrets.reload")
+                self.assertEqual(request["scopes"], ["operator.admin"])
+                self.assertNotIn("runtime-token", seen["args"])
+                self.assertNotIn("runtime-token", str(seen["input"]))
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
+    def test_secrets_reload_fails_fast_without_gateway_token(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(
+                            Path(tmp) / "missing-token"
+                        ),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                runner = Mock()
+                payload = openclaw_adapter.secrets_reload(runner=runner)
+
+                self.assertEqual(payload["state"], "failed")
+                self.assertIn(
+                    "gateway token",
+                    payload["detail"]["stderr"],
+                )
+                runner.assert_not_called()
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
     def test_adapter_spawns_official_device_code_command(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
@@ -2300,6 +2742,10 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                     env["OPENCLAW_CONFIG_PATH"],
                     str(Path(tmp) / "openclaw" / "openclaw.json"),
                 )
+                self.assertEqual(
+                    runtime_paths.OPENCLAW_GATEWAY_TOKEN_FILE,
+                    Path(tmp) / "tinyhat-control" / "openclaw-gateway-token",
+                )
             finally:
                 os.environ.clear()
                 os.environ.update(original_env)
@@ -2390,6 +2836,34 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 os.environ.update(original_env)
                 importlib.reload(runtime_paths)
 
+    def test_gateway_token_file_is_local_only_and_loaded_into_openclaw_env(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "gateway-token"
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(token_path),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                token = openclaw_adapter.ensure_gateway_token()
+                env = openclaw_adapter.openclaw_env()
+
+                self.assertEqual(env["OPENCLAW_GATEWAY_TOKEN"], token)
+                self.assertEqual(token_path.read_text(encoding="utf-8").strip(), token)
+                self.assertEqual(oct(token_path.stat().st_mode & 0o777), "0o600")
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
     def test_adapter_reports_missing_openclaw_without_raising(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
@@ -2467,6 +2941,7 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(patch["gateway"]["mode"], "local")
+        self.assertEqual(patch["gateway"]["auth"], {"mode": "token"})
         self.assertFalse(patch["channels"]["telegram"]["enabled"])
         self.assertEqual(
             patch["secrets"]["providers"]["tinyhat"]["path"],
@@ -2555,6 +3030,143 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertNotIn("123:token", json.dumps(patch, sort_keys=True))
         self.assertNotIn("sk-or-v1-child", json.dumps(patch, sort_keys=True))
 
+    def test_materialize_tinyhat_plugin_installs_missing_public_plugin(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            calls: list[list[str]] = []
+            inspect_count = 0
+
+            def runner(argv, **_kwargs):
+                nonlocal inspect_count
+                calls.append(list(argv))
+                if argv[:4] == ["openclaw", "plugins", "inspect", "tinyhat"]:
+                    inspect_count += 1
+                    if inspect_count == 1:
+                        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout='{"id":"tinyhat","version":"0.5.1"}',
+                        stderr="",
+                    )
+                if argv[:2] == ["git", "clone"]:
+                    checkout = Path(argv[-1])
+                    (checkout / ".git").mkdir(parents=True)
+                    (checkout / "package.json").write_text(
+                        '{"version":"0.5.1"}',
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                if argv[:3] == ["git", "tag", "--sort=-v:refname"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout="v0.5.1\nv0.5.0\n",
+                        stderr="",
+                    )
+                if argv[:4] == ["git", "rev-parse", "--verify", "origin/v0.5.1^{commit}"]:
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+                if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout="a" * 40 + "\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with patch.object(openclaw_adapter.paths, "OPENCLAW_STATE_DIR", state_dir):
+                result = openclaw_adapter.materialize_tinyhat_plugin(
+                    {
+                        "tinyhat_platform": {
+                            "plugin": {
+                                "id": "tinyhat",
+                                "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+                                "repo_ref": "latest",
+                            }
+                        }
+                    },
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(result["action"], "installed")
+            self.assertIn(
+                [
+                    "openclaw",
+                    "plugins",
+                    "install",
+                    str(state_dir / "platform-plugins" / "tinyhat"),
+                    "--force",
+                ],
+                calls,
+            )
+            marker = json.loads(
+                (state_dir / "tinyhat-plugin.version").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["requested_ref"], "latest")
+            self.assertEqual(marker["resolved_commit_sha"], "a" * 40)
+
+    def test_materialize_tinyhat_plugin_skips_matching_hot_image_marker(
+        self,
+    ) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir()
+            (state_dir / "tinyhat-plugin.version").write_text(
+                json.dumps(
+                    {
+                        "schema": "tinyhat_plugin_install_marker_v1",
+                        "plugin_id": "tinyhat",
+                        "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+                        "requested_ref": "v0.5.1",
+                        "resolved_commit_sha": "b" * 40,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def runner(argv, **_kwargs):
+                calls.append(list(argv))
+                if argv[:4] == ["openclaw", "plugins", "inspect", "tinyhat"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout='{"id":"tinyhat","version":"0.5.1"}',
+                        stderr="",
+                    )
+                raise AssertionError(f"unexpected command: {argv}")
+
+            with patch.object(openclaw_adapter.paths, "OPENCLAW_STATE_DIR", state_dir):
+                result = openclaw_adapter.materialize_tinyhat_plugin(
+                    {
+                        "tinyhat_platform": {
+                            "plugin": {
+                                "id": "tinyhat",
+                                "repo_url": "https://github.com/tinyhat-ai/tinyhat.git",
+                                "repo_ref": "v0.5.1",
+                                "resolved_commit_sha": "b" * 40,
+                            }
+                        }
+                    },
+                    runner=runner,
+                )
+
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(result["action"], "skipped")
+            self.assertEqual(
+                calls,
+                [["openclaw", "plugins", "inspect", "tinyhat", "--json"]],
+            )
+
     def test_apply_binding_config_writes_secrets_and_patches_hot_paths_only(
         self,
     ) -> None:
@@ -2573,6 +3185,10 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 openclaw_adapter.paths,
                 "OPENCLAW_SECRETS_PATH",
                 secrets_path,
+            ), patch.object(
+                openclaw_adapter,
+                "materialize_tinyhat_plugin",
+                return_value={"state": "ready", "action": "skipped"},
             ):
                 result = openclaw_adapter.apply_binding_config(
                     {
@@ -2632,6 +3248,10 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 openclaw_adapter.paths,
                 "OPENCLAW_SECRETS_PATH",
                 secrets_path,
+            ), patch.object(
+                openclaw_adapter,
+                "materialize_tinyhat_plugin",
+                return_value={"state": "ready", "action": "skipped"},
             ):
                 result = openclaw_adapter.apply_binding_config(
                     {
@@ -2764,6 +3384,49 @@ class BakeScriptTests(unittest.TestCase):
                 manifest["components"]["tinyhat_openclaw_plugin"]["ref"],
                 "0d79c3ca35161c05b4987cff286f85e2c988a29d",
             )
+
+
+class GceStartupScriptTests(unittest.TestCase):
+    def test_gce_startup_script_is_public_runtime_owner_boundary(self) -> None:
+        script = (
+            _REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-gce-startup"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("git clone", script)
+        self.assertIn("cache_marker_has runtime_resolved_sha", script)
+        self.assertIn("bash \"${RUNTIME_DIR}/bootstrap.sh\"", script)
+        self.assertIn("tinyhat-computer-startup", script)
+        runtime_entrypoints = "\n".join(
+            [
+                (_REPO_ROOT / "tiny_runtime" / "tinyhat_runtime" / "main.py").read_text(
+                    encoding="utf-8"
+                ),
+                (
+                    _REPO_ROOT
+                    / "tiny_runtime"
+                    / "tinyhat_runtime"
+                    / "runtime_commands.py"
+                ).read_text(encoding="utf-8"),
+            ]
+        )
+        self.assertIn(
+            "/hapi/v1/computers/me/private-access/enrollment",
+            runtime_entrypoints,
+        )
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("OPENROUTER_API_KEY", script)
+        self.assertNotIn("tinyloop/backend", script)
+
+    def test_gce_startup_script_passes_shell_syntax_check(self) -> None:
+        completed = subprocess.run(
+            ["bash", "-n", str(_REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-gce-startup")],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

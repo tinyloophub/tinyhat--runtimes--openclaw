@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Runtime-owned GCE startup entrypoint for Tinyhat-managed Computers.
+#
+# The platform creates the VM and renders only a launcher. This public script
+# owns the source-mode bootstrap that runs on the Computer: dependency install,
+# optional public runtime-cache use, checkout verification, runtime bootstrap,
+# and handoff to the tiny_runtime bundle startup when an image already contains
+# the runtime.
+set -euo pipefail
+
+BOOTSTRAP_LOG_PATH="${TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH:-/var/log/tinyhat-bootstrap.log}"
+RUNTIME_CLONE_DIR_DEFAULT="/opt/tinyhat/runtime"
+METADATA_ROOT="http://metadata.google.internal/computeMetadata/v1"
+
+if [[ "${TINYHAT_COMPUTER_STARTUP_LOG_REDIRECTED:-0}" != "1" ]]; then
+  mkdir -p "$(dirname "${BOOTSTRAP_LOG_PATH}")"
+  export TINYHAT_COMPUTER_STARTUP_LOG_REDIRECTED=1
+  exec > >(tee -a "${BOOTSTRAP_LOG_PATH}") 2>&1
+fi
+
+log() {
+  printf '[tinyhat-runtime] %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+metadata_get() {
+  local key="$1"
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    "${METADATA_ROOT}/instance/attributes/${key}" 2>/dev/null || true
+}
+
+metadata_or_env() {
+  local metadata_key="$1"
+  local env_name="$2"
+  local default_value="${3:-}"
+  local value
+  value="$(metadata_get "${metadata_key}")"
+  if [[ -n "${value}" ]]; then
+    printf '%s' "${value}"
+  elif [[ -n "${!env_name:-}" ]]; then
+    printf '%s' "${!env_name}"
+  else
+    printf '%s' "${default_value}"
+  fi
+}
+
+wait_for_metadata() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -sSf -H 'Metadata-Flavor: Google' "${METADATA_ROOT}/" >/dev/null; then
+      return 0
+    fi
+    log "metadata server not ready yet (attempt ${attempt})"
+    sleep 2
+  done
+  log "WARNING: metadata server did not answer; continuing with environment fallbacks"
+}
+
+write_public_runtime_cache_status() {
+  mkdir -p "$(dirname "${PUBLIC_RUNTIME_CACHE_STATUS_PATH}")"
+  {
+    printf 'mode=%s\n' "${STARTUP_IMAGE_MODE}"
+    printf 'status=%s\n' "${CACHE_STATUS}"
+    printf 'miss_reason=%s\n' "${CACHE_MISS_REASON}"
+    printf 'marker_path=%s\n' "${PUBLIC_RUNTIME_CACHE_MARKER_PATH}"
+    printf 'runtime_cache_dir=%s\n' "${PUBLIC_RUNTIME_CACHE_RUNTIME_DIR}"
+    printf 'runtime_repo_url=%s\n' "${RUNTIME_REPO_URL}"
+    printf 'runtime_ref=%s\n' "${RUNTIME_CHECKOUT_REF}"
+    printf 'runtime_expected_sha=%s\n' "${EXPECTED_RUNTIME_SHA}"
+    printf 'runtime_observed_sha=%s\n' "${CACHE_RUNTIME_OBSERVED_SHA}"
+    printf 'plugin_cache_dir=%s\n' "${PUBLIC_RUNTIME_CACHE_PLUGIN_DIR}"
+    printf 'plugin_target_dir=%s\n' "${PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR}"
+    printf 'plugin_repo_url=%s\n' "${PLATFORM_PLUGIN_REPO_URL}"
+    printf 'plugin_ref=%s\n' "${PLATFORM_PLUGIN_CHECKOUT_REF}"
+    printf 'plugin_expected_sha=%s\n' "${EXPECTED_PLUGIN_SHA}"
+    printf 'plugin_observed_sha=%s\n' "${CACHE_PLUGIN_OBSERVED_SHA}"
+  } >"${PUBLIC_RUNTIME_CACHE_STATUS_PATH}"
+}
+
+cache_marker_has() {
+  local key="$1"
+  local value="$2"
+  grep -Fx -- "${key}=${value}" "${PUBLIC_RUNTIME_CACHE_MARKER_PATH}" >/dev/null 2>&1
+}
+
+use_public_runtime_cache_checkout() {
+  local plugin_parent
+  if ! cp -a "${PUBLIC_RUNTIME_CACHE_RUNTIME_DIR}" "${RUNTIME_DIR}"; then
+    CACHE_MISS_REASON="cache_copy_failed"
+    return 1
+  fi
+  plugin_parent="$(dirname "${PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR}")"
+  if ! mkdir -p "${plugin_parent}"; then
+    CACHE_MISS_REASON="cache_copy_failed"
+    return 1
+  fi
+  if ! rm -rf "${PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR}"; then
+    CACHE_MISS_REASON="cache_copy_failed"
+    return 1
+  fi
+  if ! cp -a "${PUBLIC_RUNTIME_CACHE_PLUGIN_DIR}" "${PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR}"; then
+    CACHE_MISS_REASON="cache_copy_failed"
+    return 1
+  fi
+}
+
+load_config() {
+  BACKEND_AUDIENCE="$(metadata_or_env tinyhat-backend-audience TINYHAT_BACKEND_AUDIENCE)"
+  BACKEND_BASE_URL="$(metadata_or_env tinyhat-platform-base-url TINYHAT_PLATFORM_BASE_URL)"
+  STARTUP_IMAGE_MODE="$(metadata_or_env tinyhat-startup-image-mode TINYHAT_RUNTIME_STARTUP_IMAGE_MODE ubuntu_baseline)"
+  INSTALL_TINY_RUNTIME_FROM_SOURCE="${TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE:-0}"
+  TINY_RUNTIME_CURRENT_LINK="${TINYHAT_RUNTIME_CURRENT_LINK:-/opt/tinyhat/current}"
+  RUNTIME_REPO_URL="${TINYHAT_RUNTIME_REPO_URL:?TINYHAT_RUNTIME_REPO_URL is required}"
+  RUNTIME_CHECKOUT_REF="${TINYHAT_RUNTIME_CHECKOUT_REF:?TINYHAT_RUNTIME_CHECKOUT_REF is required}"
+  RUNTIME_DIR="${TINYHAT_RUNTIME_CLONE_DIR:-${RUNTIME_CLONE_DIR_DEFAULT}}"
+  EXPECTED_RUNTIME_SHA="${TINYHAT_RUNTIME_EXPECTED_SHA:-}"
+  EXPECTED_PLUGIN_SHA="${TINYHAT_PLATFORM_PLUGIN_EXPECTED_SHA:-}"
+  PLATFORM_PLUGIN_REPO_URL="${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}"
+  PLATFORM_PLUGIN_CHECKOUT_REF="${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}"
+  PUBLIC_RUNTIME_CACHE_ROOT="${TINYHAT_PUBLIC_RUNTIME_CACHE_ROOT:-/opt/tinyhat/public-runtime-cache}"
+  PUBLIC_RUNTIME_CACHE_MARKER_PATH="${PUBLIC_RUNTIME_CACHE_ROOT}/cache-manifest.env"
+  PUBLIC_RUNTIME_CACHE_RUNTIME_DIR="${PUBLIC_RUNTIME_CACHE_ROOT}/runtime"
+  PUBLIC_RUNTIME_CACHE_PLUGIN_DIR="${PUBLIC_RUNTIME_CACHE_ROOT}/plugins/tinyhat"
+  PUBLIC_RUNTIME_CACHE_STATUS_PATH="${TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH:-/var/lib/tinyhat-openclaw/public-runtime-cache.env}"
+  PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR="${TINYHAT_PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR:-/var/lib/tinyhat-openclaw/platform-plugins/tinyhat}"
+  CACHE_STATUS="disabled"
+  CACHE_MISS_REASON=""
+  CACHE_RUNTIME_OBSERVED_SHA=""
+  CACHE_PLUGIN_OBSERVED_SHA=""
+
+  if [[ -z "${BACKEND_AUDIENCE}" || -z "${BACKEND_BASE_URL}" ]]; then
+    log "ERROR: tinyhat platform base URL and backend audience are required"
+    exit 42
+  fi
+}
+
+handoff_to_bundle_if_available() {
+  if [[ "${STARTUP_IMAGE_MODE}" == "tiny_runtime_bundle" \
+    && "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then
+    log "tiny_runtime bundle image detected; handing off to runtime-owned bundle startup"
+    local runtime_owned_startup="${TINY_RUNTIME_CURRENT_LINK}/bin/tinyhat-computer-startup"
+    if [[ ! -x "${runtime_owned_startup}" ]]; then
+      log "ERROR: baked runtime startup entrypoint missing at ${runtime_owned_startup}"
+      exit 42
+    fi
+    log "lifecycle entrypoint: tinyhat--runtimes--openclaw tiny_runtime/bin/tinyhat-computer-startup"
+    exec "${runtime_owned_startup}"
+  fi
+}
+
+install_source_dependencies() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates git
+  git --version
+}
+
+prepare_runtime_checkout() {
+  mkdir -p "$(dirname "${RUNTIME_DIR}")"
+  rm -rf "${RUNTIME_DIR}"
+  if [[ "${STARTUP_IMAGE_MODE}" == "full_public_runtime_cache" ]]; then
+    CACHE_STATUS="miss"
+    if [[ -z "${EXPECTED_RUNTIME_SHA}" || -z "${EXPECTED_PLUGIN_SHA}" ]]; then
+      CACHE_MISS_REASON="unresolved_manifest_sha"
+    elif [[ ! -f "${PUBLIC_RUNTIME_CACHE_MARKER_PATH}" ]]; then
+      CACHE_MISS_REASON="missing_cache_marker"
+    elif ! cache_marker_has image_mode "full_public_runtime_cache" \
+      || ! cache_marker_has runtime_repo_url "${RUNTIME_REPO_URL}" \
+      || ! cache_marker_has runtime_ref "${RUNTIME_CHECKOUT_REF}" \
+      || ! cache_marker_has runtime_resolved_sha "${EXPECTED_RUNTIME_SHA}" \
+      || ! cache_marker_has plugin_repo_url "${PLATFORM_PLUGIN_REPO_URL}" \
+      || ! cache_marker_has plugin_ref "${PLATFORM_PLUGIN_CHECKOUT_REF}" \
+      || ! cache_marker_has plugin_resolved_sha "${EXPECTED_PLUGIN_SHA}"; then
+      CACHE_MISS_REASON="cache_marker_mismatch"
+    elif [[ ! -d "${PUBLIC_RUNTIME_CACHE_RUNTIME_DIR}/.git" \
+      || ! -d "${PUBLIC_RUNTIME_CACHE_PLUGIN_DIR}/.git" ]]; then
+      CACHE_MISS_REASON="missing_cache_checkout"
+    else
+      CACHE_RUNTIME_OBSERVED_SHA="$(git -C "${PUBLIC_RUNTIME_CACHE_RUNTIME_DIR}" rev-parse HEAD || true)"
+      CACHE_PLUGIN_OBSERVED_SHA="$(git -C "${PUBLIC_RUNTIME_CACHE_PLUGIN_DIR}" rev-parse HEAD || true)"
+      if [[ "${CACHE_RUNTIME_OBSERVED_SHA}" == "${EXPECTED_RUNTIME_SHA}" \
+        && "${CACHE_PLUGIN_OBSERVED_SHA}" == "${EXPECTED_PLUGIN_SHA}" ]]; then
+        if use_public_runtime_cache_checkout; then
+          CACHE_STATUS="hit"
+          CACHE_MISS_REASON=""
+          log "public runtime cache hit: ${EXPECTED_RUNTIME_SHA:0:12} / ${EXPECTED_PLUGIN_SHA:0:12}"
+        fi
+      else
+        CACHE_MISS_REASON="cache_sha_mismatch"
+      fi
+    fi
+  else
+    CACHE_STATUS="disabled"
+    CACHE_MISS_REASON="image_mode_not_full_public_runtime_cache"
+  fi
+  write_public_runtime_cache_status
+
+  if [[ "${CACHE_STATUS}" != "hit" ]]; then
+    log "public runtime cache ${CACHE_STATUS}: ${CACHE_MISS_REASON:-none}; using public clone/install fallback"
+    rm -rf "${RUNTIME_DIR}"
+    rm -rf "${PUBLIC_RUNTIME_CACHE_PLUGIN_TARGET_DIR}"
+    git clone "${RUNTIME_REPO_URL}" "${RUNTIME_DIR}"
+    git -C "${RUNTIME_DIR}" checkout "${RUNTIME_CHECKOUT_REF}"
+  fi
+}
+
+run_runtime_bootstrap() {
+  local resolved_runtime_sha
+  resolved_runtime_sha="$(git -C "${RUNTIME_DIR}" rev-parse HEAD)"
+  log "runtime checked out: ${RUNTIME_CHECKOUT_REF} -> ${resolved_runtime_sha}"
+  export TINYHAT_BACKEND_AUDIENCE="${BACKEND_AUDIENCE}"
+  export TINYHAT_PLATFORM_BASE_URL="${BACKEND_BASE_URL}"
+  export TINYHAT_FRAMEWORK_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-openclaw}"
+  export TINYHAT_PLATFORM_PLUGIN_REPO_URL="${PLATFORM_PLUGIN_REPO_URL}"
+  export TINYHAT_PLATFORM_PLUGIN_REPO_REF="${PLATFORM_PLUGIN_CHECKOUT_REF}"
+  export TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH="${PUBLIC_RUNTIME_CACHE_STATUS_PATH}"
+  export TINYHAT_HARD_RESET_USER_STATE_MIGRATION="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION:-0}"
+  export TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE="${INSTALL_TINY_RUNTIME_FROM_SOURCE}"
+  bash "${RUNTIME_DIR}/bootstrap.sh"
+}
+
+main() {
+  log "public runtime GCE startup starting"
+  wait_for_metadata
+  load_config
+  handoff_to_bundle_if_available
+  install_source_dependencies
+  prepare_runtime_checkout
+  run_runtime_bootstrap
+  log "public runtime GCE startup complete"
+}
+
+main "$@"
