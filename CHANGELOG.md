@@ -7,6 +7,33 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.3
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This keeps
+fresh Computers on the runtime-owned setup path even when they boot from
+a non-bundled base image, and it preserves the no-legacy-supervisor,
+no-destructive-OpenClaw-restart-loop boundary.
+
+### Added
+
+- Add the public `tinyhat-gce-startup` source-install entrypoint used by
+  non-bundled GCE Computers to assemble and start the tiny runtime from
+  the public repository at boot.
+- Add Computer-authenticated private-access enrollment at source startup
+  so ready Computers can obtain their own private access setup material
+  through `/hapi/v1/computers/me/*` APIs.
+- Add guard coverage proving the runtime platform client is confined to
+  the Computer-owned `/computers/me/*` API surface.
+
+### Fixed
+
+- Use the local runtime gateway auth path for secret reloads so config
+  apply remains hot-reload only and does not require platform-managed
+  OpenClaw restarts.
+- Harden source startup readiness in the dev loop and make private-access
+  enrollment idempotent so repeated activation does not create duplicate
+  enrollment work.
+
 ## 0.16.2
 
 Patch release for the Tinyloop v0.16 `tiny_runtime` train. This lets
