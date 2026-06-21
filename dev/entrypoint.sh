@@ -63,9 +63,18 @@ if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
     echo "[dev-entrypoint] tailscale up --ssh (node=${TINYHAT_TAILSCALE_NODE_NAME:-auto})..."
     # `if` condition so a non-zero exit doesn't trip `set -e`; record the
     # outcome in the status file the supervisor reports either way.
+    tailscale logout >/dev/null 2>&1 || true
     if tailscale "${up_args[@]}"; then
-      printf '%s\n' '{"provider":"tailscale","state":"ready"}' \
-        > "${PRIVATE_ACCESS_STATUS_FILE}"
+      python3 - <<'PY' > "${PRIVATE_ACCESS_STATUS_FILE}"
+import json
+import os
+
+print(json.dumps({
+    "provider": "tailscale",
+    "state": "ready",
+    "node_name": os.environ.get("TINYHAT_TAILSCALE_NODE_NAME") or None,
+}, sort_keys=True))
+PY
       echo "[dev-entrypoint] tailscale up OK — node is on the tailnet with SSH enabled"
     else
       printf '%s\n' \

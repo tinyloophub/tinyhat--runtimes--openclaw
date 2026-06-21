@@ -84,6 +84,7 @@ class TinyRuntimePlatformLoop:
                         "openclaw_control": "no_restart_requested",
                     },
                 )
+                self._safe_post_heartbeat(assigned=False, dispatch_command=True)
                 time.sleep(max(1.0, IDLE_SLEEP_SECONDS))
                 continue
             binding_received = time.monotonic()
@@ -92,7 +93,7 @@ class TinyRuntimePlatformLoop:
                 self._dispatch_runtime_command(command)
             if response.get("assigned") is not True:
                 self._report_ready()
-                self._safe_post_heartbeat(assigned=False)
+                self._safe_post_heartbeat(assigned=False, dispatch_command=True)
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
             binding = response.get("binding")
@@ -147,12 +148,19 @@ class TinyRuntimePlatformLoop:
             return
         if self.ready_reported:
             return
-        state_posted = self._post_lifecycle_state(
-            "ready",
-            "tiny_runtime platform loop ready",
-            already_state="ready",
-            ready_allows_assigned_current=True,
-        )
+        try:
+            state_posted = self._post_lifecycle_state(
+                "ready",
+                "tiny_runtime platform loop ready",
+                already_state="ready",
+                ready_allows_assigned_current=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness prerequisites can be gated
+            LOG.info(
+                "ready state deferred until prerequisites are ready: %s",
+                redact_text(str(exc), limit=500),
+            )
+            return
         self.ready_reported = True
         if state_posted:
             LOG.info("confirmed state=ready")
@@ -397,15 +405,28 @@ class TinyRuntimePlatformLoop:
             },
         )
 
-    def _safe_post_heartbeat(self, *, assigned: bool) -> None:
+    def _safe_post_heartbeat(
+        self, *, assigned: bool, dispatch_command: bool = False
+    ) -> None:
         try:
-            self._post_heartbeat(assigned=assigned)
+            heartbeat = self._post_heartbeat(assigned=assigned)
         except Exception as exc:  # noqa: BLE001 - heartbeat must not churn OpenClaw
             LOG.warning(
                 "heartbeat failed assigned=%s error=%s",
                 assigned,
                 redact_text(str(exc), limit=500),
             )
+            return
+        if dispatch_command:
+            command = heartbeat.get("command")
+            if isinstance(command, dict):
+                try:
+                    self._dispatch_runtime_command(command)
+                except Exception as exc:  # noqa: BLE001 - command failures must not churn the loop
+                    LOG.warning(
+                        "runtime command dispatch failed after heartbeat: %s",
+                        redact_text(str(exc), limit=500),
+                    )
 
     def _report_subscription_runtime_verification(self, binding: dict[str, Any]) -> None:
         if str(binding.get("llm_auth_mode") or "") != "chatgpt_subscription":
@@ -472,6 +493,9 @@ class TinyRuntimePlatformLoop:
             )
             if isinstance(gateway_extra, dict):
                 payload["gateway"] = {**payload["gateway"], **gateway_extra}
+        private_report = private_access.private_access_report()
+        if private_report is not None:
+            payload["private_access"] = private_report
         self.client.post_json("/hapi/v1/computers/me/runtime-state", payload)
 
     def _safe_post_runtime_state(

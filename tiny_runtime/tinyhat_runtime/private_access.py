@@ -204,6 +204,11 @@ def enroll_from_config(
             up_args.append("--ssh")
         if tags:
             up_args.append(f"--advertise-tags={tags}")
+        _run(
+            ["tailscale", "logout"],
+            runner=runner,
+            timeout=TAILSCALE_STATUS_TIMEOUT_SECONDS,
+        )
         result = _run(up_args, runner=runner, timeout=TAILSCALE_UP_TIMEOUT_SECONDS)
     finally:
         try:
