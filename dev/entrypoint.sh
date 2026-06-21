@@ -88,6 +88,7 @@ if [[ "${TINYHAT_RUNTIME_MODE:-legacy_supervisor}" == "tiny_runtime" ]]; then
     set -euo pipefail
     runtime_home="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
     mkdir -p "${runtime_home}/openclaw" "${runtime_home}/tinyhat-control"
+    python3 -m tinyhat_runtime.main platform warm-config >/dev/null
     gateway_log="${runtime_home}/openclaw-gateway.log"
     : > "${gateway_log}"
     echo "[dev-entrypoint] tiny_runtime gateway log: ${gateway_log}"

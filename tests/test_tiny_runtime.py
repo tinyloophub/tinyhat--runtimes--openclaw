@@ -1058,6 +1058,31 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
 
+    def test_apply_runtime_config_treats_failed_secret_reload_as_failed(self) -> None:
+        loop = platform_loop.TinyRuntimePlatformLoop(client=_FakePlatformClient())
+
+        with (
+            patch.object(openclaw_adapter, "write_openclaw_secrets") as write_secrets,
+            patch.object(
+                openclaw_adapter,
+                "secrets_reload",
+                return_value={
+                    "state": "failed",
+                    "detail": {
+                        "stderr": "gateway rejected token=secret-value",
+                    },
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "OpenClaw secrets reload failed"):
+                loop._apply_runtime_config(
+                    revision=2,
+                    secrets={"OPENAI_API_KEY": "sk-test-secret"},
+                    dry_run=False,
+                )
+
+        write_secrets.assert_called_once()
+
     def test_apply_config_command_rejects_invalid_spec_values(self) -> None:
         cases = [
             ({}, "desired_config_revision is required"),
@@ -2443,6 +2468,129 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["readiness"], "reachable_auth_required")
         self.assertTrue(payload["gateway"]["gateway"]["reachable"])
 
+    def test_gateway_run_uses_local_token_auth_without_argv_secret(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with (
+            patch.object(
+                openclaw_adapter,
+                "ensure_gateway_token",
+                return_value="local-gateway-token",
+            ),
+            patch.object(
+                openclaw_adapter,
+                "openclaw_env",
+                return_value={"OPENCLAW_GATEWAY_TOKEN": "local-gateway-token"},
+            ),
+            patch.object(openclaw_adapter.subprocess, "call", return_value=0) as call,
+        ):
+            rc = openclaw_adapter.gateway_run()
+
+        self.assertEqual(rc, 0)
+        argv = call.call_args.args[0]
+        self.assertIn("--auth", argv)
+        self.assertIn("token", argv)
+        self.assertNotIn("local-gateway-token", argv)
+        self.assertEqual(
+            call.call_args.kwargs["env"]["OPENCLAW_GATEWAY_TOKEN"],
+            "local-gateway-token",
+        )
+
+    def test_secret_argv_values_are_redacted_from_command_summary(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        result = openclaw_adapter.AdapterResult(
+            command=("openclaw", "secrets", "reload", "--token", "plain-secret"),
+            returncode=1,
+            stdout="",
+            stderr="failed",
+        )
+
+        self.assertEqual(
+            result.public_summary()["command"],
+            ["openclaw", "secrets", "reload", "--token", "[REDACTED]"],
+        )
+
+    def test_secrets_reload_uses_backend_gateway_sdk_with_local_token(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "gateway-token"
+            token_path.write_text("runtime-token\n", encoding="utf-8")
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(token_path),
+                    }
+                )
+                importlib.reload(runtime_paths)
+                seen: dict[str, object] = {}
+
+                def runner(args: list[str], **kwargs: object):
+                    seen["args"] = args
+                    seen["env"] = kwargs.get("env")
+                    seen["input"] = kwargs.get("input")
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        stdout='{"warningCount":0}',
+                        stderr="",
+                    )
+
+                payload = openclaw_adapter.secrets_reload(runner=runner)
+
+                self.assertEqual(payload["state"], "ready")
+                self.assertEqual(seen["args"], ["node", "--input-type=module"])
+                env = seen["env"]
+                self.assertIsInstance(env, dict)
+                self.assertEqual(env["OPENCLAW_GATEWAY_TOKEN"], "runtime-token")
+                self.assertIn("/usr/local/lib/node_modules", env["NODE_PATH"])
+                request = json.loads(env["TINYHAT_OPENCLAW_GATEWAY_CALL"])
+                self.assertEqual(request["method"], "secrets.reload")
+                self.assertEqual(request["scopes"], ["operator.admin"])
+                self.assertNotIn("runtime-token", seen["args"])
+                self.assertNotIn("runtime-token", str(seen["input"]))
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
+    def test_secrets_reload_fails_fast_without_gateway_token(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(
+                            Path(tmp) / "missing-token"
+                        ),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                runner = Mock()
+                payload = openclaw_adapter.secrets_reload(runner=runner)
+
+                self.assertEqual(payload["state"], "failed")
+                self.assertIn(
+                    "gateway token",
+                    payload["detail"]["stderr"],
+                )
+                runner.assert_not_called()
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
     def test_adapter_spawns_official_device_code_command(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
@@ -2571,6 +2719,10 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                     env["OPENCLAW_CONFIG_PATH"],
                     str(Path(tmp) / "openclaw" / "openclaw.json"),
                 )
+                self.assertEqual(
+                    runtime_paths.OPENCLAW_GATEWAY_TOKEN_FILE,
+                    Path(tmp) / "tinyhat-control" / "openclaw-gateway-token",
+                )
             finally:
                 os.environ.clear()
                 os.environ.update(original_env)
@@ -2661,6 +2813,34 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 os.environ.update(original_env)
                 importlib.reload(runtime_paths)
 
+    def test_gateway_token_file_is_local_only_and_loaded_into_openclaw_env(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+        from tinyhat_runtime import paths as runtime_paths
+
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "gateway-token"
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "PATH": original_env.get("PATH", ""),
+                        "TINYHAT_OPENCLAW_GATEWAY_TOKEN_FILE": str(token_path),
+                    }
+                )
+                importlib.reload(runtime_paths)
+
+                token = openclaw_adapter.ensure_gateway_token()
+                env = openclaw_adapter.openclaw_env()
+
+                self.assertEqual(env["OPENCLAW_GATEWAY_TOKEN"], token)
+                self.assertEqual(token_path.read_text(encoding="utf-8").strip(), token)
+                self.assertEqual(oct(token_path.stat().st_mode & 0o777), "0o600")
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+                importlib.reload(runtime_paths)
+
     def test_adapter_reports_missing_openclaw_without_raising(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
@@ -2738,6 +2918,7 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(patch["gateway"]["mode"], "local")
+        self.assertEqual(patch["gateway"]["auth"], {"mode": "token"})
         self.assertFalse(patch["channels"]["telegram"]["enabled"])
         self.assertEqual(
             patch["secrets"]["providers"]["tinyhat"]["path"],

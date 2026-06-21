@@ -8,6 +8,7 @@ this loop never restarts OpenClaw as part of assignment activation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -357,6 +358,11 @@ class TinyRuntimePlatformLoop:
             if dry_run
             else openclaw_adapter.secrets_reload()
         )
+        if not dry_run and reload_result.get("state") != "ready":
+            raise RuntimeError(
+                "OpenClaw secrets reload failed: "
+                + redact_text(json.dumps(reload_result, sort_keys=True), limit=1000)
+            )
         return {
             "revision": revision,
             "secret_count": len(secrets),

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets as secrets_module
+import shutil
 import subprocess
 import zipfile
 from dataclasses import dataclass
@@ -35,7 +37,7 @@ class AdapterResult:
 
     def public_summary(self) -> dict[str, Any]:
         return {
-            "command": list(self.command),
+            "command": _redact_command(self.command),
             "returncode": self.returncode,
             "stdout": redact_text(self.stdout, limit=1000),
             "stderr": redact_text(self.stderr, limit=1000),
@@ -48,6 +50,82 @@ TINYHAT_PLUGIN_ID = "tinyhat"
 TINYHAT_PLUGIN_REPO_URL = "https://github.com/tinyhat-ai/tinyhat.git"
 TINYHAT_PLUGIN_REPO_REF = "main"
 TINYHAT_PLUGIN_MARKER = "tinyhat-plugin.version"
+_GATEWAY_SECRET_ARG_FLAGS = frozenset({"--token", "--password"})
+_GATEWAY_BACKEND_CALL_COMMAND = (
+    "node",
+    "openclaw/plugin-sdk/gateway-runtime",
+)
+_GATEWAY_BACKEND_CALL_SCRIPT = r"""
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const request = JSON.parse(process.env.TINYHAT_OPENCLAW_GATEWAY_CALL || "{}");
+const gatewayRuntimePath = require.resolve("openclaw/plugin-sdk/gateway-runtime");
+const { callGatewayFromCli } = await import(gatewayRuntimePath);
+
+const result = await callGatewayFromCli(
+  request.method,
+  {
+    token: process.env.OPENCLAW_GATEWAY_TOKEN,
+    json: true,
+    timeout: String(request.timeoutMs ?? 30000),
+  },
+  request.params,
+  {
+    clientName: "gateway-client",
+    mode: "backend",
+    scopes: Array.isArray(request.scopes) ? request.scopes : undefined,
+    progress: false,
+    expectFinal: Boolean(request.expectFinal),
+  },
+);
+
+process.stdout.write(JSON.stringify(result ?? {}) + "\n");
+""".strip()
+
+
+def _redact_command(command: Sequence[str]) -> list[str]:
+    redacted: list[str] = []
+    redact_next = False
+    for arg in command:
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _GATEWAY_SECRET_ARG_FLAGS):
+            key = arg.split("=", 1)[0]
+            redacted.append(f"{key}=[REDACTED]")
+            continue
+        redacted.append(redact_text(arg, limit=300))
+        if arg in _GATEWAY_SECRET_ARG_FLAGS:
+            redact_next = True
+    return redacted
+
+
+def _read_gateway_token() -> str | None:
+    configured = (os.environ.get("OPENCLAW_GATEWAY_TOKEN") or "").strip()
+    if configured:
+        return configured
+    try:
+        token = paths.OPENCLAW_GATEWAY_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def ensure_gateway_token() -> str:
+    token = _read_gateway_token()
+    if token:
+        return token
+    token = secrets_module.token_urlsafe(48)
+    target = paths.OPENCLAW_GATEWAY_TOKEN_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    tmp.write_text(token + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+    os.chmod(target, 0o600)
+    return token
 
 
 def openclaw_env(
@@ -59,6 +137,9 @@ def openclaw_env(
     resolved_config = config_path or paths.OPENCLAW_CONFIG_PATH
     base_env = dict(os.environ)
     base_env["PATH"] = f"{paths.BUNDLE_OPENCLAW_BIN}{os.pathsep}{base_env.get('PATH', '')}"
+    gateway_token = _read_gateway_token()
+    if gateway_token:
+        base_env["OPENCLAW_GATEWAY_TOKEN"] = gateway_token
     return {
         **base_env,
         "HOME": str(resolved_state),
@@ -66,6 +147,85 @@ def openclaw_env(
         "OPENCLAW_STATE_DIR": str(resolved_state),
         "OPENCLAW_CONFIG_PATH": str(resolved_config),
     }
+
+
+def _node_module_path_candidates(env: dict[str, str]) -> list[str]:
+    candidates: list[str] = []
+    for raw in env.get("NODE_PATH", "").split(os.pathsep):
+        if raw:
+            candidates.append(raw)
+    openclaw_bin = shutil.which("openclaw", path=env.get("PATH"))
+    if openclaw_bin:
+        resolved_bin = Path(openclaw_bin).resolve()
+        for parent in (resolved_bin.parent, *resolved_bin.parents):
+            if parent.name == "openclaw" and (parent / "package.json").exists():
+                candidates.append(str(parent.parent))
+                break
+    candidates.extend(
+        [
+            "/usr/local/lib/node_modules",
+            "/usr/lib/node_modules",
+            "/opt/homebrew/lib/node_modules",
+        ]
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def run_openclaw_gateway_backend_call(
+    method: str,
+    *,
+    params: dict[str, Any] | None = None,
+    scopes: Sequence[str] = (),
+    timeout: int | None = 30,
+    runner: Runner = subprocess.run,
+) -> AdapterResult:
+    token = _read_gateway_token()
+    command = (*_GATEWAY_BACKEND_CALL_COMMAND, method)
+    if not token:
+        return AdapterResult(
+            command=command,
+            returncode=127,
+            stdout="",
+            stderr="OpenClaw gateway token is not available",
+        )
+    env = openclaw_env()
+    env["OPENCLAW_GATEWAY_TOKEN"] = token
+    env["NODE_PATH"] = os.pathsep.join(_node_module_path_candidates(env))
+    env["TINYHAT_OPENCLAW_GATEWAY_CALL"] = json.dumps(
+        {
+            "method": method,
+            "params": params,
+            "scopes": list(scopes),
+            "timeoutMs": (timeout or 30) * 1000,
+            "expectFinal": False,
+        },
+        sort_keys=True,
+    )
+    try:
+        completed = runner(
+            ["node", "--input-type=module"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+            input=_GATEWAY_BACKEND_CALL_SCRIPT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return AdapterResult(command=command, returncode=127, stdout="", stderr=str(exc))
+    return AdapterResult(
+        command=command,
+        returncode=int(completed.returncode),
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+    )
 
 
 def run_openclaw(
@@ -514,6 +674,11 @@ def gateway_status(*, runner: Runner = subprocess.run) -> dict[str, Any]:
 
 def gateway_run() -> int:
     try:
+        ensure_gateway_token()
+    except OSError as exc:
+        print(redact_text(str(exc)), flush=True)
+        return 127
+    try:
         return subprocess.call(
             [
                 "openclaw",
@@ -523,7 +688,7 @@ def gateway_run() -> int:
                 "--bind",
                 "loopback",
                 "--auth",
-                "none",
+                "token",
                 "--tailscale",
                 "off",
             ],
@@ -542,7 +707,11 @@ def models_status(*, runner: Runner = subprocess.run) -> dict[str, Any]:
 
 
 def secrets_reload(*, runner: Runner = subprocess.run) -> dict[str, Any]:
-    result = run_openclaw(("secrets", "reload", "--json"), runner=runner)
+    result = run_openclaw_gateway_backend_call(
+        "secrets.reload",
+        scopes=("operator.admin",),
+        runner=runner,
+    )
     if not result.ok:
         return {"state": "failed", "detail": result.public_summary()}
     return {"state": "ready", "secrets": redact_json(result.json_payload())}
@@ -644,7 +813,7 @@ def warm_image_config_patch(
             "mode": "local",
             "bind": "loopback",
             "port": int(os.environ.get("TINYHAT_OPENCLAW_GATEWAY_PORT", "18789")),
-            "auth": {"mode": "none"},
+            "auth": {"mode": "token"},
             "tailscale": {"mode": "off"},
         },
         "agents": {
@@ -693,6 +862,10 @@ def apply_warm_image_config(
     backend_audience: str | None = None,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
+    try:
+        ensure_gateway_token()
+    except OSError as exc:
+        return {"state": "failed", "detail": redact_text(str(exc), limit=1000)}
     return config_patch(
         warm_image_config_patch(
             platform_base_url=platform_base_url,
