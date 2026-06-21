@@ -402,6 +402,13 @@ class TinyRuntimePlatformLoop:
         }
         if status.get("state") != "ready":
             body["detail"] = redact_text(str(status.get("detail") or status), limit=512)
+        elif observed is None:
+            detail = (
+                "openclaw models status did not expose a default model "
+                f"(shape={_status_shape_for_log(status)})"
+            )
+            LOG.warning(detail)
+            body["detail"] = detail
         try:
             self.client.post_json(
                 "/hapi/v1/computers/me/subscription-link/runtime-verification",
@@ -515,19 +522,65 @@ class TinyRuntimePlatformLoop:
 
 
 def _observed_model_ref_from_status(status: dict[str, Any]) -> str | None:
-    models = status.get("models") if isinstance(status, dict) else None
-    if not isinstance(models, dict):
+    if not isinstance(status, dict):
         return None
-    for key in ("resolvedDefault", "defaultModel", "default"):
-        value = str(models.get(key) or "").strip()
+    models = status.get("models")
+    if isinstance(models, dict):
+        value = _observed_model_ref_from_payload(models)
         if value:
             return value
-    nested = models.get("models")
+    return _observed_model_ref_from_payload(status)
+
+
+def _observed_model_ref_from_payload(payload: dict[str, Any]) -> str | None:
+    for key in ("resolvedDefault", "defaultModel", "default", "currentModel"):
+        value = _model_ref_from_value(payload.get(key))
+        if value:
+            return value
+    nested = payload.get("models")
     if isinstance(nested, dict):
-        value = str(nested.get("default") or "").strip()
+        value = _observed_model_ref_from_payload(nested)
         if value:
             return value
+    if isinstance(nested, list):
+        for item in nested:
+            if not isinstance(item, dict):
+                continue
+            if item.get("default") is True or item.get("isDefault") is True:
+                value = _model_ref_from_value(item)
+                if value:
+                    return value
     return None
+
+
+def _model_ref_from_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if not isinstance(value, dict):
+        return None
+    provider = str(value.get("provider") or "").strip()
+    model = str(value.get("model") or value.get("modelId") or "").strip()
+    if provider and model:
+        return f"{provider}/{model}"
+    for key in ("ref", "id", "label", "name"):
+        candidate = str(value.get(key) or "").strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _status_shape_for_log(status: dict[str, Any]) -> str:
+    if not isinstance(status, dict):
+        return type(status).__name__
+    keys = sorted(str(key) for key in status.keys())
+    models = status.get("models")
+    if isinstance(models, dict):
+        model_shape = ",".join(sorted(str(key) for key in models.keys())[:8])
+        return f"top={','.join(keys[:8])};models={model_shape}"
+    if isinstance(models, list):
+        return f"top={','.join(keys[:8])};models=list[{len(models)}]"
+    return f"top={','.join(keys[:8])};models={type(models).__name__}"
 
 
 def main() -> int:

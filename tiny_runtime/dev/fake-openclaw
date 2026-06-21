@@ -86,7 +86,7 @@ case "$*" in
     printf '%s\n' "fake openclaw gateway run"
     ;;
   "models status --json")
-    printf '%s\n' '{"models":[]}'
+    printf '%s\n' '{"defaultModel":"openai/gpt-5.5","resolvedDefault":"openai/gpt-5.5"}'
     ;;
   "secrets reload --json")
     printf '%s\n' '{"reloaded":true}'

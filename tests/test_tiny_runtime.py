@@ -190,9 +190,18 @@ class PrivateAccessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             status_path = Path(tmp) / "bootstrap-status.json"
             calls: list[list[str]] = []
+            auth_paths: list[Path] = []
 
             def fake_runner(args, **_kwargs):
-                calls.append(list(args))
+                argv = list(args)
+                calls.append(argv)
+                if argv[:2] == ["tailscale", "up"]:
+                    auth_arg = next(arg for arg in argv if arg.startswith("--auth-key=file:"))
+                    auth_path = Path(auth_arg.removeprefix("--auth-key=file:"))
+                    auth_paths.append(auth_path)
+                    self.assertEqual(auth_path.parent, status_path.parent / "secrets")
+                    self.assertEqual(auth_path.read_text(encoding="utf-8"), "tskey-secret")
+                    self.assertEqual(auth_path.stat().st_mode & 0o777, 0o600)
                 return _Completed(returncode=0, stdout="ok\n")
 
             def fake_which(name: str) -> str | None:
@@ -226,6 +235,10 @@ class PrivateAccessTests(unittest.TestCase):
             self.assertIn("--advertise-tags=tag:tinyhat-computer", tailscale_up)
             self.assertTrue(any(arg.startswith("--auth-key=file:") for arg in tailscale_up))
             self.assertFalse(any("tskey-secret" in arg for arg in tailscale_up))
+            self.assertEqual(result["ssh_enabled"], True)
+            self.assertEqual(len(auth_paths), 1)
+            self.assertFalse(auth_paths[0].exists())
+            self.assertEqual((status_path.parent / "secrets").stat().st_mode & 0o777, 0o700)
 
     def test_private_access_report_parses_tailscale_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1516,6 +1529,35 @@ class PlatformLoopTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_subscription_runtime_verification_reports_unknown_status_shape(
+        self,
+    ) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "models_status",
+                return_value={"state": "ready", "models": {"models": []}},
+            ),
+            self.assertLogs(platform_loop.LOG, level="WARNING") as logs,
+        ):
+            loop._report_subscription_runtime_verification(
+                {
+                    "llm_auth_mode": "chatgpt_subscription",
+                    "llm_model_ref": "openai/gpt-5.5",
+                }
+            )
+
+        self.assertIn("did not expose a default model", "\n".join(logs.output))
+        payload = client.posts[0][1]
+        self.assertIsNone(payload["observed_model_ref"])
+        self.assertFalse(payload["verified"])
+        self.assertIn("shape=top=models,state;models=models", payload["detail"])
 
     def test_binding_activation_treats_existing_active_state_as_idempotent(
         self,

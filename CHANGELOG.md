@@ -14,6 +14,12 @@ runtime's published `VERSION` on each new Computer row.
 - Add the tiny-runtime ChatGPT/Codex device-code worker and runtime model-status
   verification using OpenClaw's official CLI surfaces.
 
+### Fixed
+
+- Harden tiny-runtime subscription verification against unexpected
+  `openclaw models status --json` shapes and keep Tailscale auth-key temp files
+  under the private-access status directory.
+
 ## 0.16.0
 
 Minor release for the Tinyloop v0.16 `tiny_runtime` release train.

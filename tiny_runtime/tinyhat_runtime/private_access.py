@@ -38,6 +38,13 @@ def _write_status(payload: dict[str, Any], *, path: Path | None = None) -> dict[
     return payload
 
 
+def _truthy_env(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def _run(
     args: Sequence[str],
     *,
@@ -121,7 +128,19 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
                 }
             )
 
-    with tempfile.NamedTemporaryFile("w", prefix="tinyhat-tailscale-auth.", delete=False) as handle:
+    secret_dir = _status_path().parent / "secrets"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        secret_dir.chmod(0o700)
+    except OSError:
+        pass
+    ssh_enabled = _truthy_env("TINYHAT_TAILSCALE_SSH", default=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        prefix="tailscale-auth.",
+        dir=secret_dir,
+        delete=False,
+    ) as handle:
         auth_file = Path(handle.name)
         handle.write(auth_key)
     try:
@@ -131,8 +150,9 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
             "up",
             f"--auth-key=file:{auth_file}",
             f"--hostname={node_name}",
-            "--ssh",
         ]
+        if ssh_enabled:
+            up_args.append("--ssh")
         if tags:
             up_args.append(f"--advertise-tags={tags}")
         result = _run(up_args, runner=runner, timeout=TAILSCALE_UP_TIMEOUT_SECONDS)
@@ -148,6 +168,7 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
                 "provider": "tailscale",
                 "state": "error",
                 "node_name": node_name,
+                "ssh_enabled": ssh_enabled,
                 "diagnostic": (
                     "tailscale up failed: "
                     + redact_text((result.stderr or result.stdout or "").strip())
@@ -160,6 +181,7 @@ def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
             "provider": "tailscale",
             "state": "ready",
             "node_name": node_name,
+            "ssh_enabled": ssh_enabled,
             "diagnostic": "tailscale enrollment completed",
         }
     )
