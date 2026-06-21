@@ -63,10 +63,12 @@ def _run(
 
 
 def enroll_from_env(*, runner: Runner = subprocess.run) -> dict[str, Any]:
-    """Enroll the VM into the configured private-access provider.
+    """Enroll the VM from explicit environment-provided private-access material.
 
-    This is used by ``tiny_runtime_bundle`` images, whose fast path skips the
-    source bootstrap block that historically ran ``tailscale up``.
+    Normal Computer startup uses ``enroll_from_payload`` through the
+    Computer-authenticated platform API. This env path is reserved for explicit
+    repair/dev invocations that intentionally provide the provider material
+    out-of-band.
     """
 
     return enroll_from_config(
