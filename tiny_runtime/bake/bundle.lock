@@ -10,7 +10,7 @@
     "tinyhat_openclaw_plugin": {
       "type": "git",
       "repo": "https://github.com/tinyhat-ai/tinyhat.git",
-      "ref": "9e564878f6057a6c66fa2047b265caa3389314e2"
+      "ref": "676e6d878b58a2da8453573fa4b389fca32bc0a9"
     }
   }
 }

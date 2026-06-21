@@ -39,6 +39,15 @@ GATEWAY_READY_POLL_SECONDS = float(
 )
 
 
+def _runtime_command_service_restart_enabled() -> bool:
+    value = (
+        os.environ.get("TINYHAT_RUNTIME_NO_SERVICE_RESTART")
+        or os.environ.get("TINYHAT_RUNTIME_SKIP_SYSTEMD")
+        or ""
+    )
+    return value.strip().lower() not in {"1", "true", "yes", "on"}
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -342,6 +351,7 @@ class TinyRuntimePlatformLoop:
             platform_get_json=self.client.get_json,
             apply_runtime_config=self._apply_runtime_config,
             start_chatgpt_link=self._start_chatgpt_link,
+            service_restart=_runtime_command_service_restart_enabled(),
         )
         result = runner.execute(runtime_command)
         self.client.post_json(

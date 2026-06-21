@@ -87,7 +87,7 @@ def _write_minimal_bundle(root: Path, *, marker: str = "") -> dict:
             "openclaw": {"package": "openclaw", "ref": "openclaw@2026.6.8"},
             "tinyhat_openclaw_plugin": {
                 "repo": "public",
-                "ref": "9e564878f6057a6c66fa2047b265caa3389314e2",
+                "ref": "676e6d878b58a2da8453573fa4b389fca32bc0a9",
             },
         },
     )
@@ -128,7 +128,7 @@ class BundleManifestTests(unittest.TestCase):
         self.assertIn("bundle.lock", dockerfile)
         self.assertNotIn("--openclaw-ref openclaw@2026.6.8", dockerfile)
         self.assertNotIn(
-            "--plugin-ref 9e564878f6057a6c66fa2047b265caa3389314e2",
+            "--plugin-ref 676e6d878b58a2da8453573fa4b389fca32bc0a9",
             dockerfile,
         )
 
@@ -142,6 +142,9 @@ class BundleManifestTests(unittest.TestCase):
         self.assertNotIn("npm install -g openclaw@latest", dockerfile)
         self.assertIn("COPY tiny_runtime ./tiny_runtime", dockerfile)
         self.assertIn("COPY tinyhat_cli ./tinyhat_cli", dockerfile)
+        self.assertIn("ARG TINYHAT_RUNTIME_IMAGE_MODE=legacy_supervisor", dockerfile)
+        self.assertIn("TINYHAT_RUNTIME_IMAGE_MODE=${TINYHAT_RUNTIME_IMAGE_MODE}", dockerfile)
+        self.assertIn('rm -f supervisor.py', dockerfile)
 
 
 class HotImageTests(unittest.TestCase):
@@ -1263,6 +1266,7 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             os.symlink(target, current)
             backup_paths: list[Path] = []
             doctor_calls: list[bool] = []
+            plugin_bindings: list[dict] = []
 
             def fake_backup_create(*, output_path: Path) -> dict:
                 backup_paths.append(output_path)
@@ -1279,6 +1283,10 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                 doctor_calls.append(True)
                 return {"state": "ready", "detail": {"command": ["openclaw", "doctor"]}}
 
+            def fake_materialize_tinyhat_plugin(binding: dict) -> dict:
+                plugin_bindings.append(binding)
+                return {"state": "ready", "action": "installed"}
+
             runner = RuntimeCommandRunner(
                 ledger=CommandLedger(root=base / "commands"),
                 bundles_dir=bundles,
@@ -1291,6 +1299,11 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
 
             with (
                 patch.object(openclaw_adapter, "backup_create", fake_backup_create),
+                patch.object(
+                    openclaw_adapter,
+                    "materialize_tinyhat_plugin",
+                    fake_materialize_tinyhat_plugin,
+                ),
                 patch.object(openclaw_adapter, "doctor_repair", fake_doctor_repair),
                 patch.object(
                     openclaw_adapter,
@@ -1316,6 +1329,11 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(result["phase"], "attested")
             self.assertEqual(result["result"]["bundle_id"], manifest["bundle_id"])
             self.assertEqual(result["result"]["backup"]["state"], "ready")
+            self.assertEqual(result["result"]["tinyhat_plugin"]["state"], "ready")
+            self.assertEqual(
+                plugin_bindings[0]["tinyhat_platform"]["plugin"]["resolved_commit_sha"],
+                "676e6d878b58a2da8453573fa4b389fca32bc0a9",
+            )
             self.assertEqual(len(backup_paths), 1)
             self.assertEqual(backup_paths[0].parent, base / "rebuild-backups")
             self.assertEqual(doctor_calls, [True])
@@ -1386,6 +1404,71 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(doctor_calls, [])
             self.assertEqual(Path(os.readlink(current)).resolve(), target.resolve())
 
+    def test_rebuild_app_layer_fails_closed_when_plugin_materialization_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, _manifest = _install_bundle_under_id(
+                bundles,
+                base / "current-bundle",
+                marker="rebuild-target",
+            )
+            current = base / "current"
+            os.symlink(target, current)
+            doctor_calls: list[bool] = []
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                rebuild_backup_dir=base / "rebuild-backups",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            with (
+                patch.object(
+                    openclaw_adapter,
+                    "backup_create",
+                    lambda *, output_path: {
+                        "state": "ready",
+                        "archive_path": str(output_path),
+                        "archive_bytes": 12,
+                        "backup": {"verified": True},
+                    },
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "materialize_tinyhat_plugin",
+                    lambda _binding: {"state": "failed", "stage": "install"},
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "doctor_repair",
+                    lambda: doctor_calls.append(True) or {"state": "ready"},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-rebuild-plugin-fail",
+                        "idempotency_key": "idem-rebuild-plugin-fail",
+                        "kind": "rebuild_app_layer",
+                        "spec": {"reason": "manual_canary_repair"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "tinyhat_plugin")
+            self.assertEqual(result["failure_code"], "tinyhat_plugin_failed")
+            self.assertEqual(result["result"]["tinyhat_plugin"]["state"], "failed")
+            self.assertEqual(doctor_calls, [])
+            self.assertNotIn("activation", result["result"])
+            self.assertNotIn("attestation", result["result"])
+
     def test_rebuild_app_layer_reports_doctor_failure_without_false_success(
         self,
     ) -> None:
@@ -1421,6 +1504,11 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                         "archive_bytes": 12,
                         "backup": {"verified": True},
                     },
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "materialize_tinyhat_plugin",
+                    lambda _binding: {"state": "ready", "action": "installed"},
                 ),
                 patch.object(
                     openclaw_adapter,
@@ -2141,6 +2229,56 @@ class PlatformLoopTests(unittest.TestCase):
 
         self.assertGreaterEqual(platform_loop.GATEWAY_READY_WAIT_SECONDS, 75)
 
+    def test_runtime_command_dispatch_can_disable_service_restart_for_dev_container(
+        self,
+    ) -> None:
+        from tinyhat_runtime import platform_loop
+
+        captured_kwargs: dict = {}
+
+        class FakeRunner:
+            def __init__(self, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+            def execute(self, command: dict) -> dict:
+                return {
+                    "command_id": command["command_id"],
+                    "kind": command["kind"],
+                    "status": "applied",
+                }
+
+        client = Mock()
+        client.post_json.return_value = {}
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.dict(os.environ, {"TINYHAT_RUNTIME_NO_SERVICE_RESTART": "1"}),
+            patch.object(platform_loop, "RuntimeCommandRunner", FakeRunner),
+        ):
+            loop._dispatch_runtime_command(
+                {
+                    "type": "runtime_command",
+                    "command": {
+                        "command_id": "cmd-rebuild",
+                        "idempotency_key": "idem-rebuild",
+                        "kind": "rebuild_app_layer",
+                        "spec": {"reason": "admin_rebuild_app_layer"},
+                    },
+                }
+            )
+
+        self.assertFalse(captured_kwargs["service_restart"])
+        client.post_json.assert_called_once_with(
+            "/hapi/v1/computers/me/runtime-command/result",
+            {
+                "result": {
+                    "command_id": "cmd-rebuild",
+                    "kind": "rebuild_app_layer",
+                    "status": "applied",
+                }
+            },
+        )
+
     def test_gateway_ready_wait_polls_until_official_health_recovers(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -2409,11 +2547,22 @@ class SystemdUnitTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('TINYHAT_RUNTIME_MODE:-legacy_supervisor', entrypoint)
+        self.assertIn(
+            'runtime_mode="${TINYHAT_RUNTIME_MODE:-${TINYHAT_RUNTIME_IMAGE_MODE:-legacy_supervisor}}"',
+            entrypoint,
+        )
         self.assertIn('== "tiny_runtime"', entrypoint)
+        self.assertIn("prepare_tiny_runtime_bundle", entrypoint)
+        self.assertIn("TINYHAT_RUNTIME_SKIP_SYSTEMD=1", entrypoint)
+        self.assertIn("/tmp/tinyhat-rebuild-backups", entrypoint)
+        self.assertIn('TAILSCALE_STATE_DIR="${TINYHAT_TAILSCALE_STATE_DIR:-/var/lib/tinyhat-tailscale}"', entrypoint)
+        self.assertIn('--state="${TAILSCALE_STATE_DIR}/tailscaled.state"', entrypoint)
+        self.assertIn('rm -rf -- "${RUNTIME_HOME}/tailscale"', entrypoint)
         self.assertIn("python3 -m tinyhat_runtime.main gateway run", entrypoint)
         self.assertIn("python3 -m tinyhat_runtime.main platform loop", entrypoint)
+        self.assertIn("TINYHAT_RUNTIME_NO_SERVICE_RESTART", entrypoint)
         self.assertIn("tailscale logout", entrypoint)
+        self.assertIn('chown -R tinyhat:tinyhat "${PRIVATE_ACCESS_STATUS_DIR}"', entrypoint)
         self.assertIn('"node_name": os.environ.get("TINYHAT_TAILSCALE_NODE_NAME")', entrypoint)
         branch = entrypoint[
             entrypoint.index('== "tiny_runtime"') : entrypoint.index(
@@ -2443,6 +2592,21 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
         self.assertNotIn("TAILSCALE_AUTH_KEY", script)
         self.assertNotIn("tailscale_auth_file", script)
+
+    def test_source_reinstall_cleans_legacy_processes_before_tiny_runtime_start(
+        self,
+    ) -> None:
+        script = (_REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+
+        cleanup_pos = script.index("cleanup_legacy_openclaw_processes")
+        enable_pos = script.index("systemctl enable --now")
+
+        self.assertLess(cleanup_pos, enable_pos)
+        self.assertIn('&& "${args}" == *"${RUNTIME_DIR}/supervisor.py"*', script)
+        self.assertIn('&& "${args}" == *"--auth none"*', script)
+        self.assertIn('&& "${args}" == *"--tailscale off"*', script)
+        self.assertIn('kill -TERM "${pids[@]}"', script)
+        self.assertIn('kill -KILL "${pids[@]}"', script)
 
     def test_assembled_bundle_carries_computer_startup_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

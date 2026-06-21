@@ -15,6 +15,8 @@
 set -euo pipefail
 
 RUNTIME_HOME="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
+TINY_RUNTIME_BUNDLE_DIR="/opt/tinyhat-runtime/tiny_runtime"
+TAILSCALE_STATE_DIR="${TINYHAT_TAILSCALE_STATE_DIR:-/var/lib/tinyhat-tailscale}"
 
 # The supervisor reports metrics.private_access ONLY when this file
 # exists with provider="tailscale"; the backend merges that report into
@@ -26,6 +28,65 @@ RUNTIME_HOME="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
 PRIVATE_ACCESS_STATUS_DIR="/var/lib/tinyhat-private-access"
 PRIVATE_ACCESS_STATUS_FILE="${PRIVATE_ACCESS_STATUS_DIR}/bootstrap-status.json"
 
+prepare_tiny_runtime_bundle() {
+  local install_root="${TINYHAT_RUNTIME_INSTALL_ROOT:-/opt/tinyhat}"
+  local runtime_ref="${TINYHAT_RUNTIME_REF:-docker-dev}"
+  local openclaw_ref
+  local plugin_ref
+
+  export TINYHAT_RUNTIME_INSTALL_ROOT="${install_root}"
+  export TINYHAT_RUNTIME_BUNDLES_DIR="${TINYHAT_RUNTIME_BUNDLES_DIR:-${install_root}/bundles}"
+  export TINYHAT_RUNTIME_CURRENT_LINK="${TINYHAT_RUNTIME_CURRENT_LINK:-${install_root}/current}"
+  # In the dev container OpenClaw's source state lives under $RUNTIME_HOME.
+  # Keep rebuild backups outside that tree because OpenClaw intentionally
+  # refuses to write a backup archive inside the source being backed up.
+  export TINYHAT_RUNTIME_REBUILD_BACKUP_DIR="${TINYHAT_RUNTIME_REBUILD_BACKUP_DIR:-/tmp/tinyhat-rebuild-backups}"
+
+  mkdir -p \
+    "${TINYHAT_RUNTIME_INSTALL_ROOT}" \
+    "${TINYHAT_RUNTIME_BUNDLES_DIR}" \
+    "$(dirname "${TINYHAT_RUNTIME_CURRENT_LINK}")" \
+    "${TINYHAT_RUNTIME_REBUILD_BACKUP_DIR}"
+  chown -R tinyhat:tinyhat \
+    "${TINYHAT_RUNTIME_INSTALL_ROOT}" \
+    "${TINYHAT_RUNTIME_REBUILD_BACKUP_DIR}"
+
+  openclaw_ref="$(
+    python3 - <<'PY'
+import json
+
+with open("/opt/tinyhat-runtime/tiny_runtime/bake/bundle.lock", encoding="utf-8") as fh:
+    print(json.load(fh)["dependencies"]["openclaw"]["resolved"])
+PY
+  )"
+  plugin_ref="$(
+    python3 - <<'PY'
+import json
+
+with open("/opt/tinyhat-runtime/tiny_runtime/bake/bundle.lock", encoding="utf-8") as fh:
+    print(json.load(fh)["dependencies"]["tinyhat_openclaw_plugin"]["ref"])
+PY
+  )"
+
+  gosu tinyhat env \
+    PYTHONPATH="${TINY_RUNTIME_BUNDLE_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m tinyhat_runtime.main bundle write \
+      --bundle-dir "${TINY_RUNTIME_BUNDLE_DIR}" \
+      --runtime-ref "${runtime_ref}" \
+      --openclaw-ref "${openclaw_ref}" \
+      --plugin-ref "${plugin_ref}" >/dev/null
+
+  gosu tinyhat env \
+    TINYHAT_RUNTIME_SKIP_SYSTEMD=1 \
+    TINYHAT_RUNTIME_BUNDLE_DIR="${TINY_RUNTIME_BUNDLE_DIR}" \
+    TINYHAT_RUNTIME_INSTALL_ROOT="${TINYHAT_RUNTIME_INSTALL_ROOT}" \
+    TINYHAT_RUNTIME_BUNDLES_DIR="${TINYHAT_RUNTIME_BUNDLES_DIR}" \
+    TINYHAT_RUNTIME_CURRENT_LINK="${TINYHAT_RUNTIME_CURRENT_LINK}" \
+    "${TINY_RUNTIME_BUNDLE_DIR}/install.sh" >/tmp/tinyhat-dev-bundle-install.json
+
+  echo "[dev-entrypoint] tiny_runtime bundle installed: $(cat /tmp/tinyhat-dev-bundle-install.json)"
+}
+
 if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
   mkdir -p "${PRIVATE_ACCESS_STATUS_DIR}"
   if [[ -n "${TINYHAT_TAILSCALE_AUTH_KEY_FILE:-}" \
@@ -33,11 +94,16 @@ if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
     echo "[dev-entrypoint] starting tailscaled (userspace networking)..."
     # Userspace networking needs no NET_ADMIN / /dev/net/tun, so this runs
     # under Docker Desktop without extra container capabilities.
-    mkdir -p /var/run/tailscale "${RUNTIME_HOME}/tailscale"
+    mkdir -p /var/run/tailscale "${TAILSCALE_STATE_DIR}"
+    if [[ -d "${RUNTIME_HOME}/tailscale" && "${TAILSCALE_STATE_DIR}" != "${RUNTIME_HOME}/tailscale" ]]; then
+      # Older dev harnesses put Tailscale state under the OpenClaw state tree.
+      # Keep transport state out of app-layer rebuild backups.
+      rm -rf -- "${RUNTIME_HOME}/tailscale"
+    fi
     tailscaled \
       --tun=userspace-networking \
-      --state="${RUNTIME_HOME}/tailscale/tailscaled.state" \
-      --statedir="${RUNTIME_HOME}/tailscale" \
+      --state="${TAILSCALE_STATE_DIR}/tailscaled.state" \
+      --statedir="${TAILSCALE_STATE_DIR}" \
       >"${RUNTIME_HOME}/tailscaled.log" 2>&1 &
 
     # Wait for the daemon socket (default path) before `tailscale up`.
@@ -90,9 +156,17 @@ PY
   fi
 fi
 
-if [[ "${TINYHAT_RUNTIME_MODE:-legacy_supervisor}" == "tiny_runtime" ]]; then
+if [[ -d "${PRIVATE_ACCESS_STATUS_DIR}" ]]; then
+  chown -R tinyhat:tinyhat "${PRIVATE_ACCESS_STATUS_DIR}"
+fi
+
+runtime_mode="${TINYHAT_RUNTIME_MODE:-${TINYHAT_RUNTIME_IMAGE_MODE:-legacy_supervisor}}"
+
+if [[ "${runtime_mode}" == "tiny_runtime" ]]; then
   echo "[dev-entrypoint] starting tiny_runtime platform loop as tinyhat..."
-  export PYTHONPATH="/opt/tinyhat-runtime/tiny_runtime${PYTHONPATH:+:${PYTHONPATH}}"
+  prepare_tiny_runtime_bundle
+  export PYTHONPATH="${TINY_RUNTIME_BUNDLE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+  export TINYHAT_RUNTIME_NO_SERVICE_RESTART="${TINYHAT_RUNTIME_NO_SERVICE_RESTART:-1}"
   exec gosu tinyhat bash -lc '
     set -euo pipefail
     runtime_home="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"

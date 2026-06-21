@@ -106,12 +106,65 @@ chown_runtime_paths() {
     "${TINYHAT_RUNTIME_LOG_ROOT}"
 }
 
+legacy_process_pids() {
+  local mode="$1"
+  local pid
+  local args
+  ps -eo pid=,args= 2>/dev/null | while read -r pid args; do
+    [[ -n "${pid}" ]] || continue
+    [[ "${pid}" != "$$" ]] || continue
+    case "${mode}" in
+      supervisor)
+        if [[ "${args}" == *"python3"* \
+          && "${args}" == *"${RUNTIME_DIR}/supervisor.py"* ]]; then
+          printf '%s\n' "${pid}"
+        fi
+        ;;
+      gateway)
+        if [[ "${args}" == *"openclaw gateway run"* \
+          && "${args}" == *"--auth none"* \
+          && "${args}" == *"--tailscale off"* ]]; then
+          printf '%s\n' "${pid}"
+        fi
+        ;;
+    esac
+  done
+}
+
+terminate_legacy_processes() {
+  local mode="$1"
+  local label="$2"
+  local pids=()
+  local attempt
+  mapfile -t pids < <(legacy_process_pids "${mode}")
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  echo "[tinyhat-runtime] terminating ${label}: ${pids[*]}"
+  kill -TERM "${pids[@]}" >/dev/null 2>&1 || true
+  for attempt in 1 2 3; do
+    sleep 1
+    mapfile -t pids < <(legacy_process_pids "${mode}")
+    if [[ "${#pids[@]}" -eq 0 ]]; then
+      return 0
+    fi
+  done
+  echo "[tinyhat-runtime] force-killing ${label}: ${pids[*]}"
+  kill -KILL "${pids[@]}" >/dev/null 2>&1 || true
+}
+
+cleanup_legacy_openclaw_processes() {
+  terminate_legacy_processes supervisor "legacy supervisor processes"
+  terminate_legacy_processes gateway "legacy gateway processes"
+}
+
 remove_legacy_openclaw_units() {
   echo "[tinyhat-runtime] removing legacy tinyhat-openclaw supervisor units"
   systemctl stop \
     "${SUPERVISOR_UNIT_NAME}" \
     "${GATEWAY_UNIT_NAME}" \
     "${WORKLOAD_SLICE_UNIT_NAME}" >/dev/null 2>&1 || true
+  cleanup_legacy_openclaw_processes
   systemctl disable \
     "${SUPERVISOR_UNIT_NAME}" \
     "${GATEWAY_UNIT_NAME}" >/dev/null 2>&1 || true

@@ -29,6 +29,7 @@
 # latest 22.x patch so we always satisfy the >=22.19 floor without
 # pinning a specific patch that goes stale.
 FROM node:22-slim
+ARG TINYHAT_RUNTIME_IMAGE_MODE=legacy_supervisor
 
 # Base OS deps. The prod bootstrap.sh installs these on the VM; we
 # bake them into the image so the container boots clean.
@@ -103,7 +104,8 @@ COPY supervisor.py bootstrap.sh VERSION README.md ./
 COPY tiny_runtime ./tiny_runtime
 COPY tinyhat_cli ./tinyhat_cli
 COPY dev/entrypoint.sh ./dev-entrypoint.sh
-RUN chmod +x supervisor.py bootstrap.sh dev-entrypoint.sh \
+RUN if [ "${TINYHAT_RUNTIME_IMAGE_MODE}" = "tiny_runtime" ]; then rm -f supervisor.py; else chmod +x supervisor.py; fi \
+    && chmod +x bootstrap.sh dev-entrypoint.sh \
     && chown -R tinyhat:tinyhat /opt/tinyhat-runtime
 
 # No ``USER tinyhat``: the dev entrypoint starts as root so it can bring
@@ -118,6 +120,7 @@ RUN chmod +x supervisor.py bootstrap.sh dev-entrypoint.sh \
 # NOT bake a default platform URL into the image.
 ENV TINYHAT_DEV_RUNTIME=1 \
     TINYHAT_RUNTIME_HOME=/home/tinyhat/runtime \
+    TINYHAT_RUNTIME_IMAGE_MODE=${TINYHAT_RUNTIME_IMAGE_MODE} \
     PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["/opt/tinyhat-runtime/dev-entrypoint.sh"]
