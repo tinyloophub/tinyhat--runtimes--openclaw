@@ -3363,5 +3363,48 @@ class BakeScriptTests(unittest.TestCase):
             )
 
 
+class GceStartupScriptTests(unittest.TestCase):
+    def test_gce_startup_script_is_public_runtime_owner_boundary(self) -> None:
+        script = (
+            _REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-gce-startup"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("git clone", script)
+        self.assertIn("cache_marker_has runtime_resolved_sha", script)
+        self.assertIn("bash \"${RUNTIME_DIR}/bootstrap.sh\"", script)
+        self.assertIn("tinyhat-computer-startup", script)
+        runtime_entrypoints = "\n".join(
+            [
+                (_REPO_ROOT / "tiny_runtime" / "tinyhat_runtime" / "main.py").read_text(
+                    encoding="utf-8"
+                ),
+                (
+                    _REPO_ROOT
+                    / "tiny_runtime"
+                    / "tinyhat_runtime"
+                    / "runtime_commands.py"
+                ).read_text(encoding="utf-8"),
+            ]
+        )
+        self.assertIn(
+            "/hapi/v1/computers/me/private-access/enrollment",
+            runtime_entrypoints,
+        )
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("OPENROUTER_API_KEY", script)
+        self.assertNotIn("tinyloop/backend", script)
+
+    def test_gce_startup_script_passes_shell_syntax_check(self) -> None:
+        completed = subprocess.run(
+            ["bash", "-n", str(_REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-gce-startup")],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

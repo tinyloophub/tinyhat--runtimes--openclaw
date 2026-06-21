@@ -42,7 +42,8 @@ environment-specific.
 | File | Purpose |
 | --- | --- |
 | `supervisor.py` | The platform-communication supervisor (state, binding, heartbeat, gateway monitor, OpenClaw config writer). Reads `tinyhat-backend-audience` and `tinyhat-platform-base-url` from instance metadata. |
-| `bootstrap.sh` | The runtime's install command. Installs generic Computer dependencies, optional private access, the requested framework package, and the supervisor + gateway systemd units after the VM's thin startup script clones this repo. |
+| `tiny_runtime/bin/tinyhat-gce-startup` | Public GCE startup owner for source-mode Computers. The platform launcher downloads this script at the selected runtime ref; this script owns dependency install, public runtime-cache use, clone/checkout, and `bootstrap.sh` handoff. |
+| `bootstrap.sh` | The runtime's install command. Installs generic Computer dependencies, optional private access, the requested framework package, and the supervisor + gateway systemd units after `tinyhat-gce-startup` clones this repo. |
 | `VERSION` | The runtime version published by this repo; recorded per Computer alongside the resolved commit SHA. |
 | `tiny_runtime/` | Greenfield M1 runtime substrate: content-addressed bundle assembly, install/activation shims, systemd units rooted at `/opt/tinyhat/current`, identity/attestation, and the single OpenClaw adapter boundary. |
 | `dev/` | Local-development container that runs the supervisor + real OpenClaw against a dev backend without GCE provisioning. See [`dev/README.md`](dev/README.md). |
@@ -59,7 +60,11 @@ the trust boundary and the build/run recipe.
 
 ## How a Computer uses this repo
 
-The VM's GCE startup script is a thin bootstrap:
+The platform's VM metadata startup script is only a launcher: it either
+execs the baked bundle entrypoint (`tiny_runtime/bin/tinyhat-computer-startup`)
+or downloads `tiny_runtime/bin/tinyhat-gce-startup` from this public repo at
+the selected ref/SHA and execs it. From that point on, public runtime code owns
+the Computer-side boot sequence:
 
 1. install only the minimal packages needed to clone this repo;
 2. `git clone` this repository and `git checkout` the configured
