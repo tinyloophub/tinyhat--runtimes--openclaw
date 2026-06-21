@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Runtime-owned boot entrypoint for Tinyhat-managed Computers.
+#
+# The platform creates the VM and records non-secret metadata. This script,
+# shipped from the public runtime bundle, owns the code that runs on the
+# Computer: environment materialization, bundle verification, platform-backed
+# private access enrollment, and tiny_runtime systemd activation.
+set -euo pipefail
+
+RUNTIME_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+TINYHAT_RUNTIME_BIN="${RUNTIME_ROOT}/bin/tinyhat-runtime"
+RUNTIME_ENV_FILE="${TINYHAT_RUNTIME_ENV_FILE:-/etc/tinyhat/runtime.env}"
+BUNDLE_STATUS_PATH="${TINYHAT_RUNTIME_BUNDLE_STATUS_PATH:-/var/lib/tinyhat-openclaw/tiny-runtime-bundle.env}"
+BOOTSTRAP_LOG_PATH="${TINYHAT_RUNTIME_BOOTSTRAP_LOG_PATH:-/var/log/tinyhat-bootstrap.log}"
+METADATA_ROOT="http://metadata.google.internal/computeMetadata/v1"
+
+if [[ "${TINYHAT_COMPUTER_STARTUP_LOG_REDIRECTED:-0}" != "1" ]]; then
+  mkdir -p "$(dirname "${BOOTSTRAP_LOG_PATH}")"
+  export TINYHAT_COMPUTER_STARTUP_LOG_REDIRECTED=1
+  exec > >(tee -a "${BOOTSTRAP_LOG_PATH}") 2>&1
+fi
+
+log() {
+  printf '[tinyhat-runtime] %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+metadata_get() {
+  local key="$1"
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    "${METADATA_ROOT}/instance/attributes/${key}" 2>/dev/null || true
+}
+
+metadata_or_env() {
+  local metadata_key="$1"
+  local env_name="$2"
+  local default_value="${3:-}"
+  local value
+  value="$(metadata_get "${metadata_key}")"
+  if [[ -n "${value}" ]]; then
+    printf '%s' "${value}"
+  elif [[ -n "${!env_name:-}" ]]; then
+    printf '%s' "${!env_name}"
+  else
+    printf '%s' "${default_value}"
+  fi
+}
+
+wait_for_metadata() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -sSf -H 'Metadata-Flavor: Google' "${METADATA_ROOT}/" >/dev/null; then
+      return 0
+    fi
+    log "metadata server not ready yet (attempt ${attempt})"
+    sleep 2
+  done
+  log "WARNING: metadata server did not answer; continuing with environment fallbacks"
+}
+
+write_runtime_env() {
+  local backend_audience platform_base_url startup_image_mode image_source_kind
+  local source_image bundle_id bundle_manifest_sha runtime_repo_ref
+  backend_audience="$(metadata_or_env tinyhat-backend-audience TINYHAT_BACKEND_AUDIENCE)"
+  platform_base_url="$(metadata_or_env tinyhat-platform-base-url TINYHAT_PLATFORM_BASE_URL)"
+  startup_image_mode="$(metadata_or_env tinyhat-startup-image-mode TINYHAT_RUNTIME_STARTUP_IMAGE_MODE tiny_runtime_bundle)"
+  image_source_kind="$(metadata_or_env tinyhat-startup-image-source-kind TINYHAT_RUNTIME_IMAGE_SOURCE_KIND)"
+  source_image="$(metadata_or_env tinyhat-startup-source-image TINYHAT_RUNTIME_SOURCE_IMAGE)"
+  bundle_id="$(metadata_or_env tinyhat-runtime-bundle-id TINYHAT_RUNTIME_EXPECTED_BUNDLE_ID)"
+  bundle_manifest_sha="$(metadata_or_env tinyhat-runtime-bundle-manifest-sha TINYHAT_RUNTIME_EXPECTED_BUNDLE_MANIFEST_SHA)"
+  runtime_repo_ref="$(metadata_or_env tinyhat-runtime-repo-ref TINYHAT_RUNTIME_EXPECTED_REPO_REF)"
+
+  if [[ -z "${backend_audience}" || -z "${platform_base_url}" ]]; then
+    log "ERROR: tinyhat platform base URL and backend audience are required"
+    exit 42
+  fi
+
+  install -d -m 0755 "$(dirname "${RUNTIME_ENV_FILE}")"
+  cat >"${RUNTIME_ENV_FILE}" <<TINYHAT_RUNTIME_ENV
+TINYHAT_BACKEND_AUDIENCE=${backend_audience}
+TINYHAT_PLATFORM_BASE_URL=${platform_base_url}
+TINYHAT_RUNTIME_EXPECTED_BUNDLE_ID=${bundle_id}
+TINYHAT_RUNTIME_EXPECTED_BUNDLE_MANIFEST_SHA=${bundle_manifest_sha}
+TINYHAT_RUNTIME_EXPECTED_REPO_REF=${runtime_repo_ref}
+TINYHAT_RUNTIME_INSTALL_ROOT=/opt/tinyhat
+TINYHAT_RUNTIME_CURRENT_LINK=/opt/tinyhat/current
+TINYHAT_OPENCLAW_RUNTIME_USER=tinyhat
+TINYHAT_OPENCLAW_RUNTIME_GROUP=tinyhat
+TINYHAT_RUNTIME_LOG_ROOT=/var/log/tinyhat
+TINYHAT_RUNTIME_BUNDLE_STATUS_PATH=${BUNDLE_STATUS_PATH}
+TINYHAT_RUNTIME_GENERATION=tiny_runtime
+TINYHAT_RUNTIME_STARTUP_IMAGE_MODE=${startup_image_mode}
+TINYHAT_RUNTIME_IMAGE_SOURCE_KIND=${image_source_kind}
+TINYHAT_RUNTIME_SOURCE_IMAGE=${source_image}
+TINYHAT_RUNTIME_NO_INSTALL_ON_BOOT=1
+TINYHAT_RUNTIME_BOOTSTRAP_MANIFEST_VERSION=4
+TINYHAT_RUNTIME_ENV
+  chmod 0600 "${RUNTIME_ENV_FILE}"
+}
+
+load_runtime_env() {
+  set -a
+  # shellcheck disable=SC1090
+  . "${RUNTIME_ENV_FILE}"
+  set +a
+}
+
+verify_bundle() {
+  if [[ ! -x "${TINYHAT_RUNTIME_BIN}" ]]; then
+    log "ERROR: tinyhat-runtime binary missing at ${TINYHAT_RUNTIME_BIN}"
+    exit 42
+  fi
+  local manifest_path observed_bundle_id observed_manifest_sha
+  manifest_path="${RUNTIME_ROOT}/bundle-manifest.json"
+  if [[ ! -f "${manifest_path}" ]]; then
+    log "ERROR: baked tiny_runtime manifest missing at ${manifest_path}"
+    exit 42
+  fi
+  observed_bundle_id="$("${TINYHAT_RUNTIME_BIN}" bundle id --bundle-dir "${RUNTIME_ROOT}")"
+  if [[ -n "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_ID:-}" \
+    && "${observed_bundle_id}" != "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_ID}" ]]; then
+    log "ERROR: baked tiny_runtime bundle id mismatch: ${observed_bundle_id}"
+    exit 42
+  fi
+  observed_manifest_sha="$(sha256sum "${manifest_path}" | awk '{print $1}')"
+  if [[ -n "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_MANIFEST_SHA:-}" \
+    && "${observed_manifest_sha}" != "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_MANIFEST_SHA}" ]]; then
+    log "ERROR: baked tiny_runtime manifest SHA mismatch: ${observed_manifest_sha}"
+    exit 42
+  fi
+  write_bundle_status "${observed_bundle_id}" "${observed_manifest_sha}"
+}
+
+write_bundle_status() {
+  local observed_bundle_id="$1"
+  local observed_manifest_sha="$2"
+  install -d -m 0755 "$(dirname "${BUNDLE_STATUS_PATH}")"
+  {
+    printf 'mode=tiny_runtime_bundle\n'
+    printf 'status=verified\n'
+    printf 'current_link=%s\n' "${RUNTIME_ROOT}"
+    printf 'bundle_id=%s\n' "${observed_bundle_id}"
+    printf 'expected_bundle_id=%s\n' "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_ID:-}"
+    printf 'bundle_manifest_sha=%s\n' "${observed_manifest_sha}"
+    printf 'expected_bundle_manifest_sha=%s\n' "${TINYHAT_RUNTIME_EXPECTED_BUNDLE_MANIFEST_SHA:-}"
+    printf 'runtime_repo_ref=%s\n' "${TINYHAT_RUNTIME_EXPECTED_REPO_REF:-}"
+  } >"${BUNDLE_STATUS_PATH}"
+}
+
+start_services() {
+  systemctl daemon-reload
+  systemctl enable --now \
+    tinyhat-runtime-gateway.service \
+    tinyhat-runtime-attestation.service \
+    tinyhat-runtime-platform.service
+}
+
+main() {
+  log "computer startup starting from ${RUNTIME_ROOT}"
+  wait_for_metadata
+  write_runtime_env
+  load_runtime_env
+  verify_bundle
+
+  log "lifecycle entrypoint: tiny_runtime/tinyhat_runtime/main.py::platform warm-config"
+  "${TINYHAT_RUNTIME_BIN}" platform warm-config \
+    --platform-base-url "${TINYHAT_PLATFORM_BASE_URL}" \
+    --backend-audience "${TINYHAT_BACKEND_AUDIENCE}"
+
+  log "lifecycle entrypoint: tiny_runtime/tinyhat_runtime/main.py::private-access enroll-platform"
+  if ! "${TINYHAT_RUNTIME_BIN}" private-access enroll-platform; then
+    log "WARNING: private-access enrollment failed; platform loop will report diagnostics"
+  fi
+
+  start_services
+  log "computer startup complete"
+}
+
+main "$@"

@@ -29,12 +29,10 @@
 #       from the checked-out runtime source, installs it, starts only the
 #       tinyhat-runtime-* services, and exits.
 #
-# Optional private-access material is passed by the platform startup
-# script through env and consumed here:
-#   TINYHAT_PRIVATE_ACCESS_PROVIDER
-#   TINYHAT_TAILSCALE_AUTH_KEY
-#   TINYHAT_TAILSCALE_NODE_NAME
-#   TINYHAT_TAILSCALE_TAGS
+# Private-access enrollment is runtime-owned. The Computer authenticates to
+# the platform with its service-account identity and pulls one-time enrollment
+# material from /hapi/v1/computers/me/private-access/enrollment; the platform
+# startup metadata must not carry provider auth keys.
 #
 # This file ships in the standalone public Tinyhat Computer runtime
 # repository. It must not import from or assume the Tinyhat monorepo.
@@ -60,7 +58,6 @@ RUNTIME_BOOTSTRAP_STATUS_PATH="${OPENCLAW_STATE_DIR}/bootstrap-status.json"
 OPENCLAW_GATEWAY_PORT="18789"
 OPENCLAW_INSTALL_SPEC="${TINYHAT_FRAMEWORK_INSTALL_SPEC:-}"
 CODEX_SUBSCRIPTION_PLUGIN_PACKAGE="@openclaw/codex"
-PRIVATE_ACCESS_PROVIDER="${TINYHAT_PRIVATE_ACCESS_PROVIDER:-disabled}"
 TINYHAT_RUNTIME_USER="${TINYHAT_OPENCLAW_RUNTIME_USER:-tinyhat}"
 TINYHAT_RUNTIME_GROUP="${TINYHAT_OPENCLAW_RUNTIME_GROUP:-tinyhat}"
 HARD_RESET_USER_STATE_MIGRATION="${TINYHAT_HARD_RESET_USER_STATE_MIGRATION:-0}"
@@ -145,7 +142,6 @@ TINYHAT_PLATFORM_PLUGIN_REPO_URL=${TINYHAT_PLATFORM_PLUGIN_REPO_URL:-}
 TINYHAT_PLATFORM_PLUGIN_REPO_REF=${TINYHAT_PLATFORM_PLUGIN_REPO_REF:-}
 TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH=${TINYHAT_PUBLIC_RUNTIME_CACHE_STATUS_PATH:-}
 TINYHAT_HARD_RESET_USER_STATE_MIGRATION=${HARD_RESET_USER_STATE_MIGRATION}
-TINYHAT_PRIVATE_ACCESS_PROVIDER=${PRIVATE_ACCESS_PROVIDER}
 TINYHAT_RUNTIME_EXPECTED_REPO_REF=$(git -C "${RUNTIME_DIR}" rev-parse HEAD 2>/dev/null || printf '%s' "${TINYHAT_RUNTIME_EXPECTED_REPO_REF:-unknown}")
 TINYHAT_RUNTIME_INSTALL_ROOT=/opt/tinyhat
 TINYHAT_RUNTIME_CURRENT_LINK=/opt/tinyhat/current
@@ -216,6 +212,10 @@ install_tiny_runtime_from_source() {
     --platform-base-url "${TINYHAT_PLATFORM_BASE_URL:-}" \
     --backend-audience "${TINYHAT_BACKEND_AUDIENCE:-}" \
     || fail_tiny_runtime_source_reinstall "tiny_runtime platform warm-config failed"
+  echo "[tinyhat-runtime] enrolling private access via Computer identity"
+  if ! /opt/tinyhat/current/bin/tinyhat-runtime private-access enroll-platform; then
+    echo "[tinyhat-runtime] WARNING: private-access enrollment failed; platform loop will report diagnostics" >&2
+  fi
   systemctl daemon-reload \
     || fail_tiny_runtime_source_reinstall "systemd daemon reload failed"
   remove_legacy_openclaw_units
@@ -235,6 +235,16 @@ verify_codex_subscription_plugin() {
     OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" \
     openclaw plugins inspect codex --json \
     | python3 -c 'import json, sys; p=(json.load(sys.stdin).get("plugin") or {}); ids=p.get("providerIds") or p.get("providers") or []; sys.exit(0 if p.get("id") == "codex" and p.get("enabled") is not False and p.get("status") == "loaded" and "codex" in ids else 1)'
+}
+
+enroll_private_access_from_platform_source() {
+  echo "[tinyhat-runtime] enrolling private access via Computer identity"
+  if PYTHONPATH="${RUNTIME_DIR}/tiny_runtime" \
+    python3 -m tinyhat_runtime.main private-access enroll-platform; then
+    echo "[tinyhat-runtime] private access enrollment command completed"
+  else
+    echo "[tinyhat-runtime] WARNING: private-access enrollment failed; OpenClaw bootstrap will continue" >&2
+  fi
 }
 
 remove_path_if_present() {
@@ -572,49 +582,7 @@ ensure_runtime_user
 hard_reset_openclaw_user_state_layout
 mkdir -p /opt/tinyhat /etc/openclaw /etc/tinyhat /var/lib/tinyhat /var/lib/tinyhat-private-access "${TINYHAT_RUNTIME_LOG_ROOT}"
 chown_runtime_paths
-
-if [[ "${PRIVATE_ACCESS_PROVIDER}" == "tailscale" ]]; then
-  TAILSCALE_AUTH_KEY="${TINYHAT_TAILSCALE_AUTH_KEY:-}"
-  TAILSCALE_NODE_NAME="${TINYHAT_TAILSCALE_NODE_NAME:-}"
-  TAILSCALE_TAGS="${TINYHAT_TAILSCALE_TAGS:-}"
-  if [[ -n "${TAILSCALE_AUTH_KEY}" && -n "${TAILSCALE_NODE_NAME}" ]]; then
-    if ! command -v tailscale >/dev/null 2>&1; then
-      curl -fsSL https://tailscale.com/install.sh | sh
-    fi
-    systemctl enable --now tailscaled
-    tailscale_auth_file="$(mktemp /tmp/tinyhat-tailscale-auth.XXXXXX)"
-    chmod 0600 "${tailscale_auth_file}"
-    printf '%s' "${TAILSCALE_AUTH_KEY}" > "${tailscale_auth_file}"
-    tailscale_up_args=(
-      up
-      "--auth-key=file:${tailscale_auth_file}"
-      "--hostname=${TAILSCALE_NODE_NAME}"
-      --ssh
-    )
-    if [[ -n "${TAILSCALE_TAGS}" ]]; then
-      tailscale_up_args+=("--advertise-tags=${TAILSCALE_TAGS}")
-    fi
-
-    set +e
-    tailscale "${tailscale_up_args[@]}"
-    ts_status="$?"
-    rm -f "${tailscale_auth_file}"
-    set -e
-    if [[ "${ts_status}" == "0" ]]; then
-      echo '{"provider":"tailscale","state":"ready"}' \
-        > /var/lib/tinyhat-private-access/bootstrap-status.json
-      echo "[tinyhat-runtime] private access enrolled with Tailscale"
-    else
-      echo '{"provider":"tailscale","state":"error","diagnostic":"tailscale up failed"}' \
-        > /var/lib/tinyhat-private-access/bootstrap-status.json
-      echo "[tinyhat-runtime] WARNING: Tailscale enrollment failed; OpenClaw bootstrap will continue"
-    fi
-  else
-    echo '{"provider":"tailscale","state":"config_missing","diagnostic":"missing auth key or node name"}' \
-      > /var/lib/tinyhat-private-access/bootstrap-status.json
-    echo "[tinyhat-runtime] WARNING: private access configured but enrollment material is missing"
-  fi
-fi
+enroll_private_access_from_platform_source
 
 if [[ -n "${OPENCLAW_INSTALL_SPEC}" ]]; then
   if install_openclaw_framework_package "${OPENCLAW_INSTALL_SPEC}"; then

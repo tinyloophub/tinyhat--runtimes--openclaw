@@ -7,6 +7,8 @@ Usage:
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import importlib
 import json
 import os
@@ -52,10 +54,16 @@ class _Completed:
 class _FakePlatformClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.gets: list[str] = []
+        self.get_payload: dict = {}
 
     def post_json(self, path: str, body: dict, **_kwargs: object) -> dict:
         self.posts.append((path, body))
         return {}
+
+    def get_json(self, path: str, **_kwargs: object) -> dict:
+        self.gets.append(path)
+        return dict(self.get_payload)
 
 
 def _write_minimal_bundle(root: Path, *, marker: str = "") -> dict:
@@ -851,6 +859,53 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertFalse(result["result"]["restart_requested"])
             self.assertFalse(result["result"]["systemd_restart_requested"])
             self.assertNotIn("tskey-secret", repr(result))
+
+    def test_private_access_cli_pulls_enrollment_with_computer_identity(
+        self,
+    ) -> None:
+        client = _FakePlatformClient()
+        client.get_payload = {
+            "provider": "tailscale",
+            "tailscale_auth_key": "tskey-secret",
+            "tailscale_node_name": "computer-abc123ef",
+            "tailscale_tags": ["tag:tinyhat-computer-prod"],
+        }
+        output = io.StringIO()
+
+        with (
+            patch.object(main, "default_platform_client", return_value=client),
+            patch.object(
+                private_access,
+                "enroll_from_payload",
+                return_value={
+                    "provider": "tailscale",
+                    "state": "ready",
+                    "node_name": "computer-abc123ef",
+                },
+            ) as enroll,
+            patch.object(
+                private_access,
+                "private_access_report",
+                return_value={
+                    "provider": "tailscale",
+                    "state": "ready",
+                    "node_name": "computer-abc123ef",
+                    "tailnet_ip": "100.101.102.103",
+                },
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            rc = main.main(["private-access", "enroll-platform"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            client.gets, ["/hapi/v1/computers/me/private-access/enrollment"]
+        )
+        enroll.assert_called_once_with(client.get_payload)
+        rendered = output.getvalue()
+        self.assertIn('"state": "ready"', rendered)
+        self.assertIn('"tailnet_ip": "100.101.102.103"', rendered)
+        self.assertNotIn("tskey-secret", rendered)
 
     def test_apply_config_command_records_env_block_without_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2029,6 +2084,54 @@ class SystemdUnitTests(unittest.TestCase):
             'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"'
         )
         self.assertLess(chown_pos, verify_pos)
+
+    def test_computer_startup_script_owns_bundle_boot_path(self) -> None:
+        script_path = _REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-computer-startup"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertTrue(os.access(script_path, os.X_OK))
+        self.assertIn("metadata_get()", script)
+        self.assertIn("tinyhat-platform-base-url", script)
+        self.assertIn("tinyhat-backend-audience", script)
+        self.assertIn('private-access enroll-platform', script)
+        self.assertIn("tinyhat-runtime-platform.service", script)
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("tskey-", script)
+
+    def test_source_bootstrap_pulls_private_access_with_computer_identity(self) -> None:
+        script = (_REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "/hapi/v1/computers/me/private-access/enrollment",
+            script,
+        )
+        self.assertIn("private-access enroll-platform", script)
+        self.assertIn("PYTHONPATH=\"${RUNTIME_DIR}/tiny_runtime\"", script)
+        self.assertNotIn("TINYHAT_TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("TAILSCALE_AUTH_KEY", script)
+        self.assertNotIn("tailscale_auth_file", script)
+
+    def test_assembled_bundle_carries_computer_startup_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "bundle"
+            completed = subprocess.run(
+                [
+                    str(_REPO_ROOT / "tiny_runtime" / "bake" / "assemble-bundle.sh"),
+                    str(out_dir),
+                ],
+                cwd=_REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entrypoint = out_dir / "bin" / "tinyhat-computer-startup"
+            self.assertTrue(entrypoint.exists())
+            self.assertTrue(os.access(entrypoint, os.X_OK))
+            self.assertIn(
+                "private-access enroll-platform",
+                entrypoint.read_text(encoding="utf-8"),
+            )
 
     def test_gateway_unit_uses_stable_current_path_and_is_enabled_on_boot(self) -> None:
         unit = (
