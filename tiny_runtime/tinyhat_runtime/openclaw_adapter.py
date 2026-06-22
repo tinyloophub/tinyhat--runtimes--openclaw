@@ -768,10 +768,31 @@ BACKUP_RESTORE_USER_DIRS: tuple[str, ...] = (
     "state",
     "openclaw",
     "tinyhat-control",
-    "workspaces",
+    "workspace",
     "secrets",
     "credentials",
 )
+
+# Subtrees that MUST be present in a healthy backup. If any of these is absent
+# from the payload, the archive is incomplete and a restore would silently lose
+# the data it was supposed to preserve — so we fail loudly instead of reporting
+# a partial restore as success.
+REQUIRED_RESTORE_DIRS: tuple[str, ...] = (
+    "identity",
+    "state",
+)
+
+
+def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
+    """Extract a tar rejecting any member that escapes ``dest`` (absolute paths
+    or ``..`` traversal). Fallback for Python < 3.12 where ``extractall`` has no
+    ``filter`` argument and applies no traversal protection."""
+    dest = dest.resolve()
+    for member in tf.getmembers():
+        target = (dest / member.name).resolve()
+        if dest != target and dest not in target.parents:
+            raise ValueError(f"unsafe tar member rejected: {member.name!r}")
+    tf.extractall(dest)  # noqa: S202 - members validated above
 
 
 def backup_restore(
@@ -800,13 +821,25 @@ def backup_restore(
         with tempfile.TemporaryDirectory() as tmp:
             tmpd = Path(tmp)
             with tarfile.open(input_path, "r:gz") as tf:
-                tf.extractall(tmpd)  # noqa: S202 - trusted, on-box archive we created
-            roots = [p for p in tmpd.iterdir() if p.is_dir()]
+                # filter="data" (Python 3.12+) rejects path-traversal / absolute
+                # members. Fall back to a manual containment check on older
+                # runtimes so the "trusted archive" claim is actually enforced.
+                try:
+                    tf.extractall(tmpd, filter="data")  # noqa: S202
+                except TypeError:
+                    _safe_extractall(tf, tmpd)
+            # Select the backup root by its create-side name pattern rather than
+            # an arbitrary first dir, so a stray top-level entry can't misdirect
+            # the restore.
+            roots = sorted(
+                p for p in tmpd.iterdir() if p.is_dir() and p.name.endswith("-openclaw-backup")
+            )
             if not roots:
+                others = sorted(p.name for p in tmpd.iterdir())
                 return {
                     "state": "failed",
                     "archive_path": str(input_path),
-                    "detail": "empty archive",
+                    "detail": f"no *-openclaw-backup root in archive; saw: {others}",
                 }
             payload_root = roots[0] / "payload" / "posix" / rel
             if not payload_root.exists():
@@ -836,12 +869,29 @@ def backup_restore(
             "archive_path": str(input_path),
             "detail": redact_text(str(exc), limit=500),
         }
+    missing = [d for d in BACKUP_RESTORE_USER_DIRS if d not in restored]
+    required_missing = [d for d in REQUIRED_RESTORE_DIRS if d in missing]
+    # A restore that skipped a required subtree (or restored nothing) is a
+    # data-loss event, not a success — surface it instead of a bare "ready".
+    ok = bool(restored) and not required_missing
+    detail = (
+        f"restored {len(restored)} user-data subtree(s): {restored}"
+        if ok
+        else (
+            f"incomplete restore; required subtree(s) missing from archive: "
+            f"{required_missing or 'none restored'}"
+        )
+    )
     return {
-        "state": "ready" if restored else "failed",
+        "state": "ready" if ok else "failed",
         "archive_path": str(input_path),
         "archive_bytes": input_path.stat().st_size,
         "restored_dirs": restored,
-        "detail": f"restored {len(restored)} user-data subtree(s)",
+        "expected_dirs": list(BACKUP_RESTORE_USER_DIRS),
+        "missing_dirs": missing,
+        "required_missing": required_missing,
+        "failure_code": None if ok else "restore_incomplete",
+        "detail": detail,
     }
 
 

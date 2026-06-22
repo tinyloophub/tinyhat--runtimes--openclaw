@@ -13,6 +13,21 @@ from . import bundle, paths
 from .redaction import redact_text
 
 
+def gateway_health_settle_params() -> tuple[int, float]:
+    """Cold-start settle window for gateway-health polling, shared by
+    activate_bundle and the runtime force handlers. Env-overridable so tests /
+    dev can collapse the window (TINYHAT_GATEWAY_HEALTH_SETTLE_DELAY=0)."""
+    try:
+        attempts = int(os.environ.get("TINYHAT_GATEWAY_HEALTH_SETTLE_ATTEMPTS", "15"))
+    except ValueError:
+        attempts = 15
+    try:
+        delay = float(os.environ.get("TINYHAT_GATEWAY_HEALTH_SETTLE_DELAY", "6.0"))
+    except ValueError:
+        delay = 6.0
+    return max(attempts, 1), max(delay, 0.0)
+
+
 @dataclass(frozen=True)
 class ActivationResult:
     activated: bool
@@ -92,9 +107,13 @@ def activate_bundle(
     start_command: Sequence[str] | None = None,
     health_command: Sequence[str] | None = None,
     timeout: int = 30,
-    health_attempts: int = 15,
-    health_delay: float = 6.0,
+    health_attempts: int | None = None,
+    health_delay: float | None = None,
 ) -> ActivationResult:
+    if health_attempts is None or health_delay is None:
+        _attempts, _delay = gateway_health_settle_params()
+        health_attempts = _attempts if health_attempts is None else health_attempts
+        health_delay = _delay if health_delay is None else health_delay
     manifest = bundle.load_manifest(bundle_dir)
     bundle.verify_manifest(bundle_dir, manifest)
     previous = _readlink_or_none(current_link)

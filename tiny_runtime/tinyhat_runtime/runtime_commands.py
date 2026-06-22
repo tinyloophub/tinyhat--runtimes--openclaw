@@ -118,6 +118,7 @@ class RuntimeCommandRunner:
         platform_get_json: Callable[[str], dict[str, Any]] | None = None,
         apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
         start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rewarm_channels: Callable[[], dict[str, Any]] | None = None,
         rebuild_backup_dir: Path = paths.REBUILD_BACKUP_DIR,
     ) -> None:
         self.ledger = ledger or CommandLedger()
@@ -128,6 +129,7 @@ class RuntimeCommandRunner:
         self.platform_get_json = platform_get_json
         self.apply_runtime_config = apply_runtime_config
         self.start_chatgpt_link = start_chatgpt_link
+        self.rewarm_channels = rewarm_channels
         self.stop_command = (
             _safe_command_sequence(stop_command)
             if stop_command is not None
@@ -803,7 +805,7 @@ class RuntimeCommandRunner:
         return tuple(self.health_command or _default_health_command())
 
     def _wait_for_gateway_healthy(
-        self, *, attempts: int = 15, delay: float = 6.0
+        self, *, attempts: int | None = None, delay: float | None = None
     ) -> dict[str, Any]:
         """Poll the OpenClaw gateway health until healthy or the cold-start
         settle window elapses.
@@ -811,8 +813,14 @@ class RuntimeCommandRunner:
         A freshly (re)started gateway binds in ~30s — longer right after a
         plugin reinstall. An immediate single probe would report ``unhealthy``
         and make a successful start look like a failure, so we retry across the
-        settle window before giving up.
+        settle window before giving up. The window is shared with
+        ``launcher.activate_bundle`` (env-overridable for tests/dev).
         """
+        _attempts, _delay = launcher.gateway_health_settle_params()
+        if attempts is None:
+            attempts = _attempts
+        if delay is None:
+            delay = _delay
         health = openclaw_adapter.gateway_health()
         attempt = 1
         while (
@@ -823,6 +831,26 @@ class RuntimeCommandRunner:
             health = openclaw_adapter.gateway_health()
             attempt += 1
         return health
+
+    def _maybe_rewarm_channels(self, result_payload: dict[str, Any]) -> None:
+        """Re-apply the binding's channel config + secrets so OpenClaw reconnects
+        its channels (Telegram polling, model providers) after the gateway is
+        (re)started.
+
+        A reinstall/restore + gateway restart otherwise leaves the gateway
+        healthy but with no live channel — the agent is up but deaf to Telegram
+        (the binding's channel config is applied once at bind time and is not
+        re-applied on a force-upgrade restart). The caller invokes this BEFORE
+        the final gateway (re)start so the restart picks up the freshly-applied
+        channel config. Best-effort: a re-warm failure is recorded but does not
+        fail the force step, since the runtime itself is healthy.
+        """
+        if self.rewarm_channels is None:
+            return
+        try:
+            result_payload["rewarm"] = self.rewarm_channels()
+        except Exception as exc:  # noqa: BLE001 - report, don't fail the upgrade
+            result_payload["rewarm_error"] = redact_text(str(exc), limit=1000)
 
     def _force_stop(self, command: dict[str, Any]) -> dict[str, Any]:
         command_id, idempotency_key, kind = _ids(command)
@@ -855,6 +883,11 @@ class RuntimeCommandRunner:
         # they decide not to upgrade. The platform clears update mode when this
         # settles, so normal command processing resumes.
         command_id, idempotency_key, kind = _ids(command)
+        result_payload: dict[str, Any] = {}
+        # Re-apply channel config + secrets before the restart so the resumed
+        # gateway serves Telegram again on the current (unchanged) version.
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
         self.ledger.update(command_id, status="running", phase="start_gateway")
         started_ok, start_detail = launcher._run_command(
             self._gateway_start_command(), timeout=60
@@ -864,6 +897,14 @@ class RuntimeCommandRunner:
         health = self._wait_for_gateway_healthy()
         gateway_up = str(health.get("state") or "") == "healthy"
         applied = bool(started_ok) and gateway_up
+        result_payload.update(
+            {
+                "started": bool(started_ok),
+                "gateway_up": gateway_up,
+                "gateway_health": health,
+                "detail": redact_text(start_detail, limit=500),
+            }
+        )
         return self._finish(
             command_id=command_id,
             idempotency_key=idempotency_key,
@@ -871,12 +912,7 @@ class RuntimeCommandRunner:
             status="applied" if applied else "failed",
             phase="gateway_resumed" if applied else "start_gateway",
             failure_code=None if applied else "resume_failed",
-            result={
-                "started": bool(started_ok),
-                "gateway_up": gateway_up,
-                "gateway_health": health,
-                "detail": redact_text(start_detail, limit=500),
-            },
+            result=result_payload,
         )
 
     def _force_backup(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -941,6 +977,13 @@ class RuntimeCommandRunner:
                 failure_code="app_layer_rebuild_failed",
                 result=result_payload,
             )
+
+        # Re-apply the binding channel config + secrets BEFORE the restart so the
+        # reactivated gateway comes up polling Telegram again (the reinstall
+        # resets OpenClaw's channel config; without this the box is healthy but
+        # deaf).
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
 
         # Reactivate (flip-before-start + auto-rollback) so the gateway comes
         # back up on the freshly-reinstalled bundle.
@@ -1010,7 +1053,23 @@ class RuntimeCommandRunner:
         requested = str(spec.get("backup_path") or "").strip()
         backup_path: Path | None = None
         if requested:
-            backup_path = Path(requested)
+            # A caller-supplied path must stay inside the runtime backup dir —
+            # never let force_recover read/restore an arbitrary file on the box.
+            bp = Path(requested).resolve()
+            root = self.rebuild_backup_dir.resolve()
+            if root != bp and root not in bp.parents:
+                return self._finish(
+                    command_id=command_id,
+                    idempotency_key=idempotency_key,
+                    kind=kind,
+                    status="failed",
+                    phase="locate_backup",
+                    failure_code="backup_path_not_allowed",
+                    result={
+                        "detail": "backup_path must resolve inside the runtime backup dir",
+                    },
+                )
+            backup_path = bp
         else:
             backups = sorted(
                 self.rebuild_backup_dir.glob("*-force-upgrade-backup.tar.gz"),
@@ -1047,6 +1106,12 @@ class RuntimeCommandRunner:
                 failure_code="restore_failed",
                 result=result_payload,
             )
+
+        # Re-apply the binding channel config + secrets before the restart so the
+        # restored box comes back up serving Telegram (the restore overwrites
+        # user state but does not re-establish the channel binding).
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
 
         # Restart the gateway so the restored user state is live, then confirm
         # it actually comes up before declaring recovery complete. Poll across
