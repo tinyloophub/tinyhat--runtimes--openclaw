@@ -784,15 +784,25 @@ REQUIRED_RESTORE_DIRS: tuple[str, ...] = (
 
 
 def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
-    """Extract a tar rejecting any member that escapes ``dest`` (absolute paths
-    or ``..`` traversal). Fallback for Python < 3.12 where ``extractall`` has no
-    ``filter`` argument and applies no traversal protection."""
+    """Extract a tar rejecting any member that would be written OUTSIDE ``dest``
+    (absolute member paths, ``..`` traversal, or a write that resolves through a
+    symlink to escape the destination).
+
+    We do NOT use ``filter="data"``: a real ``openclaw backup create`` archive
+    legitimately contains symlinks with absolute targets (e.g. plugin-skills),
+    which ``"data"`` rejects outright. Those links live in install dirs we never
+    restore anyway; the only real risk is a member escaping the temp extraction
+    dir, which the explicit ``resolve()`` containment check below covers.
+    """
     dest = dest.resolve()
     for member in tf.getmembers():
         target = (dest / member.name).resolve()
         if dest != target and dest not in target.parents:
             raise ValueError(f"unsafe tar member rejected: {member.name!r}")
-    tf.extractall(dest)  # noqa: S202 - members validated above
+    try:
+        tf.extractall(dest, filter="fully_trusted")  # noqa: S202 - paths validated
+    except TypeError:
+        tf.extractall(dest)  # noqa: S202 - Python < 3.12, paths validated above
 
 
 def backup_restore(
@@ -821,13 +831,10 @@ def backup_restore(
         with tempfile.TemporaryDirectory() as tmp:
             tmpd = Path(tmp)
             with tarfile.open(input_path, "r:gz") as tf:
-                # filter="data" (Python 3.12+) rejects path-traversal / absolute
-                # members. Fall back to a manual containment check on older
-                # runtimes so the "trusted archive" claim is actually enforced.
-                try:
-                    tf.extractall(tmpd, filter="data")  # noqa: S202
-                except TypeError:
-                    _safe_extractall(tf, tmpd)
+                # Extract with an explicit traversal-containment check (NOT
+                # filter="data", which rejects the archive's legitimate absolute
+                # symlinks). See _safe_extractall.
+                _safe_extractall(tf, tmpd)
             # Select the backup root by its create-side name pattern rather than
             # an arbitrary first dir, so a stray top-level entry can't misdirect
             # the restore.

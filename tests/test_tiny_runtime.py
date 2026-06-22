@@ -4195,6 +4195,38 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertEqual(result.get("failure_code"), "restore_incomplete")
             self.assertIn("identity", result["required_missing"])
 
+    def test_restore_tolerates_absolute_symlink_in_archive(self):
+        # A real `openclaw backup create` archive contains symlinks with absolute
+        # targets (e.g. plugin-skills). Extraction must tolerate them and still
+        # restore the user-data dirs — a strict filter="data" would reject the
+        # whole archive (regression guard).
+        from tinyhat_runtime import paths as runtime_paths
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            state_dir = tmp / "state"
+            state_rel = str(state_dir).lstrip("/")
+            archive = tmp / "backup.tar.gz"
+            with tempfile.TemporaryDirectory() as staging:
+                root = Path(staging) / "2026-01-01T00-00-00.000+00-00-openclaw-backup"
+                payload = root / "payload" / "posix" / state_rel
+                for name in ("identity", "state"):
+                    d = payload / name
+                    d.mkdir(parents=True)
+                    (d / "f.json").write_text(name)
+                # An install dir (not restored) with an absolute-target symlink.
+                skills = payload / "plugin-skills"
+                skills.mkdir(parents=True)
+                os.symlink("/opt/tinyhat/current/skills/browser", skills / "browser")
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(root, arcname=root.name)
+            with patch.object(runtime_paths, "OPENCLAW_STATE_DIR", state_dir):
+                result = openclaw_adapter.backup_restore(input_path=archive)
+            self.assertEqual(result["state"], "ready", result)
+            self.assertIn("identity", result["restored_dirs"])
+            self.assertIn("state", result["restored_dirs"])
+
     def test_restore_rejects_non_openclaw_backup_root(self):
         from tinyhat_runtime import paths as runtime_paths
 
