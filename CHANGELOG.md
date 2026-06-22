@@ -7,6 +7,38 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.7
+
+Adds a step-wise, data-preserving **Force Upgrade** for tiny_runtime Computers:
+five separable, individually-verifiable operator commands for upgrading an
+already-running Computer without losing user data. Companion platform PR:
+tinyloophub/tinyloop#864.
+
+### Added
+
+- Force-Upgrade command handlers: `force_stop`, `force_resume` (the reverse of
+  stop — return to the current version without updating), `force_backup`,
+  `force_update` (clean reinstall with flip-before-start auto-rollback), and
+  `force_recover` (restore user data + restart).
+- Channel re-warm: the force handlers re-apply the binding channel config +
+  secrets before their final gateway restart, so the agent keeps serving (e.g.
+  Telegram polling) after an upgrade instead of coming up healthy-but-deaf.
+- Gateway-health cold-start settle poll (shared, env-overridable) so a freshly
+  restarted gateway is not false-failed and rolled back before it warms up.
+
+### Fixed
+
+- `backup_restore` is scoped to the user-data subtrees it restores (install dirs
+  are reinstalled fresh): fixes a `workspace` directory-name bug, fails loudly on
+  a missing required subtree instead of reporting a partial restore as success,
+  selects the backup root by name, and validates member paths + link targets to
+  close a tar symlink-order escape; a restore path outside the backup dir is
+  rejected.
+- `force_update` fails closed when the post-reinstall OpenClaw doctor reports
+  not-ready, instead of settling as applied.
+- New force-upgrade failure codes are typed (no longer normalized to
+  `invalid_command`).
+
 ## 0.16.6
 
 Patch release for the Tinyloop v0.16 `tiny_runtime` train. This makes
