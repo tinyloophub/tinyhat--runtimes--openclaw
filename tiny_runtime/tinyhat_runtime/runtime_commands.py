@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import attestation, bundle, launcher, openclaw_adapter, paths, private_access
+from . import (
+    attestation,
+    bundle,
+    hot_image,
+    launcher,
+    openclaw_adapter,
+    paths,
+    private_access,
+)
 from .command_ledger import (
     TERMINAL_STATUSES,
     CommandLedger,
@@ -28,6 +37,11 @@ ALLOWED_COMMAND_KINDS = frozenset(
         "link_chatgpt",
         "rebuild_app_layer",
         "enroll_private_access",
+        "force_stop",
+        "force_resume",
+        "force_backup",
+        "force_update",
+        "force_recover",
     }
 )
 FAILURE_CODES = frozenset(
@@ -37,16 +51,22 @@ FAILURE_CODES = frozenset(
         "attestation_failed",
         "attestation_mismatch",
         "backup_failed",
+        "backup_not_found",
+        "backup_path_not_allowed",
         "bundle_not_found",
         "bundle_verification_failed",
         "canceled",
         "config_apply_failed",
         "diagnostics_export_failed",
+        "gateway_unhealthy_after_restore",
         "private_access_enroll_failed",
         "idempotency_mismatch",
         "invalid_command",
         "link_chatgpt_failed",
+        "restore_failed",
+        "resume_failed",
         "rollback_failed",
+        "stop_failed",
         "tinyhat_plugin_failed",
         "unsupported_kind",
     }
@@ -104,6 +124,7 @@ class RuntimeCommandRunner:
         platform_get_json: Callable[[str], dict[str, Any]] | None = None,
         apply_runtime_config: Callable[..., dict[str, Any]] | None = None,
         start_chatgpt_link: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rewarm_channels: Callable[[], dict[str, Any]] | None = None,
         rebuild_backup_dir: Path = paths.REBUILD_BACKUP_DIR,
     ) -> None:
         self.ledger = ledger or CommandLedger()
@@ -114,6 +135,7 @@ class RuntimeCommandRunner:
         self.platform_get_json = platform_get_json
         self.apply_runtime_config = apply_runtime_config
         self.start_chatgpt_link = start_chatgpt_link
+        self.rewarm_channels = rewarm_channels
         self.stop_command = (
             _safe_command_sequence(stop_command)
             if stop_command is not None
@@ -245,6 +267,16 @@ class RuntimeCommandRunner:
                 return self._rebuild_app_layer(command)
             if kind == "enroll_private_access":
                 return self._enroll_private_access(command)
+            if kind == "force_stop":
+                return self._force_stop(command)
+            if kind == "force_resume":
+                return self._force_resume(command)
+            if kind == "force_backup":
+                return self._force_backup(command)
+            if kind == "force_update":
+                return self._force_update(command)
+            if kind == "force_recover":
+                return self._force_recover(command)
         except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
             return self._finish(
                 command_id=command_id,
@@ -750,6 +782,396 @@ class RuntimeCommandRunner:
             kind=kind,
             status="applied",
             phase="attested",
+            result=result_payload,
+        )
+
+    # ── Force Upgrade (without data loss) ────────────────────────────────
+    # Four independently-dispatchable, independently-verifiable steps that
+    # decompose the monolithic rebuild into operator-controlled buttons. The
+    # tiny_runtime supervisor stays up as the idle orchestrator; these steps
+    # act on the OpenClaw gateway/workload (the thing that mutates state).
+    #   1. force_stop    — stop the gateway + workload (freeze state)
+    #   2. force_backup  — official OpenClaw backup of user state, verified
+    #   3. force_update  — fresh reinstall of plugins (codex + tinyhat) on the
+    #                      supported bundle, reactivate, doctor, attest
+    #   4. force_recover — official OpenClaw restore of the backup, restart
+
+    def _gateway_stop_command(self) -> tuple[str, ...]:
+        # Force-Upgrade always controls the gateway lifecycle, so it resolves
+        # the stop/start commands even when the runner was built without
+        # service_restart. On systemd Computers (prod / GCE) this is
+        # ``systemctl stop`` of the Restart=always gateway unit, which keeps it
+        # down (systemd does not restart an intentionally stopped unit).
+        return tuple(self.stop_command or _default_gateway_stop_command())
+
+    def _gateway_start_command(self) -> tuple[str, ...]:
+        return tuple(self.start_command or _default_gateway_start_command())
+
+    def _gateway_health_command(self) -> tuple[str, ...]:
+        return tuple(self.health_command or _default_health_command())
+
+    def _wait_for_gateway_healthy(
+        self, *, attempts: int | None = None, delay: float | None = None
+    ) -> dict[str, Any]:
+        """Poll the OpenClaw gateway health until healthy or the cold-start
+        settle window elapses.
+
+        A freshly (re)started gateway binds in ~30s — longer right after a
+        plugin reinstall. An immediate single probe would report ``unhealthy``
+        and make a successful start look like a failure, so we retry across the
+        settle window before giving up. The window is shared with
+        ``launcher.activate_bundle`` (env-overridable for tests/dev).
+        """
+        _attempts, _delay = launcher.gateway_health_settle_params()
+        if attempts is None:
+            attempts = _attempts
+        if delay is None:
+            delay = _delay
+        health = openclaw_adapter.gateway_health()
+        attempt = 1
+        while (
+            str(health.get("state") or "") != "healthy"
+            and attempt < max(attempts, 1)
+        ):
+            time.sleep(delay)
+            health = openclaw_adapter.gateway_health()
+            attempt += 1
+        return health
+
+    def _maybe_rewarm_channels(self, result_payload: dict[str, Any]) -> None:
+        """Re-apply the binding's channel config + secrets so OpenClaw reconnects
+        its channels (Telegram polling, model providers) after the gateway is
+        (re)started.
+
+        A reinstall/restore + gateway restart otherwise leaves the gateway
+        healthy but with no live channel — the agent is up but deaf to Telegram
+        (the binding's channel config is applied once at bind time and is not
+        re-applied on a force-upgrade restart). The caller invokes this BEFORE
+        the final gateway (re)start so the restart picks up the freshly-applied
+        channel config. Best-effort: a re-warm failure is recorded but does not
+        fail the force step, since the runtime itself is healthy.
+        """
+        if self.rewarm_channels is None:
+            return
+        try:
+            result_payload["rewarm"] = self.rewarm_channels()
+        except Exception as exc:  # noqa: BLE001 - report, don't fail the upgrade
+            result_payload["rewarm_error"] = redact_text(str(exc), limit=1000)
+
+    def _force_stop(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id, idempotency_key, kind = _ids(command)
+        self.ledger.update(command_id, status="running", phase="stop_gateway")
+        stopped_ok, stop_detail = launcher._run_command(
+            self._gateway_stop_command(), timeout=60
+        )
+        health = openclaw_adapter.gateway_health()
+        gateway_down = str(health.get("state") or "") != "healthy"
+        applied = bool(stopped_ok) and gateway_down
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied" if applied else "failed",
+            phase="gateway_stopped" if applied else "stop_gateway",
+            failure_code=None if applied else "stop_failed",
+            result={
+                "stopped": bool(stopped_ok),
+                "gateway_down": gateway_down,
+                "gateway_health": health,
+                "detail": redact_text(stop_detail, limit=500),
+            },
+        )
+
+    def _force_resume(self, command: dict[str, Any]) -> dict[str, Any]:
+        # Reverse of force_stop: bring the OpenClaw gateway/workload back up on
+        # the CURRENT (unchanged) version, without any update or restore. Lets
+        # an operator stop, inspect, and then return to the existing version if
+        # they decide not to upgrade. The platform clears update mode when this
+        # settles, so normal command processing resumes.
+        command_id, idempotency_key, kind = _ids(command)
+        result_payload: dict[str, Any] = {}
+        # Re-apply channel config + secrets before the restart so the resumed
+        # gateway serves Telegram again on the current (unchanged) version.
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
+        self.ledger.update(command_id, status="running", phase="start_gateway")
+        started_ok, start_detail = launcher._run_command(
+            self._gateway_start_command(), timeout=60
+        )
+        # Poll across the cold-start window: a just-started gateway is unhealthy
+        # for the first ~30s. Probing once would false-fail the resume.
+        health = self._wait_for_gateway_healthy()
+        gateway_up = str(health.get("state") or "") == "healthy"
+        applied = bool(started_ok) and gateway_up
+        result_payload.update(
+            {
+                "started": bool(started_ok),
+                "gateway_up": gateway_up,
+                "gateway_health": health,
+                "detail": redact_text(start_detail, limit=500),
+            }
+        )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied" if applied else "failed",
+            phase="gateway_resumed" if applied else "start_gateway",
+            failure_code=None if applied else "resume_failed",
+            result=result_payload,
+        )
+
+    def _force_backup(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id, idempotency_key, kind = _ids(command)
+        self.ledger.update(command_id, status="running", phase="backup")
+        self.rebuild_backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.rebuild_backup_dir.chmod(0o700)
+        except OSError:
+            pass
+        backup_path = (
+            self.rebuild_backup_dir / f"{command_id}-force-upgrade-backup.tar.gz"
+        )
+        backup_result = openclaw_adapter.backup_create(output_path=backup_path)
+        applied = backup_result.get("state") == "ready"
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied" if applied else "failed",
+            phase="backup_ready" if applied else "backup",
+            failure_code=None if applied else "backup_failed",
+            result={"backup": backup_result, "backup_path": str(backup_path)},
+        )
+
+    def _force_update(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_id, idempotency_key, kind = _ids(command)
+        bundle_dir = self.current_link
+        if not bundle_dir.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_not_found",
+                result={"detail": "no current bundle to reinstall"},
+            )
+        self.ledger.update(command_id, status="running", phase="verify_bundle")
+        manifest = bundle.load_manifest(bundle_dir)
+        bundle.verify_manifest(bundle_dir, manifest)
+        bundle_id = str(manifest.get("bundle_id") or "")
+        result_payload: dict[str, Any] = {"bundle_id": bundle_id}
+
+        # Fresh reinstall of the OpenClaw plugins (codex + tinyhat) from the
+        # supported bundle. The clean reinstall is the load-bearing fix for
+        # boxes whose previous setup left a broken plugin layout (e.g. a
+        # bootstrap that died at codex preinstall). install_plugin uses
+        # --force, so this re-materializes both plugins.
+        self.ledger.update(command_id, status="running", phase="reinstall_plugins")
+        try:
+            plugins = hot_image.preinstall_hot_image_plugins()
+            result_payload["plugins"] = plugins
+        except Exception as exc:  # noqa: BLE001 - report a clean, visible failure
+            result_payload["plugins_error"] = redact_text(str(exc), limit=1000)
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="reinstall_plugins",
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
+
+        # Re-apply the binding channel config + secrets BEFORE the restart so the
+        # reactivated gateway comes up polling Telegram again (the reinstall
+        # resets OpenClaw's channel config; without this the box is healthy but
+        # deaf).
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
+
+        # Reactivate (flip-before-start + auto-rollback) so the gateway comes
+        # back up on the freshly-reinstalled bundle.
+        self.ledger.update(command_id, status="running", phase="reactivate_bundle")
+        activation = launcher.activate_bundle(
+            bundle_dir,
+            current_link=self.current_link,
+            stop_command=self._gateway_stop_command(),
+            start_command=self._gateway_start_command(),
+            health_command=self._gateway_health_command(),
+        )
+        result_payload["activation"] = activation.__dict__
+        result_payload["restart_requested"] = True
+        if not activation.activated:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if activation.rolled_back else "failed",
+                phase=activation.phase,
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="openclaw_doctor")
+        doctor = openclaw_adapter.doctor_repair()
+        result_payload["doctor"] = doctor
+        if doctor.get("state") != "ready":
+            # Fail closed: a failed post-reinstall repair must not settle the
+            # update as applied (same gate rebuild_app_layer enforces).
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="openclaw_doctor",
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
+
+        self.ledger.update(command_id, status="running", phase="attest")
+        try:
+            attestation_doc = self._current_attestation()
+            result_payload["attestation"] = attestation_doc
+        except Exception as exc:  # noqa: BLE001 - final safety gate
+            result_payload["attestation_error"] = redact_text(str(exc), limit=1000)
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="attestation_gate",
+                failure_code="attestation_failed",
+                result=result_payload,
+            )
+        if attestation_doc.get("bundle_id") != bundle_id:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="attestation_gate",
+                failure_code="attestation_mismatch",
+                result=result_payload,
+            )
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="attested",
+            result=result_payload,
+        )
+
+    def _force_recover(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+        self.ledger.update(command_id, status="running", phase="locate_backup")
+        requested = str(spec.get("backup_path") or "").strip()
+        backup_path: Path | None = None
+        if requested:
+            # A caller-supplied path must stay inside the runtime backup dir —
+            # never let force_recover read/restore an arbitrary file on the box.
+            bp = Path(requested).resolve()
+            root = self.rebuild_backup_dir.resolve()
+            if root != bp and root not in bp.parents:
+                return self._finish(
+                    command_id=command_id,
+                    idempotency_key=idempotency_key,
+                    kind=kind,
+                    status="failed",
+                    phase="locate_backup",
+                    failure_code="backup_path_not_allowed",
+                    result={
+                        "detail": "backup_path must resolve inside the runtime backup dir",
+                    },
+                )
+            backup_path = bp
+        else:
+            backups = sorted(
+                self.rebuild_backup_dir.glob("*-force-upgrade-backup.tar.gz"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            )
+            backup_path = backups[-1] if backups else None
+        if backup_path is None or not backup_path.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="locate_backup",
+                failure_code="backup_not_found",
+                result={"detail": "no force-upgrade backup archive found"},
+            )
+
+        # Stop the gateway so the sqlite state is quiescent during the restore.
+        self.ledger.update(command_id, status="running", phase="stop_for_restore")
+        launcher._run_command(self._gateway_stop_command(), timeout=60)
+        self.ledger.update(command_id, status="running", phase="restore")
+        restore = openclaw_adapter.backup_restore(input_path=backup_path)
+        result_payload: dict[str, Any] = {
+            "restore": restore,
+            "backup_path": str(backup_path),
+        }
+        if restore.get("state") != "ready":
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="restore",
+                failure_code="restore_failed",
+                result=result_payload,
+            )
+
+        # Re-apply the binding channel config + secrets before the restart so the
+        # restored box comes back up serving Telegram (the restore overwrites
+        # user state but does not re-establish the channel binding).
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
+
+        # Restart the gateway so the restored user state is live, then confirm
+        # it actually comes up before declaring recovery complete. Poll across
+        # the cold-start window so a slow-but-healthy gateway is not misread as
+        # a failed recover.
+        self.ledger.update(command_id, status="running", phase="restart_gateway")
+        started_ok, start_detail = launcher._run_command(
+            self._gateway_start_command(), timeout=60
+        )
+        health = self._wait_for_gateway_healthy()
+        gateway_up = str(health.get("state") or "") == "healthy"
+        result_payload["restart_requested"] = True
+        result_payload["restart"] = {
+            "ok": bool(started_ok),
+            "gateway_up": gateway_up,
+            "gateway_health": health,
+            "detail": redact_text(start_detail, limit=500),
+        }
+        if not gateway_up:
+            # The restore is on disk, but the workload did not come back. Report
+            # a clean failure so the operator can re-run recover rather than
+            # silently leaving a down gateway behind a "restored" status.
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="restart_gateway",
+                failure_code="gateway_unhealthy_after_restore",
+                result=result_payload,
+            )
+        self.ledger.update(command_id, status="running", phase="attest")
+        try:
+            result_payload["attestation"] = self._current_attestation()
+        except Exception as exc:  # noqa: BLE001 - diagnostic, restore already applied
+            result_payload["attestation_error"] = redact_text(str(exc), limit=1000)
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="restored",
             result=result_payload,
         )
 

@@ -373,7 +373,7 @@ class TinyRuntimePlatformLoop:
             heartbeat = self._post_heartbeat(assigned=True)
             command = heartbeat.get("command")
             if isinstance(command, dict):
-                self._dispatch_runtime_command(command)
+                self._dispatch_runtime_command(command, binding)
             response = self.client.get_json(
                 "/hapi/v1/computers/me/binding?include_command=true",
                 timeout=30,
@@ -456,7 +456,24 @@ class TinyRuntimePlatformLoop:
                 return False
             raise exc
 
-    def _dispatch_runtime_command(self, command: dict[str, Any]) -> None:
+    def _rewarm_channels(self, binding: dict[str, Any]) -> dict[str, Any]:
+        """Re-apply the binding's channel config + secrets.
+
+        Handed to the force-upgrade command handlers so that, after a reinstall
+        or restore, they can re-establish OpenClaw's channels (Telegram polling,
+        model providers) before restarting the gateway — otherwise the upgraded
+        box is healthy but no longer serving messages.
+        """
+        return openclaw_adapter.apply_binding_config(
+            binding,
+            platform_base_url=platform_base_url_from_env(),
+            backend_audience=backend_audience_from_env(),
+            preserve_existing_secrets=True,
+        )
+
+    def _dispatch_runtime_command(
+        self, command: dict[str, Any], binding: dict[str, Any] | None = None
+    ) -> None:
         # A single bad/legacy/malformed command must NEVER crash the loop. Two
         # of the three call sites (the binding-poll path and _active_loop) used
         # to call this unguarded, so a raise here re-bound the Computer ~every
@@ -476,6 +493,11 @@ class TinyRuntimePlatformLoop:
                 platform_get_json=self.client.get_json,
                 apply_runtime_config=self._apply_runtime_config,
                 start_chatgpt_link=self._start_chatgpt_link,
+                rewarm_channels=(
+                    (lambda b=binding: self._rewarm_channels(b))
+                    if isinstance(binding, dict)
+                    else None
+                ),
                 service_restart=_runtime_command_service_restart_enabled(),
             )
             result = runner.execute(runtime_command)

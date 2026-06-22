@@ -7,6 +7,8 @@ import os
 import secrets as secrets_module
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -751,6 +753,195 @@ def backup_create(
         "archive_bytes": output_path.stat().st_size if archive_exists else None,
         "backup": payload,
         "detail": result.public_summary(),
+    }
+
+
+# Top-level OpenClaw state subtrees that hold USER data and are restored after a
+# fresh reinstall. The install layer (extensions / platform-plugins / npm /
+# .npm) is deliberately NOT restored — the Force-Upgrade "update" step freshly
+# installs the supported plugins (codex + tinyhat), and restoring the old
+# install would undo the upgrade. Transient logs/markers are also skipped.
+BACKUP_RESTORE_USER_DIRS: tuple[str, ...] = (
+    "agents",
+    "devices",
+    "identity",
+    "state",
+    "openclaw",
+    "tinyhat-control",
+    "workspace",
+    "secrets",
+    "credentials",
+)
+
+# Subtrees that MUST be present in a healthy backup. If any of these is absent
+# from the payload, the archive is incomplete and a restore would silently lose
+# the data it was supposed to preserve — so we fail loudly instead of reporting
+# a partial restore as success.
+REQUIRED_RESTORE_DIRS: tuple[str, ...] = (
+    "identity",
+    "state",
+)
+
+
+def _safe_extract_members(
+    tf: tarfile.TarFile, dest: Path, members: list[tarfile.TarInfo]
+) -> None:
+    """Extract ONLY ``members``, rejecting any member path or link target that
+    could escape ``dest`` (absolute paths, ``..`` traversal, or a symlink/hardlink
+    pointing outside).
+
+    Two layers of safety:
+
+    1. Callers pre-filter ``members`` to the user-data subtrees we actually
+       restore, so install-dir absolute symlinks (e.g. plugin-skills) are never
+       extracted — they are both unnecessary and a traversal vector.
+    2. Every member path and link target is validated up front (before any
+       extraction), then we extract with the stdlib ``data`` filter on 3.12+.
+       Validating links *before* extraction closes the symlink-order escape
+       where a member creates a link and a later member is written through it:
+       no escaping link is ever materialised, so nothing can be followed out.
+    """
+    dest = dest.resolve()
+    for m in members:
+        if m.name.startswith("/") or ".." in Path(m.name).parts:
+            raise ValueError(f"unsafe tar member path rejected: {m.name!r}")
+        if m.issym() or m.islnk():
+            link = m.linkname or ""
+            if link.startswith("/") or ".." in Path(link).parts:
+                raise ValueError(
+                    f"unsafe tar link target rejected: {m.name!r} -> {link!r}"
+                )
+    try:
+        tf.extractall(dest, members=members, filter="data")  # noqa: S202 - validated
+    except TypeError:
+        tf.extractall(dest, members=members)  # noqa: S202 - <3.12, validated above
+
+
+def backup_restore(
+    *,
+    input_path: Path,
+) -> dict[str, Any]:
+    """Restore user state from an ``openclaw backup create`` archive.
+
+    OpenClaw has no ``backup restore`` command — the archive is a tarball whose
+    ``<ts>-openclaw-backup/payload/posix/<state-dir>`` mirrors the on-box state.
+    We extract it and copy back ONLY the user-data subtrees (auth state,
+    credentials, sessions/sqlite, agents, identity, config), leaving the
+    freshly-installed plugin/runtime layer intact. The caller must stop the
+    gateway first so the sqlite state is quiescent.
+    """
+    if not input_path.exists():
+        return {
+            "state": "failed",
+            "archive_path": None,
+            "detail": f"backup archive not found: {input_path}",
+        }
+    state_dir = paths.OPENCLAW_STATE_DIR
+    rel = str(state_dir).lstrip("/")  # e.g. home/tinyhat/runtime
+    restored: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpd = Path(tmp)
+            with tarfile.open(input_path, "r:gz") as tf:
+                members = tf.getmembers()
+                # Select the backup root by its create-side name pattern rather
+                # than an arbitrary first dir, so a stray top-level entry can't
+                # misdirect the restore.
+                root_names = sorted(
+                    {
+                        m.name.split("/", 1)[0]
+                        for m in members
+                        if m.name.split("/", 1)[0].endswith("-openclaw-backup")
+                    }
+                )
+                if not root_names:
+                    saw = sorted({m.name.split("/", 1)[0] for m in members})
+                    return {
+                        "state": "failed",
+                        "archive_path": str(input_path),
+                        "detail": f"no *-openclaw-backup root in archive; saw: {saw}",
+                    }
+                root = root_names[0]
+                payload_prefix = f"{root}/payload/posix/{rel}/"
+                # Extract ONLY the user-data subtrees we restore — install dirs
+                # (plugin-skills etc., with absolute symlinks) are skipped entirely.
+                wanted = [
+                    m
+                    for m in members
+                    if any(
+                        m.name == payload_prefix + d
+                        or m.name.startswith(payload_prefix + d + "/")
+                        for d in BACKUP_RESTORE_USER_DIRS
+                    )
+                ]
+                if not wanted:
+                    return {
+                        "state": "failed",
+                        "archive_path": str(input_path),
+                        "detail": "archive has no user-data subtrees under the expected payload path",
+                    }
+                _safe_extract_members(tf, tmpd, wanted)
+            roots = sorted(
+                p for p in tmpd.iterdir() if p.is_dir() and p.name.endswith("-openclaw-backup")
+            )
+            if not roots:
+                others = sorted(p.name for p in tmpd.iterdir())
+                return {
+                    "state": "failed",
+                    "archive_path": str(input_path),
+                    "detail": f"no *-openclaw-backup root in archive; saw: {others}",
+                }
+            payload_root = roots[0] / "payload" / "posix" / rel
+            if not payload_root.exists():
+                return {
+                    "state": "failed",
+                    "archive_path": str(input_path),
+                    "detail": f"payload root not found under {roots[0].name}",
+                }
+            state_dir.mkdir(parents=True, exist_ok=True)
+            for name in BACKUP_RESTORE_USER_DIRS:
+                src = payload_root / name
+                if not src.exists():
+                    continue
+                dst = state_dir / name
+                if dst.is_dir():
+                    shutil.rmtree(dst, ignore_errors=True)
+                elif dst.exists():
+                    dst.unlink()
+                if src.is_dir():
+                    shutil.copytree(src, dst, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                restored.append(name)
+    except Exception as exc:  # noqa: BLE001 - report a clean failure, never raise
+        return {
+            "state": "failed",
+            "archive_path": str(input_path),
+            "detail": redact_text(str(exc), limit=500),
+        }
+    missing = [d for d in BACKUP_RESTORE_USER_DIRS if d not in restored]
+    required_missing = [d for d in REQUIRED_RESTORE_DIRS if d in missing]
+    # A restore that skipped a required subtree (or restored nothing) is a
+    # data-loss event, not a success — surface it instead of a bare "ready".
+    ok = bool(restored) and not required_missing
+    detail = (
+        f"restored {len(restored)} user-data subtree(s): {restored}"
+        if ok
+        else (
+            f"incomplete restore; required subtree(s) missing from archive: "
+            f"{required_missing or 'none restored'}"
+        )
+    )
+    return {
+        "state": "ready" if ok else "failed",
+        "archive_path": str(input_path),
+        "archive_bytes": input_path.stat().st_size,
+        "restored_dirs": restored,
+        "expected_dirs": list(BACKUP_RESTORE_USER_DIRS),
+        "missing_dirs": missing,
+        "required_missing": required_missing,
+        "failure_code": None if ok else "restore_incomplete",
+        "detail": detail,
     }
 
 
