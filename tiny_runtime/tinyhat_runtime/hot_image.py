@@ -101,10 +101,60 @@ def _write_tinyhat_marker(*, checkout: Path, resolved_sha: str) -> None:
     marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def reown_plugin_trees_to_root(
+    runner: Sequence | None = None,
+) -> dict[str, Any]:
+    """Re-own the installed plugin trees to root, world-readable.
+
+    OpenClaw 2026.6.9+ BLOCKS any plugin whose install path is not owned by root
+    (an anti-tamper check). The runtime owns the OpenClaw state dir as the
+    unprivileged gateway user, so the codex npm project and the tinyhat extension
+    end up uid!=0 and get blocked — ``inspect_plugin`` then reports the plugin as
+    "not found", the codex preinstall gate fails, and the box bricks mid-upgrade
+    (the #112 incident). Re-owning the plugin trees to root with ``a+rX`` keeps
+    them loadable by the gateway while satisfying OpenClaw's ownership check.
+
+    Best-effort: only root can chown to root, which the bootstrap is; in non-root
+    dev/test it is a harmless no-op.
+    """
+    run = runner if callable(runner) else subprocess.run
+    state = paths.OPENCLAW_STATE_DIR
+    trees = [
+        state / "extensions",
+        state / "platform-plugins",
+        state / "npm" / "projects",
+    ]
+    results: dict[str, Any] = {}
+    for tree in trees:
+        if not tree.exists():
+            continue
+        try:
+            run(
+                ["chown", "-R", "root:root", str(tree)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            run(
+                ["chmod", "-R", "a+rX", str(tree)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            results[tree.name] = "reowned_root"
+        except Exception as exc:  # noqa: BLE001 - best effort, never fatal
+            results[tree.name] = f"skipped: {exc}"
+    return results
+
+
 def preinstall_hot_image_plugins() -> dict[str, Any]:
     codex_install = openclaw_adapter.install_plugin(CODEX_PLUGIN_PACKAGE)
     if codex_install.get("state") != "ready":
         raise RuntimeError(f"Codex plugin install failed: {codex_install}")
+    # Re-own to root BEFORE the inspect gate: OpenClaw blocks non-root-owned
+    # plugins, which would otherwise surface here as "unavailable" and brick the
+    # box (the #112 codex-ownership incident).
+    reown_plugin_trees_to_root()
     codex_inspect = openclaw_adapter.inspect_plugin(CODEX_PLUGIN_ID)
     if codex_inspect.get("state") != "ready":
         raise RuntimeError(f"Codex plugin unavailable after install: {codex_inspect}")
@@ -113,6 +163,7 @@ def preinstall_hot_image_plugins() -> dict[str, Any]:
     tinyhat_install = openclaw_adapter.install_plugin(str(checkout))
     if tinyhat_install.get("state") != "ready":
         raise RuntimeError(f"Tinyhat plugin install failed: {tinyhat_install}")
+    reown_plugin_trees_to_root()
     tinyhat_inspect = openclaw_adapter.inspect_plugin(TINYHAT_PLUGIN_ID)
     if tinyhat_inspect.get("state") != "ready":
         raise RuntimeError(f"Tinyhat plugin unavailable after install: {tinyhat_inspect}")

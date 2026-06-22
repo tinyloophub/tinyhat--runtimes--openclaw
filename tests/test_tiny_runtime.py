@@ -213,6 +213,50 @@ class HotImageTests(unittest.TestCase):
         write_marker.assert_called_once_with(checkout=checkout, resolved_sha="a" * 40)
         self.assertEqual(result["warm_config"], {"state": "ready"})
 
+    def test_preinstall_reowns_plugins_to_root_before_inspect_gate(self) -> None:
+        # OpenClaw 2026.6.9+ blocks non-root-owned plugins; the preinstall must
+        # re-own the plugin trees to root BEFORE each inspect gate, or the codex
+        # gate fails and bricks the box (the #112 incident).
+        order: list[str] = []
+        with (
+            patch.object(
+                openclaw_adapter,
+                "install_plugin",
+                side_effect=lambda *_a, **_k: (
+                    order.append("install"),
+                    {"state": "ready"},
+                )[1],
+            ),
+            patch.object(
+                openclaw_adapter,
+                "inspect_plugin",
+                side_effect=lambda *_a, **_k: (
+                    order.append("inspect"),
+                    {"state": "ready"},
+                )[1],
+            ),
+            patch.object(
+                openclaw_adapter, "apply_warm_image_config", return_value={"state": "ready"}
+            ),
+            patch.object(
+                hot_image, "_checkout_tinyhat_plugin", return_value=(Path("/tmp/x"), "a" * 40)
+            ),
+            patch.object(hot_image, "_write_tinyhat_marker"),
+            patch.object(
+                hot_image,
+                "reown_plugin_trees_to_root",
+                side_effect=lambda *_a, **_k: order.append("reown") or {},
+            ) as reown,
+        ):
+            hot_image.preinstall_hot_image_plugins()
+
+        # Re-own runs at least once per plugin, and each codex/tinyhat inspect is
+        # preceded by a re-own (root ownership established before the gate).
+        self.assertGreaterEqual(reown.call_count, 2)
+        for i, step in enumerate(order):
+            if step == "inspect":
+                self.assertIn("reown", order[:i], f"inspect at {i} not preceded by reown")
+
 
 class PrivateAccessTests(unittest.TestCase):
     def test_enroll_from_env_runs_tailscale_up_and_writes_ready_status(self) -> None:
