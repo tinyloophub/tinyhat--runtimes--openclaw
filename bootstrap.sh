@@ -92,6 +92,25 @@ ensure_runtime_user() {
   fi
 }
 
+# OpenClaw 2026.6.9+ BLOCKS any plugin whose install path is not owned by root
+# (an anti-tamper check). Our broad chown of the OpenClaw state dir to the
+# unprivileged runtime user would otherwise make the codex npm project and the
+# tinyhat extension uid!=0 and get them blocked, which fails the codex preinstall
+# gate and bricks the box (the #112 incident). Re-own the plugin trees back to
+# root with a+rX so the gateway can still load them but the ownership check
+# passes. Idempotent; safe to call after every state-dir chown.
+reown_plugin_trees_to_root() {
+  local tree
+  for tree in \
+    "${OPENCLAW_STATE_DIR}/extensions" \
+    "${OPENCLAW_STATE_DIR}/platform-plugins" \
+    "${OPENCLAW_STATE_DIR}/npm/projects"; do
+    [[ -e "${tree}" ]] || continue
+    chown -R root:root "${tree}" 2>/dev/null || true
+    chmod -R a+rX "${tree}" 2>/dev/null || true
+  done
+}
+
 chown_runtime_paths() {
   mkdir -p \
     "${OPENCLAW_CONFIG_DIR}" \
@@ -107,6 +126,8 @@ chown_runtime_paths() {
     "${OPENCLAW_CONFIG_DIR}" \
     "${OPENCLAW_STATE_DIR}" \
     "${TINYHAT_RUNTIME_LOG_ROOT}"
+  # Keep installed plugin trees root-owned for OpenClaw's ownership gate.
+  reown_plugin_trees_to_root
 }
 
 legacy_process_pids() {
