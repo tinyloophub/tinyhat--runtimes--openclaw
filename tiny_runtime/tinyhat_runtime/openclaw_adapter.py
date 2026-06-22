@@ -783,26 +783,38 @@ REQUIRED_RESTORE_DIRS: tuple[str, ...] = (
 )
 
 
-def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
-    """Extract a tar rejecting any member that would be written OUTSIDE ``dest``
-    (absolute member paths, ``..`` traversal, or a write that resolves through a
-    symlink to escape the destination).
+def _safe_extract_members(
+    tf: tarfile.TarFile, dest: Path, members: list[tarfile.TarInfo]
+) -> None:
+    """Extract ONLY ``members``, rejecting any member path or link target that
+    could escape ``dest`` (absolute paths, ``..`` traversal, or a symlink/hardlink
+    pointing outside).
 
-    We do NOT use ``filter="data"``: a real ``openclaw backup create`` archive
-    legitimately contains symlinks with absolute targets (e.g. plugin-skills),
-    which ``"data"`` rejects outright. Those links live in install dirs we never
-    restore anyway; the only real risk is a member escaping the temp extraction
-    dir, which the explicit ``resolve()`` containment check below covers.
+    Two layers of safety:
+
+    1. Callers pre-filter ``members`` to the user-data subtrees we actually
+       restore, so install-dir absolute symlinks (e.g. plugin-skills) are never
+       extracted — they are both unnecessary and a traversal vector.
+    2. Every member path and link target is validated up front (before any
+       extraction), then we extract with the stdlib ``data`` filter on 3.12+.
+       Validating links *before* extraction closes the symlink-order escape
+       where a member creates a link and a later member is written through it:
+       no escaping link is ever materialised, so nothing can be followed out.
     """
     dest = dest.resolve()
-    for member in tf.getmembers():
-        target = (dest / member.name).resolve()
-        if dest != target and dest not in target.parents:
-            raise ValueError(f"unsafe tar member rejected: {member.name!r}")
+    for m in members:
+        if m.name.startswith("/") or ".." in Path(m.name).parts:
+            raise ValueError(f"unsafe tar member path rejected: {m.name!r}")
+        if m.issym() or m.islnk():
+            link = m.linkname or ""
+            if link.startswith("/") or ".." in Path(link).parts:
+                raise ValueError(
+                    f"unsafe tar link target rejected: {m.name!r} -> {link!r}"
+                )
     try:
-        tf.extractall(dest, filter="fully_trusted")  # noqa: S202 - paths validated
+        tf.extractall(dest, members=members, filter="data")  # noqa: S202 - validated
     except TypeError:
-        tf.extractall(dest)  # noqa: S202 - Python < 3.12, paths validated above
+        tf.extractall(dest, members=members)  # noqa: S202 - <3.12, validated above
 
 
 def backup_restore(
@@ -831,13 +843,44 @@ def backup_restore(
         with tempfile.TemporaryDirectory() as tmp:
             tmpd = Path(tmp)
             with tarfile.open(input_path, "r:gz") as tf:
-                # Extract with an explicit traversal-containment check (NOT
-                # filter="data", which rejects the archive's legitimate absolute
-                # symlinks). See _safe_extractall.
-                _safe_extractall(tf, tmpd)
-            # Select the backup root by its create-side name pattern rather than
-            # an arbitrary first dir, so a stray top-level entry can't misdirect
-            # the restore.
+                members = tf.getmembers()
+                # Select the backup root by its create-side name pattern rather
+                # than an arbitrary first dir, so a stray top-level entry can't
+                # misdirect the restore.
+                root_names = sorted(
+                    {
+                        m.name.split("/", 1)[0]
+                        for m in members
+                        if m.name.split("/", 1)[0].endswith("-openclaw-backup")
+                    }
+                )
+                if not root_names:
+                    saw = sorted({m.name.split("/", 1)[0] for m in members})
+                    return {
+                        "state": "failed",
+                        "archive_path": str(input_path),
+                        "detail": f"no *-openclaw-backup root in archive; saw: {saw}",
+                    }
+                root = root_names[0]
+                payload_prefix = f"{root}/payload/posix/{rel}/"
+                # Extract ONLY the user-data subtrees we restore — install dirs
+                # (plugin-skills etc., with absolute symlinks) are skipped entirely.
+                wanted = [
+                    m
+                    for m in members
+                    if any(
+                        m.name == payload_prefix + d
+                        or m.name.startswith(payload_prefix + d + "/")
+                        for d in BACKUP_RESTORE_USER_DIRS
+                    )
+                ]
+                if not wanted:
+                    return {
+                        "state": "failed",
+                        "archive_path": str(input_path),
+                        "detail": "archive has no user-data subtrees under the expected payload path",
+                    }
+                _safe_extract_members(tf, tmpd, wanted)
             roots = sorted(
                 p for p in tmpd.iterdir() if p.is_dir() and p.name.endswith("-openclaw-backup")
             )

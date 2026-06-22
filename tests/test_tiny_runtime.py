@@ -1424,6 +1424,53 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertEqual(mirror["status"], "applied")
             self.assertEqual(mirror["phase"], "attested")
 
+    def test_force_update_fails_closed_on_doctor_failure(self) -> None:
+        # A failed post-reinstall doctor must NOT settle force_update as applied
+        # (same fail-closed gate rebuild_app_layer enforces).
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            target, _manifest = _install_bundle_under_id(
+                bundles, base / "current-bundle", marker="fu-doctor"
+            )
+            current = base / "current"
+            os.symlink(target, current)
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=bundles,
+                current_link=current,
+                diagnostics_dir=base / "diagnostics",
+                rebuild_backup_dir=base / "rebuild-backups",
+                stop_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                start_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+            with (
+                patch.object(
+                    hot_image,
+                    "preinstall_hot_image_plugins",
+                    lambda: {"state": "ready", "plugins": []},
+                ),
+                patch.object(
+                    openclaw_adapter,
+                    "doctor_repair",
+                    lambda: {"state": "failed", "detail": "boom"},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-fu-doctor",
+                        "idempotency_key": "idem-fu-doctor",
+                        "kind": "force_update",
+                        "spec": {},
+                    }
+                )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "openclaw_doctor")
+            self.assertEqual(result["failure_code"], "app_layer_rebuild_failed")
+
     def test_rebuild_app_layer_stops_before_restart_when_snapshot_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -4226,6 +4273,35 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertEqual(result["state"], "ready", result)
             self.assertIn("identity", result["restored_dirs"])
             self.assertIn("state", result["restored_dirs"])
+
+    def test_restore_rejects_symlink_escape_under_user_dir(self):
+        # An absolute symlink under a RESTORED user-data dir is an escape vector
+        # (a later member could be written through it). It must be rejected before
+        # extraction so nothing is written outside the extraction dir.
+        from tinyhat_runtime import paths as runtime_paths
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            state_dir = tmp / "state"
+            state_rel = str(state_dir).lstrip("/")
+            archive = tmp / "backup.tar.gz"
+            outside = tmp / "outside"
+            outside.mkdir()
+            with tempfile.TemporaryDirectory() as staging:
+                root = Path(staging) / "2026-01-01T00-00-00.000+00-00-openclaw-backup"
+                payload = root / "payload" / "posix" / state_rel
+                (payload / "identity").mkdir(parents=True)
+                (payload / "identity" / "id.json").write_text("id")
+                sd = payload / "state"
+                sd.mkdir(parents=True)
+                os.symlink(str(outside), sd / "escape")  # absolute-target symlink
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(root, arcname=root.name)
+            with patch.object(runtime_paths, "OPENCLAW_STATE_DIR", state_dir):
+                result = openclaw_adapter.backup_restore(input_path=archive)
+            self.assertEqual(result["state"], "failed", result)
+            self.assertEqual(list(outside.iterdir()), [])  # nothing escaped
 
     def test_restore_rejects_non_openclaw_backup_root(self):
         from tinyhat_runtime import paths as runtime_paths

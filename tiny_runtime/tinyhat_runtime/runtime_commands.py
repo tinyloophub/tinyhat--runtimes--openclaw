@@ -51,16 +51,22 @@ FAILURE_CODES = frozenset(
         "attestation_failed",
         "attestation_mismatch",
         "backup_failed",
+        "backup_not_found",
+        "backup_path_not_allowed",
         "bundle_not_found",
         "bundle_verification_failed",
         "canceled",
         "config_apply_failed",
         "diagnostics_export_failed",
+        "gateway_unhealthy_after_restore",
         "private_access_enroll_failed",
         "idempotency_mismatch",
         "invalid_command",
         "link_chatgpt_failed",
+        "restore_failed",
+        "resume_failed",
         "rollback_failed",
+        "stop_failed",
         "tinyhat_plugin_failed",
         "unsupported_kind",
     }
@@ -1011,6 +1017,18 @@ class RuntimeCommandRunner:
         self.ledger.update(command_id, status="running", phase="openclaw_doctor")
         doctor = openclaw_adapter.doctor_repair()
         result_payload["doctor"] = doctor
+        if doctor.get("state") != "ready":
+            # Fail closed: a failed post-reinstall repair must not settle the
+            # update as applied (same gate rebuild_app_layer enforces).
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="openclaw_doctor",
+                failure_code="app_layer_rebuild_failed",
+                result=result_payload,
+            )
 
         self.ledger.update(command_id, status="running", phase="attest")
         try:
