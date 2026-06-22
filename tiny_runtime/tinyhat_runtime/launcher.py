@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -52,6 +53,30 @@ def _run_command(command: Sequence[str], *, timeout: int) -> tuple[bool, str]:
     return False, redact_text(detail or f"command exited {completed.returncode}", limit=1000)
 
 
+def _run_health_until_ok(
+    health_command: Sequence[str],
+    *,
+    timeout: int,
+    attempts: int,
+    delay: float,
+) -> tuple[bool, str]:
+    """Poll the health command until it reports ok or the settle window elapses.
+
+    A freshly (re)started gateway cold-starts — binding can take ~30s, and on a
+    first start after a plugin reinstall it can be longer. A single immediate
+    probe would false-fail and trigger an unnecessary rollback (the #112-class
+    "destructive loop" where a healthy box is torn down because it wasn't warm
+    yet). We retry the probe across the settle window before giving up.
+    """
+    ok, detail = _run_command(health_command, timeout=timeout)
+    attempt = 1
+    while not ok and attempt < max(attempts, 1):
+        time.sleep(delay)
+        ok, detail = _run_command(health_command, timeout=timeout)
+        attempt += 1
+    return ok, detail
+
+
 def _restore_link(link: Path, previous: str | None) -> None:
     if previous is not None:
         _replace_symlink(link, Path(previous))
@@ -67,6 +92,8 @@ def activate_bundle(
     start_command: Sequence[str] | None = None,
     health_command: Sequence[str] | None = None,
     timeout: int = 30,
+    health_attempts: int = 15,
+    health_delay: float = 6.0,
 ) -> ActivationResult:
     manifest = bundle.load_manifest(bundle_dir)
     bundle.verify_manifest(bundle_dir, manifest)
@@ -105,7 +132,12 @@ def activate_bundle(
             )
 
     if health_command:
-        ok, detail = _run_command(health_command, timeout=timeout)
+        ok, detail = _run_health_until_ok(
+            health_command,
+            timeout=timeout,
+            attempts=health_attempts,
+            delay=health_delay,
+        )
         if not ok:
             if stop_command:
                 _run_command(stop_command, timeout=timeout)
