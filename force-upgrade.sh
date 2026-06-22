@@ -62,13 +62,30 @@ fi
 RESOLVED_SHA="$(git -C "${WORKDIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 log "running data-preserving in-place reinstall from ${REF} (${RESOLVED_SHA})"
 
+# bootstrap.sh's warm-config and runtime install require the platform identity
+# (TINYHAT_PLATFORM_BASE_URL / TINYHAT_BACKEND_AUDIENCE) to be present as env
+# vars. On a normal boot the GCE startup wrapper reads these from instance
+# metadata and exports them before running bootstrap.sh; force-upgrade.sh drives
+# bootstrap.sh directly, so it reads them the same way here. An explicit env var
+# wins over metadata (handy for a manual run on a non-GCE box).
+metadata_get() {
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null || true
+}
+: "${TINYHAT_PLATFORM_BASE_URL:=$(metadata_get tinyhat-platform-base-url)}"
+: "${TINYHAT_BACKEND_AUDIENCE:=$(metadata_get tinyhat-backend-audience)}"
+[[ -n "${TINYHAT_PLATFORM_BASE_URL}" ]] || fail \
+  "TINYHAT_PLATFORM_BASE_URL is required (export it, or run on a GCE Computer whose tinyhat-platform-base-url metadata is set)"
+: "${TINYHAT_BACKEND_AUDIENCE:=${TINYHAT_PLATFORM_BASE_URL}}"
+export TINYHAT_PLATFORM_BASE_URL TINYHAT_BACKEND_AUDIENCE
+log "platform base URL=${TINYHAT_PLATFORM_BASE_URL} audience=${TINYHAT_BACKEND_AUDIENCE}"
+
 # Drive the standard runtime bootstrap install path, but force:
 #   - source install of the current tiny_runtime from the cloned repo, and
 #   - the hard-reset user-state migration (back up the old OpenClaw state, clean
 #     the install-layout paths, reinstall fresh, then restore the user data),
-# with a unique migration token so it always runs for this upgrade. The bootstrap
-# reads the platform base URL / identity audience / framework + plugin specs from
-# the box's GCE metadata, so an old box is rebuilt to today's stack in place.
+# with a unique migration token so it always runs for this upgrade. The remaining
+# framework + plugin specs default to the current public stack inside bootstrap.
 TINYHAT_INSTALL_TINY_RUNTIME_FROM_SOURCE=1 \
 TINYHAT_HARD_RESET_USER_STATE_MIGRATION=1 \
 TINYHAT_HARD_RESET_USER_STATE_MIGRATION_TOKEN="force-upgrade-${RESOLVED_SHA}-$(date +%s)" \
