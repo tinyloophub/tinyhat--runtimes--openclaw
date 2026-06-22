@@ -11,6 +11,7 @@ from . import attestation, bundle, launcher, openclaw_adapter, paths, private_ac
 from .command_ledger import (
     TERMINAL_STATUSES,
     CommandLedger,
+    CommandLedgerError,
     utc_now_iso,
     validate_command_id,
 )
@@ -134,9 +135,30 @@ class RuntimeCommandRunner:
         )
 
     def execute(self, command: dict[str, Any]) -> dict[str, Any]:
-        command_id = validate_command_id(str(command.get("command_id") or ""))
+        raw_command_id = str(command.get("command_id") or "")
         idempotency_key = str(command.get("idempotency_key") or "")
         kind = str(command.get("kind") or "")
+        try:
+            command_id = validate_command_id(raw_command_id)
+        except CommandLedgerError as exc:
+            # A legacy/malformed platform command (e.g. the type-based
+            # ``update_component`` shape) carries no ledger ``command_id``.
+            # Returning a graceful failed result instead of raising is
+            # load-bearing: raising here propagated out of the unguarded
+            # active-loop dispatch and re-bound the Computer ~every cycle in a
+            # destructive loop. The platform can observe this failure code and
+            # stop sending the unsupported command.
+            return {
+                "schema": COMMAND_RESULT_SCHEMA,
+                "command_id": raw_command_id or "invalid",
+                "idempotency_key": idempotency_key,
+                "kind": kind,
+                "status": "failed",
+                "phase": "validate",
+                "failure_code": "invalid_command",
+                "observed_at": utc_now_iso(),
+                "result": {"detail": f"invalid command_id: {exc}"},
+            }
         existing = self.ledger.load(command_id)
         if existing is not None:
             existing_key = str(existing.get("idempotency_key") or "")
