@@ -340,24 +340,44 @@ class TinyRuntimePlatformLoop:
             raise exc
 
     def _dispatch_runtime_command(self, command: dict[str, Any]) -> None:
-        runtime_command = command.get("command")
-        if not isinstance(runtime_command, dict):
-            runtime_command = {
-                key: value
-                for key, value in command.items()
-                if key not in {"type", "revision"}
-            }
-        runner = RuntimeCommandRunner(
-            platform_get_json=self.client.get_json,
-            apply_runtime_config=self._apply_runtime_config,
-            start_chatgpt_link=self._start_chatgpt_link,
-            service_restart=_runtime_command_service_restart_enabled(),
-        )
-        result = runner.execute(runtime_command)
-        self.client.post_json(
-            "/hapi/v1/computers/me/runtime-command/result",
-            {"result": result},
-        )
+        # A single bad/legacy/malformed command must NEVER crash the loop. Two
+        # of the three call sites (the binding-poll path and _active_loop) used
+        # to call this unguarded, so a raise here re-bound the Computer ~every
+        # cycle in a destructive loop (e.g. a legacy ``update_component`` with no
+        # ``command_id``). Catch everything: report a best-effort failed result
+        # when we can, log, and continue. ``execute()`` also returns a graceful
+        # failed result for invalid/unknown commands rather than raising.
+        try:
+            runtime_command = command.get("command")
+            if not isinstance(runtime_command, dict):
+                runtime_command = {
+                    key: value
+                    for key, value in command.items()
+                    if key not in {"type", "revision"}
+                }
+            runner = RuntimeCommandRunner(
+                platform_get_json=self.client.get_json,
+                apply_runtime_config=self._apply_runtime_config,
+                start_chatgpt_link=self._start_chatgpt_link,
+                service_restart=_runtime_command_service_restart_enabled(),
+            )
+            result = runner.execute(runtime_command)
+        except Exception as exc:  # noqa: BLE001 - command failures must not churn the loop
+            LOG.warning(
+                "runtime command dispatch failed (ignored, loop continues): %s",
+                redact_text(str(exc), limit=500),
+            )
+            return
+        try:
+            self.client.post_json(
+                "/hapi/v1/computers/me/runtime-command/result",
+                {"result": result},
+            )
+        except Exception as exc:  # noqa: BLE001 - result POST must not churn the loop
+            LOG.warning(
+                "runtime command result POST failed (ignored): %s",
+                redact_text(str(exc), limit=500),
+            )
 
     def _apply_runtime_config(
         self,

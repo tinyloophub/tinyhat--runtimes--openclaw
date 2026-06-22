@@ -670,6 +670,32 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             )
             self.assertEqual(mirror["status"], "canceled")
 
+    def test_invalid_command_id_returns_failed_without_raising(self) -> None:
+        # A legacy/malformed platform command (e.g. the type-based
+        # ``update_component`` shape) carries no ledger ``command_id``. execute()
+        # must return a graceful failed result, NOT raise — raising here used to
+        # escape the unguarded active-loop dispatch and re-bind the Computer in a
+        # ~75s destructive loop.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "bundles").mkdir()
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                health_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=False,
+            )
+
+            # This is what _dispatch_runtime_command hands execute() after it
+            # strips ``type``/``revision`` from a legacy update_component envelope.
+            result = runner.execute({"targets": {"runtime": {"ref": "v0.16.6"}}})
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "invalid_command")
+            self.assertEqual(result["phase"], "validate")
+
     def test_duplicate_terminal_command_is_local_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
