@@ -7,6 +7,39 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.8
+
+Adds **in-place force-upgrade for already-running Computers** and fixes two
+upgrade-time bricks. A self-contained `force-upgrade.sh` (repo root), run on the
+box, rebuilds it to the current runtime + plugins + OpenClaw while preserving the
+user's data — independent of the box's current version, so a legacy /
+pre-`tiny_runtime` Computer is brought fully current in one shot with no command
+channel. Companion platform PR: tinyloophub/tinyloop#866.
+
+### Added
+
+- `force-upgrade.sh` (repo root): clones the public runtime at a target ref and
+  runs the standard bootstrap with the data-preserving migration forced on (back
+  up user state -> reinstall fresh -> restore), reading platform / OpenClaw /
+  plugin config from the box's GCE metadata. Runs on a box on an OLD version
+  without updating it first.
+
+### Fixed
+
+- codex/tinyhat plugins blocked for "suspicious ownership": OpenClaw 2026.6.9+
+  blocks any plugin whose install path is not owned by root, but the runtime
+  owned the OpenClaw state dir as the unprivileged gateway user -- so the codex
+  npm project and the tinyhat extension ended up uid != 0, were blocked, the
+  preinstall inspect gate reported them "not found", and the box bricked
+  mid-upgrade. The plugin trees are now re-owned to root (`a+rX`, still
+  gateway-loadable) before each inspect gate and in `chown_runtime_paths`; a
+  regression test is added.
+- `force-upgrade.sh` aborted at `warm-config failed: TINYHAT_PLATFORM_BASE_URL is
+  required`: the bootstrap's warm-config needs `TINYHAT_PLATFORM_BASE_URL` /
+  `TINYHAT_BACKEND_AUDIENCE` as env vars (the GCE startup wrapper normally
+  exports them from metadata), but `force-upgrade.sh` bypassed the wrapper. It
+  now reads those keys from GCE metadata and exports them before bootstrap.
+
 ## 0.16.7
 
 Adds a step-wise, data-preserving **Force Upgrade** for tiny_runtime Computers:
