@@ -7,6 +7,8 @@ import os
 import secrets as secrets_module
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -751,6 +753,95 @@ def backup_create(
         "archive_bytes": output_path.stat().st_size if archive_exists else None,
         "backup": payload,
         "detail": result.public_summary(),
+    }
+
+
+# Top-level OpenClaw state subtrees that hold USER data and are restored after a
+# fresh reinstall. The install layer (extensions / platform-plugins / npm /
+# .npm) is deliberately NOT restored — the Force-Upgrade "update" step freshly
+# installs the supported plugins (codex + tinyhat), and restoring the old
+# install would undo the upgrade. Transient logs/markers are also skipped.
+BACKUP_RESTORE_USER_DIRS: tuple[str, ...] = (
+    "agents",
+    "devices",
+    "identity",
+    "state",
+    "openclaw",
+    "tinyhat-control",
+    "workspaces",
+    "secrets",
+    "credentials",
+)
+
+
+def backup_restore(
+    *,
+    input_path: Path,
+) -> dict[str, Any]:
+    """Restore user state from an ``openclaw backup create`` archive.
+
+    OpenClaw has no ``backup restore`` command — the archive is a tarball whose
+    ``<ts>-openclaw-backup/payload/posix/<state-dir>`` mirrors the on-box state.
+    We extract it and copy back ONLY the user-data subtrees (auth state,
+    credentials, sessions/sqlite, agents, identity, config), leaving the
+    freshly-installed plugin/runtime layer intact. The caller must stop the
+    gateway first so the sqlite state is quiescent.
+    """
+    if not input_path.exists():
+        return {
+            "state": "failed",
+            "archive_path": None,
+            "detail": f"backup archive not found: {input_path}",
+        }
+    state_dir = paths.OPENCLAW_STATE_DIR
+    rel = str(state_dir).lstrip("/")  # e.g. home/tinyhat/runtime
+    restored: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpd = Path(tmp)
+            with tarfile.open(input_path, "r:gz") as tf:
+                tf.extractall(tmpd)  # noqa: S202 - trusted, on-box archive we created
+            roots = [p for p in tmpd.iterdir() if p.is_dir()]
+            if not roots:
+                return {
+                    "state": "failed",
+                    "archive_path": str(input_path),
+                    "detail": "empty archive",
+                }
+            payload_root = roots[0] / "payload" / "posix" / rel
+            if not payload_root.exists():
+                return {
+                    "state": "failed",
+                    "archive_path": str(input_path),
+                    "detail": f"payload root not found under {roots[0].name}",
+                }
+            state_dir.mkdir(parents=True, exist_ok=True)
+            for name in BACKUP_RESTORE_USER_DIRS:
+                src = payload_root / name
+                if not src.exists():
+                    continue
+                dst = state_dir / name
+                if dst.is_dir():
+                    shutil.rmtree(dst, ignore_errors=True)
+                elif dst.exists():
+                    dst.unlink()
+                if src.is_dir():
+                    shutil.copytree(src, dst, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                restored.append(name)
+    except Exception as exc:  # noqa: BLE001 - report a clean failure, never raise
+        return {
+            "state": "failed",
+            "archive_path": str(input_path),
+            "detail": redact_text(str(exc), limit=500),
+        }
+    return {
+        "state": "ready" if restored else "failed",
+        "archive_path": str(input_path),
+        "archive_bytes": input_path.stat().st_size,
+        "restored_dirs": restored,
+        "detail": f"restored {len(restored)} user-data subtree(s)",
     }
 
 
