@@ -2091,6 +2091,37 @@ class PlatformLoopTests(unittest.TestCase):
         )
         self.assertTrue(payload["metrics"]["assigned"])
 
+    def test_heartbeat_omits_component_versions_when_manifest_missing(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        client = _FakePlatformClient()
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.bundle,
+                "load_manifest",
+                side_effect=FileNotFoundError("no active bundle"),
+            ),
+            patch.object(
+                platform_loop.private_access,
+                "private_access_report",
+                return_value=None,
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_status",
+                return_value={"state": "ready"},
+            ),
+        ):
+            self.assertEqual(platform_loop._active_bundle_component_versions(), {})
+            self.assertEqual(platform_loop._active_bundle_runtime_state_report(), {})
+            loop._post_heartbeat(assigned=True)
+
+        payload = client.posts[0][1]
+        self.assertNotIn("component_versions", payload)
+        self.assertEqual(payload["metrics"]["runtime_generation"], "tiny_runtime")
+
     def test_runtime_state_includes_private_access_report(self) -> None:
         from tinyhat_runtime import platform_loop
 
@@ -2172,6 +2203,74 @@ class PlatformLoopTests(unittest.TestCase):
         self.assertEqual(
             payload["components"]["tinyhat_openclaw_plugin"]["ref"],
             plugin_sha,
+        )
+
+    def test_runtime_state_bundle_evidence_wins_over_extra_payload(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        runtime_sha = "e" * 40
+        plugin_sha = "f" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = bundle.write_manifest(
+                root,
+                components={
+                    "runtime": {
+                        "repo": "https://github.com/tinyloophub/tinyhat--runtimes--openclaw.git",
+                        "ref": runtime_sha,
+                    },
+                    "openclaw": {"package": "openclaw", "ref": "openclaw@2026.6.8"},
+                    "tinyhat_openclaw_plugin": {
+                        "repo": "https://github.com/tinyhat-ai/tinyhat.git",
+                        "ref": plugin_sha,
+                    },
+                },
+            )
+            client = _FakePlatformClient()
+            loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+            with (
+                patch.object(platform_loop.paths, "CURRENT_LINK", root),
+                patch.object(
+                    platform_loop.private_access,
+                    "private_access_report",
+                    return_value=None,
+                ),
+            ):
+                loop._post_runtime_state(
+                    "healthy",
+                    "tiny_runtime OpenClaw ready",
+                    {
+                        "runtime": {"sha": "stale-runtime"},
+                        "plugin": {
+                            "sha": "stale-plugin",
+                            "framework_installed": "old-framework",
+                        },
+                        "openclaw": {"installed_version": "old-framework"},
+                        "component_versions": {
+                            "runtime": {"sha": "stale-runtime"},
+                            "plugin": {"sha": "stale-plugin"},
+                            "framework": {"version": "old-framework"},
+                        },
+                        "bundle": {"id": "stale-bundle"},
+                        "components": {"runtime": {"ref": "stale-runtime"}},
+                    },
+                )
+
+        payload = client.posts[0][1]
+        self.assertEqual(payload["runtime"], {"sha": runtime_sha})
+        self.assertEqual(payload["plugin"]["sha"], plugin_sha)
+        self.assertEqual(payload["plugin"]["framework_installed"], "2026.6.8")
+        self.assertEqual(payload["openclaw"]["interface"], "official_cli")
+        self.assertEqual(payload["openclaw"]["installed_version"], "2026.6.8")
+        self.assertEqual(payload["bundle"]["id"], manifest["bundle_id"])
+        self.assertEqual(
+            payload["component_versions"],
+            {
+                "runtime": {"sha": runtime_sha},
+                "plugin": {"sha": plugin_sha},
+                "framework": {"version": "2026.6.8"},
+            },
         )
 
     def test_subscription_runtime_verification_uses_models_status(self) -> None:
@@ -2789,6 +2888,27 @@ class SystemdUnitTests(unittest.TestCase):
             '"stopping existing runtime before source reinstall"',
             script,
         )
+
+    def test_source_reinstall_quiesce_guard_skips_normal_boots(self) -> None:
+        script = (_REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+
+        function_start = script.index("quiesce_for_tiny_runtime_source_reinstall() {")
+        function_end = script.index(
+            "\n}\n\nfail_tiny_runtime_source_reinstall",
+            function_start,
+        )
+        function_body = script[function_start:function_end]
+        guard_pos = function_body.index(
+            'if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then'
+        )
+        return_pos = function_body.index("return 0", guard_pos)
+        first_stop_pos = min(
+            function_body.index("stop_existing_tiny_runtime_units"),
+            function_body.index("remove_legacy_openclaw_units"),
+        )
+
+        self.assertLess(guard_pos, return_pos)
+        self.assertLess(return_pos, first_stop_pos)
 
     def test_assembled_bundle_carries_computer_startup_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

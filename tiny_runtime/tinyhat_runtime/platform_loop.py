@@ -637,18 +637,25 @@ class TinyRuntimePlatformLoop:
                 "interface": "official_cli",
             },
         }
+        if extra:
+            gateway_extra = extra.get("gateway")
+            openclaw_extra = extra.get("openclaw")
+            payload.update(
+                {
+                    key: value
+                    for key, value in extra.items()
+                    if key not in {"gateway", "openclaw"}
+                }
+            )
+            if isinstance(gateway_extra, dict):
+                payload["gateway"] = {**payload["gateway"], **gateway_extra}
+            if isinstance(openclaw_extra, dict):
+                payload["openclaw"] = {**payload["openclaw"], **openclaw_extra}
         bundle_report = _active_bundle_runtime_state_report()
         bundle_openclaw = bundle_report.pop("openclaw", None)
         payload.update(bundle_report)
         if isinstance(bundle_openclaw, dict):
             payload["openclaw"] = {**payload["openclaw"], **bundle_openclaw}
-        if extra:
-            gateway_extra = extra.get("gateway")
-            payload.update(
-                {key: value for key, value in extra.items() if key != "gateway"}
-            )
-            if isinstance(gateway_extra, dict):
-                payload["gateway"] = {**payload["gateway"], **gateway_extra}
         private_report = private_access.private_access_report()
         if private_report is not None:
             payload["private_access"] = private_report
