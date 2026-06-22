@@ -2305,6 +2305,38 @@ class PlatformLoopTests(unittest.TestCase):
             },
         )
 
+    def test_legacy_command_dispatch_result_failure_does_not_raise(self) -> None:
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+
+        def post_json(path: str, payload: dict) -> dict:
+            posts.append((path, payload))
+            if path == "/hapi/v1/computers/me/runtime-command/result":
+                raise RuntimeError("HTTP Error 409: Conflict")
+            return {}
+
+        client = Mock()
+        client.post_json.side_effect = post_json
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        loop._dispatch_runtime_command(
+            {
+                "type": "update_component",
+                "revision": 2,
+                "targets": {"runtime": {"ref": "v0.16.6"}},
+            }
+        )
+
+        self.assertEqual(
+            [path for path, _payload in posts],
+            ["/hapi/v1/computers/me/runtime-command/result"],
+        )
+        result = posts[0][1]["result"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_code"], "invalid_command")
+        self.assertEqual(result["phase"], "validate")
+
     def test_gateway_ready_wait_polls_until_official_health_recovers(self) -> None:
         from tinyhat_runtime import platform_loop
 
