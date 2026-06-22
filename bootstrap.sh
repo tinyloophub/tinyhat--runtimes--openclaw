@@ -44,6 +44,9 @@ SUPERVISOR_PATH="${RUNTIME_DIR}/supervisor.py"
 SUPERVISOR_UNIT_NAME="tinyhat-openclaw.service"
 GATEWAY_UNIT_NAME="tinyhat-openclaw-gateway.service"
 WORKLOAD_SLICE_UNIT_NAME="tinyhat-openclaw-workload.slice"
+TINY_RUNTIME_PLATFORM_UNIT_NAME="tinyhat-runtime-platform.service"
+TINY_RUNTIME_GATEWAY_UNIT_NAME="tinyhat-runtime-gateway.service"
+TINY_RUNTIME_ATTESTATION_UNIT_NAME="tinyhat-runtime-attestation.service"
 SUPERVISOR_UNIT="/etc/systemd/system/${SUPERVISOR_UNIT_NAME}"
 GATEWAY_UNIT="/etc/systemd/system/${GATEWAY_UNIT_NAME}"
 WORKLOAD_SLICE_UNIT="/etc/systemd/system/${WORKLOAD_SLICE_UNIT_NAME}"
@@ -176,6 +179,29 @@ remove_legacy_openclaw_units() {
   systemctl reset-failed \
     "${SUPERVISOR_UNIT_NAME}" \
     "${GATEWAY_UNIT_NAME}" >/dev/null 2>&1 || true
+}
+
+stop_existing_tiny_runtime_units() {
+  echo "[tinyhat-runtime] stopping existing tiny_runtime services before source reinstall"
+  systemctl stop \
+    "${TINY_RUNTIME_PLATFORM_UNIT_NAME}" \
+    "${TINY_RUNTIME_GATEWAY_UNIT_NAME}" \
+    "${TINY_RUNTIME_ATTESTATION_UNIT_NAME}" >/dev/null 2>&1 || true
+  systemctl reset-failed \
+    "${TINY_RUNTIME_PLATFORM_UNIT_NAME}" \
+    "${TINY_RUNTIME_GATEWAY_UNIT_NAME}" \
+    "${TINY_RUNTIME_ATTESTATION_UNIT_NAME}" >/dev/null 2>&1 || true
+}
+
+quiesce_for_tiny_runtime_source_reinstall() {
+  if [[ "${INSTALL_TINY_RUNTIME_FROM_SOURCE}" != "1" ]]; then
+    return 0
+  fi
+
+  write_runtime_bootstrap_status "updating" "stopping existing runtime before source reinstall"
+  stop_existing_tiny_runtime_units
+  remove_legacy_openclaw_units
+  write_runtime_bootstrap_status "updating" "existing runtime stopped for source reinstall"
 }
 
 fail_tiny_runtime_source_reinstall() {
@@ -619,6 +645,8 @@ if [[ ! -f "${SUPERVISOR_PATH}" ]]; then
   echo "[tinyhat-runtime] ERROR: supervisor.py not found at ${SUPERVISOR_PATH}" >&2
   exit 1
 fi
+
+quiesce_for_tiny_runtime_source_reinstall
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y

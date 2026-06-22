@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-from . import openclaw_adapter, private_access, subscription_link
+from . import bundle, openclaw_adapter, paths, private_access, subscription_link
 from .platform_client import (
     PlatformClient,
     backend_audience_from_env,
@@ -37,6 +38,7 @@ GATEWAY_READY_WAIT_SECONDS = float(
 GATEWAY_READY_POLL_SECONDS = float(
     os.environ.get("TINYHAT_GATEWAY_READY_POLL_SECONDS", "0.5")
 )
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def _runtime_command_service_restart_enabled() -> bool:
@@ -63,6 +65,121 @@ def _phase(name: str, label: str, started: float, ended: float) -> dict[str, Any
         "label": label,
         "duration_ms": _elapsed_ms(started, ended),
     }
+
+
+def _text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _sha_or_version_entry(
+    *,
+    ref: Any,
+    version: Any = None,
+    sha: Any = None,
+) -> dict[str, str] | None:
+    ref_text = _text(ref)
+    version_text = _text(version)
+    sha_text = _text(sha)
+    if sha_text is None and ref_text and _GIT_SHA_RE.fullmatch(ref_text):
+        sha_text = ref_text
+    if version_text is None and ref_text and not _GIT_SHA_RE.fullmatch(ref_text):
+        version_text = ref_text
+    entry: dict[str, str] = {}
+    if version_text:
+        entry["version"] = version_text
+    if sha_text:
+        entry["sha"] = sha_text
+    return entry or None
+
+
+def _package_version_from_ref(ref: Any, *, package: str) -> str | None:
+    text = _text(ref)
+    if text is None:
+        return None
+    prefix = f"{package}@"
+    return text.removeprefix(prefix) if text.startswith(prefix) else text
+
+
+def _active_bundle_component_versions() -> dict[str, dict[str, str]]:
+    try:
+        manifest = bundle.load_manifest(paths.CURRENT_LINK)
+    except Exception as exc:  # noqa: BLE001 - reporting must not break the loop
+        LOG.debug("active bundle manifest unavailable: %s", exc)
+        return {}
+    components = manifest.get("components")
+    if not isinstance(components, dict):
+        return {}
+
+    out: dict[str, dict[str, str]] = {}
+
+    runtime = components.get("runtime")
+    if isinstance(runtime, dict):
+        entry = _sha_or_version_entry(
+            ref=runtime.get("ref"),
+            version=runtime.get("version"),
+            sha=runtime.get("sha") or runtime.get("commit_sha"),
+        )
+        if entry:
+            out["runtime"] = entry
+
+    plugin = components.get("tinyhat_openclaw_plugin")
+    if isinstance(plugin, dict):
+        entry = _sha_or_version_entry(
+            ref=plugin.get("ref"),
+            version=plugin.get("version"),
+            sha=plugin.get("sha") or plugin.get("commit_sha"),
+        )
+        if entry:
+            out["plugin"] = entry
+
+    openclaw = components.get("openclaw")
+    if isinstance(openclaw, dict):
+        version = (
+            _text(openclaw.get("version"))
+            or _package_version_from_ref(openclaw.get("ref"), package="openclaw")
+        )
+        if version:
+            out["framework"] = {"version": version}
+
+    return out
+
+
+def _active_bundle_runtime_state_report() -> dict[str, Any]:
+    versions = _active_bundle_component_versions()
+    if not versions:
+        return {}
+    report: dict[str, Any] = {
+        "component_versions": versions,
+    }
+    runtime = versions.get("runtime")
+    if runtime:
+        report["runtime"] = dict(runtime)
+    plugin = versions.get("plugin")
+    framework = versions.get("framework")
+    if plugin or framework:
+        plugin_report = dict(plugin or {})
+        if framework and framework.get("version"):
+            plugin_report["framework_installed"] = framework["version"]
+        if plugin_report:
+            report["plugin"] = plugin_report
+    if framework and framework.get("version"):
+        report["openclaw"] = {"installed_version": framework["version"]}
+    try:
+        manifest = bundle.load_manifest(paths.CURRENT_LINK)
+    except Exception:
+        return report
+    bundle_id = _text(manifest.get("bundle_id"))
+    if bundle_id:
+        report["bundle"] = {
+            "id": bundle_id,
+            "runtime_generation": _text(manifest.get("runtime_generation")),
+            "schema": _text(manifest.get("schema")),
+        }
+    components = manifest.get("components")
+    if isinstance(components, dict):
+        report["components"] = components
+    return report
 
 
 class TinyRuntimePlatformLoop:
@@ -427,12 +544,16 @@ class TinyRuntimePlatformLoop:
         private_report = private_access.private_access_report()
         if private_report is not None:
             metrics["private_access"] = private_report
+        component_versions = _active_bundle_component_versions()
+        body: dict[str, Any] = {
+            "metrics": metrics,
+            "openclaw_status": openclaw_adapter.gateway_status(),
+        }
+        if component_versions:
+            body["component_versions"] = component_versions
         return self.client.post_json(
             "/hapi/v1/computers/me/heartbeat",
-            {
-                "metrics": metrics,
-                "openclaw_status": openclaw_adapter.gateway_status(),
-            },
+            body,
         )
 
     def _safe_post_heartbeat(
@@ -516,6 +637,11 @@ class TinyRuntimePlatformLoop:
                 "interface": "official_cli",
             },
         }
+        bundle_report = _active_bundle_runtime_state_report()
+        bundle_openclaw = bundle_report.pop("openclaw", None)
+        payload.update(bundle_report)
+        if isinstance(bundle_openclaw, dict):
+            payload["openclaw"] = {**payload["openclaw"], **bundle_openclaw}
         if extra:
             gateway_extra = extra.get("gateway")
             payload.update(
