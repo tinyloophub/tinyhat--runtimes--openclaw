@@ -7,6 +7,15 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.6
+
+Patch release for the Tinyloop v0.16 `tiny_runtime` train. This makes
+data-preserving upgrades of existing customer Computers stop old
+tiny-runtime and legacy OpenClaw services before source reinstall, then
+report bundle evidence back to the platform so admin upgrades can prove
+convergence without using legacy runtime state. Companion platform PR:
+tinyloophub/tinyloop#855.
+
 ### Added
 
 - Report the active tiny-runtime bundle's runtime, plugin, and OpenClaw
