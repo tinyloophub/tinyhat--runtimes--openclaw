@@ -527,6 +527,10 @@ class LauncherTests(unittest.TestCase):
                     "-c",
                     f"EVENT='health'; {append_event}; raise SystemExit(9)",
                 ],
+                # Single probe (no settle window) so the persistent-failure
+                # rollback path is exercised without sleeping.
+                health_attempts=1,
+                health_delay=0,
             )
 
             self.assertFalse(result.activated)
@@ -536,6 +540,43 @@ class LauncherTests(unittest.TestCase):
                 events.read_text(encoding="utf-8"),
                 "stop\nstart\nhealth\nstop\nstart\n",
             )
+
+    def test_activation_health_poll_recovers_from_cold_start(self) -> None:
+        # A freshly started gateway is unhealthy for the first probes, then
+        # becomes healthy. The settle poll must wait it out and activate rather
+        # than false-fail + roll back (the #112-class destructive loop).
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            previous = base / "previous"
+            candidate = base / "candidate"
+            previous.mkdir()
+            candidate.mkdir()
+            _write_minimal_bundle(candidate)
+            current = base / "current"
+            os.symlink(previous, current)
+            counter = base / "health_calls"
+            # Health command: fail (exit 9) for the first 2 calls, then succeed.
+            health_script = (
+                "from pathlib import Path; "
+                f"c=Path({str(counter)!r}); "
+                "n=int(c.read_text()) if c.exists() else 0; "
+                "n+=1; c.write_text(str(n)); "
+                "raise SystemExit(0 if n >= 3 else 9)"
+            )
+
+            result = launcher.activate_bundle(
+                candidate,
+                current_link=current,
+                start_command=[sys.executable, "-c", "pass"],
+                health_command=[sys.executable, "-c", health_script],
+                health_attempts=5,
+                health_delay=0,
+            )
+
+            self.assertTrue(result.activated)
+            self.assertFalse(result.rolled_back)
+            self.assertEqual(os.readlink(current), str(candidate.resolve()))
+            self.assertEqual(int(counter.read_text()), 3)
 
 
 class CommandLedgerTests(unittest.TestCase):

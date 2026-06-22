@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -801,6 +802,28 @@ class RuntimeCommandRunner:
     def _gateway_health_command(self) -> tuple[str, ...]:
         return tuple(self.health_command or _default_health_command())
 
+    def _wait_for_gateway_healthy(
+        self, *, attempts: int = 15, delay: float = 6.0
+    ) -> dict[str, Any]:
+        """Poll the OpenClaw gateway health until healthy or the cold-start
+        settle window elapses.
+
+        A freshly (re)started gateway binds in ~30s — longer right after a
+        plugin reinstall. An immediate single probe would report ``unhealthy``
+        and make a successful start look like a failure, so we retry across the
+        settle window before giving up.
+        """
+        health = openclaw_adapter.gateway_health()
+        attempt = 1
+        while (
+            str(health.get("state") or "") != "healthy"
+            and attempt < max(attempts, 1)
+        ):
+            time.sleep(delay)
+            health = openclaw_adapter.gateway_health()
+            attempt += 1
+        return health
+
     def _force_stop(self, command: dict[str, Any]) -> dict[str, Any]:
         command_id, idempotency_key, kind = _ids(command)
         self.ledger.update(command_id, status="running", phase="stop_gateway")
@@ -836,7 +859,9 @@ class RuntimeCommandRunner:
         started_ok, start_detail = launcher._run_command(
             self._gateway_start_command(), timeout=60
         )
-        health = openclaw_adapter.gateway_health()
+        # Poll across the cold-start window: a just-started gateway is unhealthy
+        # for the first ~30s. Probing once would false-fail the resume.
+        health = self._wait_for_gateway_healthy()
         gateway_up = str(health.get("state") or "") == "healthy"
         applied = bool(started_ok) and gateway_up
         return self._finish(
@@ -1023,15 +1048,36 @@ class RuntimeCommandRunner:
                 result=result_payload,
             )
 
-        # Restart the gateway so the restored user state is live, then attest.
+        # Restart the gateway so the restored user state is live, then confirm
+        # it actually comes up before declaring recovery complete. Poll across
+        # the cold-start window so a slow-but-healthy gateway is not misread as
+        # a failed recover.
+        self.ledger.update(command_id, status="running", phase="restart_gateway")
         started_ok, start_detail = launcher._run_command(
             self._gateway_start_command(), timeout=60
         )
+        health = self._wait_for_gateway_healthy()
+        gateway_up = str(health.get("state") or "") == "healthy"
         result_payload["restart_requested"] = True
         result_payload["restart"] = {
             "ok": bool(started_ok),
+            "gateway_up": gateway_up,
+            "gateway_health": health,
             "detail": redact_text(start_detail, limit=500),
         }
+        if not gateway_up:
+            # The restore is on disk, but the workload did not come back. Report
+            # a clean failure so the operator can re-run recover rather than
+            # silently leaving a down gateway behind a "restored" status.
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="restart_gateway",
+                failure_code="gateway_unhealthy_after_restore",
+                result=result_payload,
+            )
         self.ledger.update(command_id, status="running", phase="attest")
         try:
             result_payload["attestation"] = self._current_attestation()
