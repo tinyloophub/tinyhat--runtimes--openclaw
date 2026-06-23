@@ -316,6 +316,27 @@ install_tiny_runtime_from_source() {
   if ! /opt/tinyhat/current/bin/tinyhat-runtime private-access enroll-platform; then
     echo "[tinyhat-runtime] WARNING: private-access enrollment failed; platform loop will report diagnostics" >&2
   fi
+  # A data-preserving reinstall restores the box's prior OpenClaw user state
+  # (including agents/main/agent/auth-profiles.json), but a current OpenClaw
+  # keeps per-agent auth in openclaw-agent.sqlite. Run OpenClaw's official
+  # doctor migration so the restored ChatGPT/Codex-subscription profile is
+  # reconciled into the live auth store BEFORE the gateway starts -- otherwise
+  # the box comes back with "No API key for provider openai" and is silently
+  # demoted to OpenRouter (tinyloophub/tinyloop#870). Best-effort: the gateway
+  # is brought up regardless and the admin auth-repair path is the backstop, so
+  # a doctor problem must never brick the reinstall.
+  if [[ "${HARD_RESET_USER_STATE_MIGRATION}" == "1" ]]; then
+    echo "[tinyhat-runtime] migrating OpenClaw auth store after data-preserving reinstall"
+    if /opt/tinyhat/current/bin/tinyhat-runtime openclaw migrate-auth-store; then
+      echo "[tinyhat-runtime] OpenClaw auth-store migration complete"
+    else
+      echo "[tinyhat-runtime] WARNING: OpenClaw auth-store migration reported a problem; subscription auth may need admin repair" >&2
+    fi
+    # doctor runs as root here; restore runtime-user ownership of the migrated
+    # auth store (and re-own plugin trees back to root) so the unprivileged
+    # gateway can read it and OpenClaw's plugin ownership gate still passes.
+    chown_runtime_paths
+  fi
   systemctl daemon-reload \
     || fail_tiny_runtime_source_reinstall "systemd daemon reload failed"
   remove_legacy_openclaw_units
