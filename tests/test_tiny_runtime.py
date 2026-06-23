@@ -2997,6 +2997,40 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertNotIn("TAILSCALE_AUTH_KEY", script)
         self.assertNotIn("tailscale_auth_file", script)
 
+    def test_source_reinstall_migrates_openclaw_auth_store_before_gateway_start(
+        self,
+    ) -> None:
+        # A data-preserving reinstall restores the box's prior OpenClaw user
+        # state (auth-profiles.json) but a current OpenClaw keeps per-agent auth
+        # in openclaw-agent.sqlite; without OpenClaw's official doctor migration
+        # the restored ChatGPT/Codex-subscription profile is never reconciled
+        # and the box comes back demoted to OpenRouter (tinyloophub/tinyloop#870).
+        script = (_REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        body = script[
+            script.index("install_tiny_runtime_from_source() {") : script.index(
+                "verify_codex_subscription_plugin() {"
+            )
+        ]
+
+        self.assertIn(
+            "/opt/tinyhat/current/bin/tinyhat-runtime openclaw migrate-auth-store",
+            body,
+        )
+        # Only on the data-preserving reinstall, and gated by an if/else so a
+        # doctor problem never trips `set -e` and bricks the boot.
+        guard_pos = body.index(
+            'if [[ "${HARD_RESET_USER_STATE_MIGRATION}" == "1" ]]; then'
+        )
+        migrate_pos = body.index("openclaw migrate-auth-store")
+        enable_pos = body.index("systemctl enable --now")
+        self.assertLess(guard_pos, migrate_pos)
+        # Gateway is down while doctor reconciles the sqlite auth store.
+        self.assertLess(migrate_pos, enable_pos)
+        # doctor runs as root here; ownership is restored before the gateway
+        # starts so the unprivileged runtime user can read its auth store.
+        chown_pos = body.index("chown_runtime_paths", migrate_pos)
+        self.assertLess(chown_pos, enable_pos)
+
     def test_source_reinstall_cleans_legacy_processes_before_tiny_runtime_start(
         self,
     ) -> None:
@@ -3177,6 +3211,45 @@ def _scan_source_for_openclaw_literal(source: str) -> bool:
 def _tiny_runtime_python_files() -> list[Path]:
     package_root = _REPO_ROOT / "tiny_runtime" / "tinyhat_runtime"
     return sorted(path for path in package_root.rglob("*.py") if path.is_file())
+
+
+class OpenClawMigrateAuthStoreCliTests(unittest.TestCase):
+    """`tinyhat-runtime openclaw migrate-auth-store` — the data-preserving
+    reinstall's auth migration, driven only through OpenClaw's official
+    `doctor --fix` (tinyloophub/tinyloop#870)."""
+
+    def test_migrate_auth_store_runs_official_doctor_and_succeeds(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(
+                openclaw_adapter,
+                "doctor_repair",
+                return_value={"state": "ready", "detail": "ok"},
+            ) as doctor,
+            contextlib.redirect_stdout(output),
+        ):
+            rc = main.main(["openclaw", "migrate-auth-store"])
+
+        self.assertEqual(rc, 0)
+        doctor.assert_called_once_with()
+        self.assertIn('"state": "ready"', output.getvalue())
+
+    def test_migrate_auth_store_reports_failure_when_doctor_not_ready(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(
+                openclaw_adapter,
+                "doctor_repair",
+                return_value={"state": "failed", "detail": "boom"},
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            rc = main.main(["openclaw", "migrate-auth-store"])
+
+        # Non-ready doctor result must surface as a non-zero exit so the
+        # reinstall logs the warning instead of claiming a clean migration.
+        self.assertEqual(rc, 1)
+        self.assertIn('"state": "failed"', output.getvalue())
 
 
 class OpenClawAdapterBoundaryTests(unittest.TestCase):

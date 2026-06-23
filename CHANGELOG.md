@@ -7,6 +7,22 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Fixed
+
+- Data-preserving reinstall no longer strands ChatGPT/Codex-subscription auth.
+  The in-place force-upgrade restores the box's prior OpenClaw user state
+  (including `agents/main/agent/auth-profiles.json`), but a current OpenClaw
+  keeps per-agent auth in `openclaw-agent.sqlite` and does not pick up the
+  restored profiles until its own `doctor --fix` migration runs. The reinstall
+  now runs OpenClaw's official doctor migration (new
+  `tinyhat-runtime openclaw migrate-auth-store`, backed by
+  `openclaw_adapter.doctor_repair`) before starting the gateway, so a
+  force-upgraded subscription box comes back on its subscription model instead
+  of erroring with `No API key for provider "openai"` and being silently
+  demoted to OpenRouter. Best-effort: a doctor problem never bricks the
+  reinstall; the gateway still starts and the platform admin auth-repair path
+  remains the backstop. Companion platform issue: tinyloophub/tinyloop#870.
+
 ## 0.16.8
 
 Adds **in-place force-upgrade for already-running Computers** and fixes two

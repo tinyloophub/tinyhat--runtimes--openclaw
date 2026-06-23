@@ -170,6 +170,26 @@ def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_openclaw_migrate_auth_store(_args: argparse.Namespace) -> int:
+    """Run OpenClaw's official safe repair so a data-preserving reinstall
+    reconciles the restored auth profiles into the current auth store.
+
+    A force-upgrade / data-preserving reinstall lays down a current OpenClaw
+    and restores the box's prior user state (including `auth-profiles.json`),
+    but a newer OpenClaw keeps per-agent auth in `openclaw-agent.sqlite`. The
+    profiles are not picked up until OpenClaw's own `doctor --fix` migration
+    runs, so a ChatGPT/Codex-subscription box would otherwise come back with
+    "No API key for provider openai" and get silently demoted. This drives the
+    migration only through the official `openclaw doctor --fix` interface
+    (`openclaw_adapter.doctor_repair`) — never by touching the auth store
+    directly — matching the recovery the `rebuild_app_layer` / `force_update`
+    command handlers already perform. See tinyloophub/tinyloop#870.
+    """
+    result = openclaw_adapter.doctor_repair()
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("state") == "ready" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tinyhat-runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -262,6 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
     bake_sub = bake.add_subparsers(dest="bake_command", required=True)
     preinstall_plugins = bake_sub.add_parser("preinstall-plugins")
     preinstall_plugins.set_defaults(func=_cmd_bake_preinstall_plugins)
+
+    openclaw_parser = subparsers.add_parser("openclaw")
+    openclaw_sub = openclaw_parser.add_subparsers(
+        dest="openclaw_command",
+        required=True,
+    )
+    migrate_auth_store = openclaw_sub.add_parser("migrate-auth-store")
+    migrate_auth_store.set_defaults(func=_cmd_openclaw_migrate_auth_store)
     return parser
 
 
