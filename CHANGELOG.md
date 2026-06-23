@@ -7,6 +7,16 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+### Added
+
+- Heartbeat now attests the live runtime identity inside the `openclaw_status`
+  payload: `runtime_generation` (`tiny_runtime`), the active bundle `bundle_id`,
+  and — when assigned — the live `model_ref` (from `openclaw models status`).
+  The platform admin Status panel reads these top-level keys, so a healthy
+  tiny_runtime Computer now shows its real runtime generation, bundle, and
+  active model instead of `Unknown` / `Not reported`. Best-effort: a status
+  read never skips the heartbeat. Companion platform issue: tinyloophub/tinyloop#870.
+
 ## 0.16.9
 
 Fixes a force-upgrade regression that stranded ChatGPT/Codex-subscription auth.
