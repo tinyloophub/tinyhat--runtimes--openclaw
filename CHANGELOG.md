@@ -7,6 +7,16 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.9
+
+Fixes a force-upgrade regression that stranded ChatGPT/Codex-subscription auth.
+The data-preserving reinstall now runs OpenClaw's official `doctor --fix`
+migration before starting the gateway, so a force-upgraded subscription
+Computer comes back on its subscription model instead of erroring with
+`No API key for provider "openai"` and being silently demoted to OpenRouter.
+`force-upgrade.sh` now defaults its target ref to `v0.16.9`, so an in-place
+force-upgrade delivers this fix. Companion platform issue: tinyloophub/tinyloop#870.
+
 ### Fixed
 
 - Data-preserving reinstall no longer strands ChatGPT/Codex-subscription auth.
