@@ -558,16 +558,19 @@ class RuntimeCommandRunner:
         # reaches the agent's exec shell after a local gateway rebind. SecretRef-
         # only changes (model/channel keys) stay hot and skip this.
         if env_block_changed:
-            gateway_up = self._rebind_gateway_for_env_block(
+            rebound_ok = self._rebind_gateway_for_env_block(
                 command_id=command_id, result_payload=result_payload
             )
+            rebind = result_payload.get("gateway_rebind") or {}
+            # Point at the lifecycle step that actually failed for diagnostics.
+            fail_phase = "stop_gateway" if not rebind.get("stopped") else "start_gateway"
             return self._finish(
                 command_id=command_id,
                 idempotency_key=idempotency_key,
                 kind=kind,
-                status="applied" if gateway_up else "failed",
-                phase="env_block_rebound" if gateway_up else "start_gateway",
-                failure_code=None if gateway_up else "config_apply_failed",
+                status="applied" if rebound_ok else "failed",
+                phase="env_block_rebound" if rebound_ok else fail_phase,
+                failure_code=None if rebound_ok else "config_apply_failed",
                 result=result_payload,
             )
         return self._finish(
@@ -868,7 +871,12 @@ class RuntimeCommandRunner:
         applied once at bind time, not re-applied on restart). Uses the same
         gateway-lifecycle commands as Force-Upgrade, which resolve even when the
         runner was built without ``service_restart``. Returns whether the
-        gateway came back healthy; the caller maps that to applied/failed.
+        rebind actually happened: the stop AND start lifecycle commands must both
+        succeed AND the gateway must come back healthy. A healthy gateway alone
+        is NOT sufficient — if the stop command fails, the OLD gateway keeps
+        serving with the stale process.env, so the new config.env never took
+        effect even though health reads "healthy". The caller maps the returned
+        bool to applied/failed.
         """
         self.ledger.update(command_id, status="running", phase="stop_gateway")
         stopped_ok, stop_detail = launcher._run_command(
@@ -882,6 +890,10 @@ class RuntimeCommandRunner:
         )
         health = self._wait_for_gateway_healthy()
         gateway_up = str(health.get("state") or "") == "healthy"
+        # The rebind only counts if the gateway was actually stopped and started
+        # (so it re-read config.env) AND is healthy again. A failed stop with a
+        # still-healthy old process must NOT report success.
+        rebound_ok = bool(stopped_ok) and bool(started_ok) and gateway_up
         result_payload.update(
             {
                 "gateway_rebind_requested": True,
@@ -891,13 +903,14 @@ class RuntimeCommandRunner:
                     "stopped": bool(stopped_ok),
                     "started": bool(started_ok),
                     "gateway_up": gateway_up,
+                    "rebound": rebound_ok,
                     "stop_detail": redact_text(stop_detail, limit=300),
                     "start_detail": redact_text(start_detail, limit=300),
                 },
                 "gateway_health": health,
             }
         )
-        return gateway_up
+        return rebound_ok
 
     def _maybe_rewarm_channels(self, result_payload: dict[str, Any]) -> None:
         """Re-apply the binding's channel config + secrets so OpenClaw reconnects

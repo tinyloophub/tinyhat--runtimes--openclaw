@@ -1204,6 +1204,61 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertTrue(result["result"]["env_block_changed"])
             self.assertFalse(result["result"]["gateway_rebind"]["gateway_up"])
 
+    def test_apply_config_command_fails_when_stop_fails_even_if_gateway_healthy(
+        self,
+    ) -> None:
+        # The dangerous shape: the stop command fails, so the OLD gateway keeps
+        # serving with the stale process.env, yet gateway_health still reads
+        # "healthy". The env block never took effect, so the command MUST report
+        # failed — a healthy gateway alone is not proof of a rebind.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                platform_get_json=lambda _path: {
+                    "revision": 9,
+                    "secrets": {"EXA_API_KEY": "exa-test-secret"},
+                },
+                apply_runtime_config=lambda **kwargs: {
+                    "revision": kwargs["revision"],
+                    "secret_count": 1,
+                    "reload": {"skipped": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": True,
+                },
+                stop_command=[sys.executable, "-c", "raise SystemExit(1)"],
+                start_command=[sys.executable, "-c", "raise SystemExit(1)"],
+                service_restart=True,
+            )
+
+            with patch.object(
+                openclaw_adapter, "gateway_health", return_value={"state": "healthy"}
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-apply-stopfail",
+                        "idempotency_key": "idem-apply-stopfail",
+                        "kind": "apply_config",
+                        "spec": {
+                            "desired_config_revision": 9,
+                            "reason": "credential_save",
+                            "hot_required": True,
+                        },
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "config_apply_failed")
+            self.assertEqual(result["phase"], "stop_gateway")
+            rebind = result["result"]["gateway_rebind"]
+            self.assertFalse(rebind["stopped"])
+            self.assertFalse(rebind["started"])
+            self.assertTrue(rebind["gateway_up"])  # health healthy, but...
+            self.assertFalse(rebind["rebound"])  # ...the rebind did not happen
+
     def test_apply_config_command_reports_typed_failure_on_reload_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
