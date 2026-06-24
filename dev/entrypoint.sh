@@ -107,26 +107,75 @@ set -uo pipefail
 action="${1:-}"
 unit="${2:-}"
 log="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}/openclaw-gateway.log"
+# Tunable so a focused test can use short windows; defaults emulate systemd's
+# stop grace before SIGKILL.
+term_secs="${TINYHAT_DEV_GATEWAY_STOP_TERM_SECONDS:-10}"
+kill_secs="${TINYHAT_DEV_GATEWAY_STOP_KILL_SECONDS:-5}"
+# Overridable so a test can match a fake gateway process; real default is the
+# tiny_runtime gateway command.
+gw_match="${TINYHAT_DEV_GATEWAY_MATCH_SUBSTR:--m tinyhat_runtime.main gateway run}"
 
 _is_gateway() {
   case "$1" in
-    python*"-m tinyhat_runtime.main gateway run"*) return 0 ;;
+    python*"$gw_match"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+# A process counts as "alive" only if it exists AND is not a zombie. A zombie
+# has already exited but has not been reaped by its parent; the gateway it was
+# is no longer serving, so it counts as gone. `kill -0` alone returns success
+# for a zombie, which would otherwise make the stop hang or falsely fail.
+_is_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  _st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  case "${_st##*) }" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Block until $1 is gone (truly exited or a zombie), polling every 0.2s up to
+# $2 seconds. Returns 0 if gone, 1 on timeout.
+_wait_gone() {
+  _pid="$1"
+  _iters=$(( $2 * 5 ))
+  _i=0
+  while _is_alive "$_pid"; do
+    [ "$_i" -ge "$_iters" ] && return 1
+    sleep 0.2
+    _i=$(( _i + 1 ))
+  done
+  return 0
+}
+
+# Stop like `systemctl stop`: block until every matched gateway PID is actually
+# gone (SIGTERM, bounded wait, then SIGKILL), and return non-zero if one cannot
+# be signalled or reaped. A non-blocking "send TERM and exit 0" stop would let
+# the rebind's start + health-check pass against the still-alive old gateway and
+# falsely mark the new env block applied.
 _stop_gateway() {
   self=$$
+  rc=0
   for d in /proc/[0-9]*; do
     pid="${d##*/}"
     [ "$pid" = "1" ] && continue
     [ "$pid" = "$self" ] && continue
     [ -r "${d}/cmdline" ] || continue
     cmd=$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)
-    if _is_gateway "$cmd"; then
-      kill -TERM "$pid" 2>/dev/null || true
+    _is_gateway "$cmd" || continue
+    if ! kill -TERM "$pid" 2>/dev/null; then
+      # Couldn't signal it; if it's still present that is a failed stop.
+      kill -0 "$pid" 2>/dev/null && rc=1
+      continue
+    fi
+    if ! _wait_gone "$pid" "$term_secs"; then
+      # Ignored or slow SIGTERM -> escalate to SIGKILL, then confirm gone.
+      kill -KILL "$pid" 2>/dev/null || true
+      _wait_gone "$pid" "$kill_secs" || rc=1
     fi
   done
+  return "$rc"
 }
 
 _start_gateway() {
@@ -134,16 +183,17 @@ _start_gateway() {
     </dev/null >/dev/null 2>&1 &
 }
 
+rc=0
 case "${unit%.service}" in
   tinyhat-runtime-gateway)
     case "${action}" in
-      stop) _stop_gateway ;;
-      start) _start_gateway ;;
-      restart) _stop_gateway; sleep 1; _start_gateway ;;
+      stop) _stop_gateway; rc=$? ;;
+      start) _start_gateway; rc=$? ;;
+      restart) _stop_gateway && _start_gateway; rc=$? ;;
     esac
     ;;
 esac
-exit 0
+exit "$rc"
 SYSTEMCTL_SHIM
   chmod 0755 /usr/local/bin/systemctl
   echo "[dev-entrypoint] installed dev systemctl shim for gateway control"
