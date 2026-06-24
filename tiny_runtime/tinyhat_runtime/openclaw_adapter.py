@@ -646,6 +646,83 @@ def config_patch(
     return {"state": "ready", "patch": payload, "detail": result.public_summary()}
 
 
+# --- User runtime-secret env block -------------------------------------------
+# OpenClaw exposes a saved secret to the agent's exec/bash shell ONLY through the
+# config `env` block: OpenClaw applies it into the gateway's process.env at
+# gateway start, and the exec tool's child shells inherit it. The SecretRef
+# provider file (tinyhat-secrets.json) resolves only a fixed set of config
+# credential FIELDS (model/channel keys) and never reaches the shell. So an
+# arbitrary user secret the operator saves in Tinyhat (e.g. EXA_API_KEY) must be
+# mirrored into config.env for `$EXA_API_KEY` to work in a skill. This re-lands
+# the legacy supervisor behavior (runtime v0.9.1) that tiny_runtime dropped.
+#
+# OPENAI_API_KEY is wired as a SecretRef on models.providers.openai.apiKey and
+# OPENROUTER_API_KEY is binding-managed (also a SecretRef); neither belongs in
+# the shell env block, so both are excluded from the mirror.
+ENV_BLOCK_EXCLUDED_KEYS = frozenset({"OPENAI_API_KEY", "OPENROUTER_API_KEY"})
+
+
+def runtime_secret_env_entries(secrets: dict[str, Any]) -> dict[str, str]:
+    """The subset of user runtime secrets that must become shell env vars.
+
+    Drops blank names/values and the provider-managed keys (handled as
+    SecretRefs, not shell env). Keys keep the env-style names the operator gave.
+    """
+    entries: dict[str, str] = {}
+    for raw_name, raw_value in (secrets or {}).items():
+        name = str(raw_name or "").strip()
+        value = "" if raw_value is None else str(raw_value)
+        if not name or not value.strip():
+            continue
+        if name in ENV_BLOCK_EXCLUDED_KEYS:
+            continue
+        entries[name] = value
+    return entries
+
+
+def read_config_env(*, config_path: Path | None = None) -> dict[str, str]:
+    """Read the current OpenClaw config ``env`` block (read-only, for change
+    detection). Returns ``{}`` when the config or block is absent/unreadable."""
+    path = config_path or paths.OPENCLAW_CONFIG_PATH
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def apply_runtime_secret_env_block(
+    secrets: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    runner: Runner = subprocess.run,
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    """Replace the OpenClaw config ``env`` block with the user runtime secrets,
+    via the official ``openclaw config patch --replace-path env``.
+
+    ``--replace-path env`` swaps the whole object, so a secret removed in the
+    Mini App disappears from the shell on the next apply. Change detection reads
+    the current block from the config file (read-only); the WRITE always goes
+    through the official CLI. Returns ``{state, env_block_changed}``.
+    """
+    desired = runtime_secret_env_entries(secrets)
+    current = read_config_env(config_path=config_path)
+    changed = current != desired
+    if dry_run or not changed:
+        return {"state": "ready", "env_block_changed": changed, "dry_run": dry_run}
+    patch_result = config_patch({"env": desired}, replace_paths=("env",), runner=runner)
+    if patch_result.get("state") != "ready":
+        raise RuntimeError(
+            "OpenClaw config env patch failed: "
+            + redact_text(json.dumps(patch_result, sort_keys=True), limit=1000)
+        )
+    return {"state": "ready", "env_block_changed": True, "patch": patch_result}
+
+
 def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     result = run_openclaw(("gateway", "health", "--json"), runner=runner)
     if not result.ok:

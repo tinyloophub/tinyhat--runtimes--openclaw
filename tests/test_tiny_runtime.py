@@ -1088,10 +1088,15 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
         self.assertIn('"tailnet_ip": "100.101.102.103"', rendered)
         self.assertNotIn("tskey-secret", rendered)
 
-    def test_apply_config_command_records_env_block_without_rebind(self) -> None:
+    def test_apply_config_command_rebinds_gateway_when_env_block_changes(self) -> None:
+        # A changed user-secret env block (e.g. EXA_API_KEY) only reaches the
+        # agent's exec shell after a local gateway rebind, because config.env is
+        # read into process.env at gateway START. The command must stop → rewarm
+        # → start the gateway and report the rebind.
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             applied: list[dict] = []
+            rewarmed: list[bool] = []
 
             def fake_apply_runtime_config(**kwargs) -> dict:
                 applied.append(kwargs)
@@ -1101,6 +1106,10 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                     "reload": {"skipped": bool(kwargs.get("dry_run"))},
                     "env_block_changed": True,
                 }
+
+            def fake_rewarm() -> dict:
+                rewarmed.append(True)
+                return {"state": "ready"}
 
             runner = RuntimeCommandRunner(
                 ledger=CommandLedger(root=base / "commands"),
@@ -1112,30 +1121,88 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                     "secrets": {"EXA_API_KEY": "exa-test-secret"},
                 },
                 apply_runtime_config=fake_apply_runtime_config,
-                service_restart=False,
+                rewarm_channels=fake_rewarm,
+                stop_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                start_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=True,
             )
 
-            result = runner.execute(
-                {
-                    "command_id": "cmd-apply-unsupported",
-                    "idempotency_key": "idem-apply-unsupported",
-                    "kind": "apply_config",
-                    "spec": {
-                        "desired_config_revision": 9,
-                        "reason": "credential_save",
-                        "hot_required": True,
-                    },
-                }
-            )
+            with patch.object(
+                openclaw_adapter, "gateway_health", return_value={"state": "healthy"}
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-apply-env",
+                        "idempotency_key": "idem-apply-env",
+                        "kind": "apply_config",
+                        "spec": {
+                            "desired_config_revision": 9,
+                            "reason": "credential_save",
+                            "hot_required": True,
+                        },
+                    }
+                )
 
             self.assertEqual(result["status"], "applied")
             self.assertEqual(result["failure_code"], None)
-            self.assertEqual(result["phase"], "hot_reloaded")
+            self.assertEqual(result["phase"], "env_block_rebound")
             self.assertEqual([item["dry_run"] for item in applied], [True, False])
             self.assertTrue(result["result"]["env_block_changed"])
-            self.assertFalse(result["result"]["gateway_rebind_requested"])
-            self.assertFalse(result["result"]["restart_requested"])
-            self.assertFalse(result["result"]["systemd_restart_requested"])
+            self.assertTrue(result["result"]["gateway_rebind_requested"])
+            self.assertTrue(result["result"]["restart_requested"])
+            self.assertTrue(result["result"]["gateway_rebind"]["gateway_up"])
+            # the gateway was rewarmed across the rebind so it isn't left deaf
+            self.assertEqual(rewarmed, [True])
+
+    def test_apply_config_command_fails_when_env_rebind_leaves_gateway_down(
+        self,
+    ) -> None:
+        # If the env-block rebind cannot bring the gateway back, the command must
+        # surface a typed failure (the agent would otherwise be silently down).
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                bundles_dir=base / "bundles",
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                platform_get_json=lambda _path: {
+                    "revision": 9,
+                    "secrets": {"EXA_API_KEY": "exa-test-secret"},
+                },
+                apply_runtime_config=lambda **kwargs: {
+                    "revision": kwargs["revision"],
+                    "secret_count": 1,
+                    "reload": {"skipped": bool(kwargs.get("dry_run"))},
+                    "env_block_changed": True,
+                },
+                stop_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                start_command=[sys.executable, "-c", "raise SystemExit(0)"],
+                service_restart=True,
+            )
+
+            with patch.object(
+                openclaw_adapter, "gateway_health", return_value={"state": "unhealthy"}
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-apply-env-down",
+                        "idempotency_key": "idem-apply-env-down",
+                        "kind": "apply_config",
+                        "spec": {
+                            "desired_config_revision": 9,
+                            "reason": "credential_save",
+                            "hot_required": True,
+                        },
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "config_apply_failed")
+            self.assertEqual(result["phase"], "start_gateway")
+            self.assertTrue(result["result"]["env_block_changed"])
+            self.assertFalse(result["result"]["gateway_rebind"]["gateway_up"])
 
     def test_apply_config_command_reports_typed_failure_on_reload_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3810,6 +3877,96 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         self.assertIn("--dry-run", seen["argv"])
         self.assertIn("--json", seen["argv"])
         self.assertEqual(result["patch"], {"state": "would_apply"})
+
+    def test_runtime_secret_env_entries_excludes_managed_keys(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        entries = openclaw_adapter.runtime_secret_env_entries(
+            {
+                "EXA_API_KEY": "exa-123",
+                "INSTANTLY_API_KEY": "inst-456",
+                "OPENAI_API_KEY": "sk-openai",  # SecretRef-managed -> excluded
+                "OPENROUTER_API_KEY": "sk-or",  # binding-managed -> excluded
+                "BLANK_VALUE": "   ",  # blank value -> dropped
+                "": "no-name",  # blank name -> dropped
+            }
+        )
+
+        self.assertEqual(
+            entries, {"EXA_API_KEY": "exa-123", "INSTANTLY_API_KEY": "inst-456"}
+        )
+
+    def test_apply_runtime_secret_env_block_patches_changed_env_via_cli(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"
+            config_path.write_text(json.dumps({"env": {"OLD_KEY": "stale"}}))
+            seen: dict[str, object] = {}
+
+            def runner(argv, **kwargs):
+                seen["argv"] = argv
+                seen["input"] = kwargs.get("input")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"EXA_API_KEY": "exa-123", "OPENAI_API_KEY": "sk-openai"},
+                runner=runner,
+                config_path=config_path,
+            )
+
+            self.assertTrue(result["env_block_changed"])
+            # whole env object replaced through the official CLI
+            self.assertEqual(
+                seen["argv"],
+                ["openclaw", "config", "patch", "--stdin", "--replace-path", "env"],
+            )
+            payload = json.loads(str(seen["input"]))
+            # OPENAI_API_KEY excluded; OLD_KEY dropped by replace semantics
+            self.assertEqual(payload, {"env": {"EXA_API_KEY": "exa-123"}})
+
+    def test_apply_runtime_secret_env_block_noop_when_unchanged(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"
+            config_path.write_text(json.dumps({"env": {"EXA_API_KEY": "exa-123"}}))
+            calls: list = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"EXA_API_KEY": "exa-123"},
+                runner=runner,
+                config_path=config_path,
+            )
+
+            self.assertFalse(result["env_block_changed"])
+            self.assertEqual(calls, [])  # no CLI write when nothing changed
+
+    def test_apply_runtime_secret_env_block_dry_run_never_writes(self) -> None:
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"  # absent -> current env {}
+            calls: list = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"EXA_API_KEY": "exa-123"},
+                dry_run=True,
+                runner=runner,
+                config_path=config_path,
+            )
+
+            self.assertTrue(result["env_block_changed"])  # would change
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(calls, [])  # dry-run never writes
 
     def test_warm_image_config_patch_owns_stable_gateway_setup(self) -> None:
         from tinyhat_runtime import openclaw_adapter

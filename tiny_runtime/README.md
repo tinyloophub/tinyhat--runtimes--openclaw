@@ -94,15 +94,25 @@ through `OPENCLAW_GATEWAY_TOKEN` so command ledgers do not expose secret argv
 values. User or external clients still use OpenClaw's normal device-pairing
 scope model.
 
-SecretRef-backed fields hot-refresh through `openclaw secrets reload`. Tinyhat
-assignment and credential updates never request a gateway restart. Values that
-cannot be refreshed through OpenClaw's official hot surfaces must move to
-SecretRefs or a separate typed maintenance operation; `restart_requested`,
-`gateway_rebind_requested`, and `systemd_restart_requested` stay `false`.
-Same-owner rebinds merge new secrets into the existing Tinyhat secrets file so
-Mini App credential updates do not wipe user keys. If the platform ever sends a
-different owner on an in-place rebind, the runtime replaces the file before
-patching OpenClaw so stale owner secrets are not carried across.
+SecretRef-backed fields (model + channel keys) hot-refresh through
+`openclaw secrets reload`, with no gateway restart. Arbitrary USER secrets the
+operator saves (for example `EXA_API_KEY`) are different: OpenClaw exposes them
+to the agent's exec/bash shell only through the config `env` block, which it
+applies into the Gateway's `process.env` at gateway *start*. So `apply_config`
+also mirrors the user secrets into `config.env` via the official
+`openclaw config patch --replace-path env`, and when that env block actually
+changes it performs a single local gateway rebind (stop → rewarm channels →
+start) so the new `$NAME` reaches the shell — `env_block_changed`,
+`gateway_rebind_requested`, and `restart_requested` are then `true`. A
+SecretRef-only change (no env-block delta) stays fully hot and leaves those
+flags `false`. `OPENAI_API_KEY` (SecretRef on `models.providers.openai.apiKey`)
+and `OPENROUTER_API_KEY` (binding-managed) are excluded from the env mirror. The
+`--replace-path env` write drops a secret removed in the Mini App, and the
+channel rewarm keeps the restarted Gateway connected to Telegram / model
+providers. Same-owner rebinds merge new secrets into the existing Tinyhat
+SecretRef file so Mini App credential updates do not wipe user keys; a
+different-owner in-place rebind replaces the file before patching OpenClaw so
+stale owner secrets are not carried across.
 
 `link_chatgpt` starts the official OpenClaw device-code flow for the local
 Computer. OAuth tokens stay on the Computer; the platform receives only the
