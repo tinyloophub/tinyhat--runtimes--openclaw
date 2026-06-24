@@ -4081,6 +4081,47 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             # the stale entry was cleared on disk via the official CLI
             self.assertEqual(json.loads(str(seen["input"])), {"env": {}})
 
+    def test_apply_runtime_secret_env_block_keeps_rebinding_after_failed_removal(
+        self,
+    ) -> None:
+        # The removal-retry trap: a prior removal already patched config.env to {}
+        # but its rebind FAILED, so no marker exists. config.env now matches the
+        # empty desired, yet the running gateway still holds the stale shell var.
+        # With no marker the rebind must KEEP firing — config-state matching
+        # desired must NOT settle it.
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"
+            config_path.write_text(json.dumps({"env": {}}))  # already cleared on disk
+            marker_path = Path(tmp) / "marker.json"  # rebind failed -> never written
+            calls: list = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"OPENROUTER_API_KEY": "managed-only"},  # desired mirror is empty
+                runner=runner,
+                config_path=config_path,
+                marker_path=marker_path,
+            )
+            self.assertTrue(result["env_block_changed"])  # still needs the rebind
+            self.assertEqual(calls, [])  # config already {} -> no redundant patch
+
+            # once a successful rebind records the empty marker, it finally settles
+            openclaw_adapter.write_rebound_env_marker(
+                {"OPENROUTER_API_KEY": "managed-only"}, marker_path=marker_path
+            )
+            settled = openclaw_adapter.apply_runtime_secret_env_block(
+                {"OPENROUTER_API_KEY": "managed-only"},
+                runner=runner,
+                config_path=config_path,
+                marker_path=marker_path,
+            )
+            self.assertFalse(settled["env_block_changed"])
+
     def test_apply_runtime_secret_env_block_dry_run_never_writes(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 

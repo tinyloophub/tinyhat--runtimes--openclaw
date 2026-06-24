@@ -763,15 +763,14 @@ def apply_runtime_secret_env_block(
     marker = read_rebound_env_marker(marker_path=marker_path)
     current_file = read_config_env(config_path=config_path)
     config_will_change = current_file != desired
-    if marker is None:
-        # The gateway's live env is UNKNOWN (never confirmed). Rebind if there is
-        # anything to ensure present (desired non-empty) OR anything stale to
-        # remove from the running shell (the on-disk block has to change) — e.g.
-        # the last secret was removed before any marker existed.
-        rebind_needed = bool(desired) or config_will_change
-    else:
-        # The gateway's live env == the marker; rebind iff it differs from desired.
-        rebind_needed = marker != desired
+    # The ONLY signal that the gateway's live env matches desired is a marker
+    # written after a confirmed rebind. If the marker is absent the gateway's env
+    # is UNKNOWN — and crucially config.env is NOT a substitute, because the
+    # config is patched to desired BEFORE the rebind, so on a failed (or
+    # not-yet-run) rebind the file already matches while the running gateway is
+    # stale. So rebind until a successful rebind records marker == desired:
+    # absent marker => always rebind; present marker => rebind iff it differs.
+    rebind_needed = marker is None or marker != desired
     if dry_run:
         return {"state": "ready", "env_block_changed": rebind_needed, "dry_run": True}
     # Keep config.env current so the NEXT gateway start reads the desired values;
