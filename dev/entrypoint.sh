@@ -87,6 +87,68 @@ PY
   echo "[dev-entrypoint] tiny_runtime bundle installed: $(cat /tmp/tinyhat-dev-bundle-install.json)"
 }
 
+install_dev_systemctl_shim() {
+  # tiny_runtime's gateway-control verbs (the secret-apply rebind that makes a
+  # newly-saved user secret reach the agent's exec shell, plus force-upgrade)
+  # stop/start the gateway via `systemctl`, which assumes systemd. A plain
+  # Docker dev container has no systemd, so those calls ENOENT and the
+  # secret-apply rebind can never advance applied_config_revision -> the
+  # "✅ <NAME> is now available on your Computer" confirmation never fires (a
+  # real systemd Computer completes it). Emulate just the gateway unit's
+  # stop/start/restart as plain process management (procps-free: /proc scan +
+  # kill, setsid relaunch) so the dev container behaves like a systemd
+  # Computer for the one operation that needs a real gateway restart. Every
+  # other systemctl call is a dev no-op. The match is deliberately narrow
+  # (argv0 python* AND "-m tinyhat_runtime.main gateway run"), and PID 1 / the
+  # shim itself are never targeted, so it cannot kill the entrypoint.
+  cat > /usr/local/bin/systemctl <<'SYSTEMCTL_SHIM'
+#!/usr/bin/env bash
+set -uo pipefail
+action="${1:-}"
+unit="${2:-}"
+log="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}/openclaw-gateway.log"
+
+_is_gateway() {
+  case "$1" in
+    python*"-m tinyhat_runtime.main gateway run"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_stop_gateway() {
+  self=$$
+  for d in /proc/[0-9]*; do
+    pid="${d##*/}"
+    [ "$pid" = "1" ] && continue
+    [ "$pid" = "$self" ] && continue
+    [ -r "${d}/cmdline" ] || continue
+    cmd=$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)
+    if _is_gateway "$cmd"; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+_start_gateway() {
+  setsid bash -c "exec python3 -m tinyhat_runtime.main gateway run >>'${log}' 2>&1" \
+    </dev/null >/dev/null 2>&1 &
+}
+
+case "${unit%.service}" in
+  tinyhat-runtime-gateway)
+    case "${action}" in
+      stop) _stop_gateway ;;
+      start) _start_gateway ;;
+      restart) _stop_gateway; sleep 1; _start_gateway ;;
+    esac
+    ;;
+esac
+exit 0
+SYSTEMCTL_SHIM
+  chmod 0755 /usr/local/bin/systemctl
+  echo "[dev-entrypoint] installed dev systemctl shim for gateway control"
+}
+
 if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
   mkdir -p "${PRIVATE_ACCESS_STATUS_DIR}"
   if [[ -n "${TINYHAT_TAILSCALE_AUTH_KEY_FILE:-}" \
@@ -167,6 +229,7 @@ if [[ "${runtime_mode}" == "tiny_runtime" ]]; then
   prepare_tiny_runtime_bundle
   export PYTHONPATH="${TINY_RUNTIME_BUNDLE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
   export TINYHAT_RUNTIME_NO_SERVICE_RESTART="${TINYHAT_RUNTIME_NO_SERVICE_RESTART:-1}"
+  install_dev_systemctl_shim
   exec gosu tinyhat bash -lc '
     set -euo pipefail
     runtime_home="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
