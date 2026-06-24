@@ -422,10 +422,12 @@ class RuntimeCommandRunner:
         and rewrites the live marker -- so a later activation/attestation
         failure would leave the running Computer drifted, breaking the
         stage-only / fail-closed boundary) and no warm-config hook (warm-image
-        config is for a fresh box, not an already-configured one; channel state
-        is rewarmed by ``_maybe_rewarm_channels`` before the flip). The flip
-        swaps runtime + framework in place; the box's existing plugin install
-        persists across the flip, which is what delivers a runtime-side fix.
+        config is for a fresh box, not an already-configured one). The flip
+        swaps runtime + framework in place; the box's existing OpenClaw config,
+        channel binding, and plugin install all live in the persistent state
+        dirs the flip never touches, so they persist across the flip -- which is
+        what delivers a runtime-side fix with no live-state mutation and no
+        pre-flip rewarm (see ``_stage_and_activate_bundle``).
         """
         return staging.stage_bundle(
             runtime_ref=_required_string(spec, "runtime_ref"),
@@ -492,11 +494,23 @@ class RuntimeCommandRunner:
         if manifest.get("bundle_id") != expected_bundle_id:
             raise RuntimeCommandError("bundle_id does not match staged manifest")
 
-        # ---- channel rewarm BEFORE the start so the restart comes up polling --
-        # (same intent as _force_update: a fresh bundle resets channel config;
-        #  rewarm so the reactivated gateway is not "healthy but deaf").
-        self.ledger.update(command_id, status="running", phase="rewarm_channels")
-        self._maybe_rewarm_channels(result_payload)
+        # NO pre-flip channel rewarm. A pure bundle flip swaps only the
+        # runtime+framework code under /opt/tinyhat/current; OpenClaw reads its
+        # channel binding from the persistent config/state dirs (/etc/openclaw,
+        # /var/lib/tinyhat-openclaw) that the flip never touches, so the existing
+        # binding survives and the reactivated gateway comes up on its channels
+        # unaided -- exactly like the plain ``_activate_bundle`` verb, which also
+        # ships with no rewarm. ``_force_update``/``_force_resume`` rewarm only
+        # because they FIRST reset the live config (preinstall_hot_image_plugins /
+        # apply_warm_image_config); this verb does not, so a rewarm here would be
+        # pure cargo-cult. Critically, ``rewarm_channels`` -> ``apply_binding_config``
+        # mutates live state (secrets file, plugin checkout + ``plugins install``,
+        # ``config patch``) OUTSIDE the bundles/<digest> + ``current`` rollback
+        # boundary and is best-effort (it does not gate the flip), so running it
+        # before activation could leave a Computer on the OLD ``current`` with NEW
+        # app-layer/config if activation or attestation later fails. Any future
+        # config migration that the box must adopt belongs in its own rollback-
+        # gated ledger step, not a side effect on every flip.
 
         # ---- ACTIVATE (flip + auto-rollback owned by the launcher) -----------
         self.ledger.update(command_id, status="running", phase="activate")

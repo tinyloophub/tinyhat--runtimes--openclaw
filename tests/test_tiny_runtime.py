@@ -5235,6 +5235,99 @@ class StageAndActivateBundleTests(unittest.TestCase):
             self.assertEqual(result["failure_code"], "attestation_mismatch")
             self.assertEqual(Path(os.readlink(current)).resolve(), previous.resolve())
 
+    def test_stage_and_activate_never_invokes_rewarm(self) -> None:
+        """Fail-closed boundary: the verb must NOT run the channel rewarm
+        (``rewarm_channels`` -> ``apply_binding_config``), which mutates live
+        OpenClaw state -- the secrets file, the plugin checkout + ``plugins
+        install``, and ``config patch`` against the live config -- ALL OUTSIDE
+        the bundles/<digest> + ``current`` symlink rollback boundary, and is
+        best-effort (it does not gate the flip). Running it before activation
+        could leave a Computer on the OLD ``current`` with NEW app-layer/config
+        if activation or attestation later fails. A pure flip preserves the
+        binding (it lives in the persistent state dirs the flip never touches),
+        exactly like the plain ``_activate_bundle`` verb, which also ships with
+        no rewarm. Proven on BOTH the success and the attestation-rollback paths:
+        rewarm is never invoked, so no out-of-boundary live-state mutation can
+        occur and a rollback of ``current`` cannot strand drifted app state."""
+
+        def fake_stage_factory(base: Path, bundles: Path, holder: dict):
+            def fake_stage(_spec):
+                target, manifest = _install_bundle_under_id(
+                    bundles, base / "staged-src", marker="staged"
+                )
+                holder["target"] = target
+                holder["manifest"] = manifest
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            return fake_stage
+
+        for case, expected_status in (
+            ("success", "applied"),
+            ("attestation_rollback", "rolled_back"),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                bundles = base / "bundles"
+                bundles.mkdir()
+                previous, _ = _install_bundle_under_id(
+                    bundles, base / "previous", marker="prev"
+                )
+                current = base / "current"
+                os.symlink(previous, current)
+                holder: dict[str, object] = {}
+
+                runner = self._runner(base, bundles, current, health_exit=0)
+                rewarm_calls: list[object] = []
+                # Tripwire: any rewarm invocation is a fail-closed violation.
+                runner.rewarm_channels = lambda *a, **k: rewarm_calls.append(1)
+
+                if case == "success":
+
+                    def attest():
+                        return {
+                            "bundle_id": holder["manifest"]["bundle_id"],
+                            "state": "ready",
+                        }
+
+                else:
+
+                    def attest():
+                        raise RuntimeError("attestation read failed")
+
+                with (
+                    patch.object(
+                        runner, "_stage_bundle", fake_stage_factory(base, bundles, holder)
+                    ),
+                    patch.object(runner, "_current_attestation", attest),
+                ):
+                    result = runner.execute(
+                        {
+                            "command_id": f"cmd-{case}",
+                            "idempotency_key": f"idem-{case}",
+                            "kind": "stage_and_activate_bundle",
+                            "spec": dict(_STAGE_SPEC),
+                        }
+                    )
+
+                self.assertEqual(result["status"], expected_status)
+                # The core invariant: the rewarm (the only out-of-boundary
+                # mutator) is never invoked on EITHER path.
+                self.assertEqual(rewarm_calls, [])
+                if case == "attestation_rollback":
+                    # current rolled back to the OLD bundle; since rewarm never
+                    # ran, no live config/secrets/plugin state drifted from it.
+                    self.assertEqual(
+                        Path(os.readlink(current)).resolve(), previous.resolve()
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

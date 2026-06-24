@@ -47,10 +47,14 @@ integrates with OpenClaw only via official commands.
   hooks; staging stays pure.
 - `tinyhat-runtime bake stage-bundle` CLI for dev/bake-time staging parity.
 - New ledger verb `stage_and_activate_bundle` (in `ALLOWED_COMMAND_KINDS`) with
-  the `bundle_stage_failed` typed failure code; reuses the launcher flip,
-  channel rewarm, and attestation-match rollback gate of `activate_bundle` /
-  `force_update`. The platform gates the emit on
-  `computer_is_tiny_runtime_generation`.
+  the `bundle_stage_failed` typed failure code; reuses the launcher flip and the
+  attestation-match rollback gate of `activate_bundle` (it is a pure flip, so —
+  like `activate_bundle` and unlike `force_update` — it runs NO channel rewarm:
+  `apply_binding_config` mutates live OpenClaw state outside the
+  bundles/`current` rollback boundary, so a pre-flip rewarm could strand a
+  Computer on the old `current` with new app-layer/config on a failed
+  activation; the binding persists across a pure flip unaided). The platform
+  gates the emit on `computer_is_tiny_runtime_generation`.
 
 ## 0.16.11
 
