@@ -16,6 +16,7 @@ from . import (
     openclaw_adapter,
     paths,
     private_access,
+    staging,
 )
 from .command_ledger import (
     TERMINAL_STATUSES,
@@ -31,6 +32,7 @@ COMMAND_RESULT_SCHEMA = "tiny_runtime_command_result_v1"
 ALLOWED_COMMAND_KINDS = frozenset(
     {
         "activate_bundle",
+        "stage_and_activate_bundle",
         "rollback_bundle",
         "export_diagnostics",
         "apply_config",
@@ -54,6 +56,7 @@ FAILURE_CODES = frozenset(
         "backup_not_found",
         "backup_path_not_allowed",
         "bundle_not_found",
+        "bundle_stage_failed",
         "bundle_verification_failed",
         "canceled",
         "config_apply_failed",
@@ -255,6 +258,8 @@ class RuntimeCommandRunner:
         try:
             if kind == "activate_bundle":
                 return self._activate_bundle(command)
+            if kind == "stage_and_activate_bundle":
+                return self._stage_and_activate_bundle(command)
             if kind == "rollback_bundle":
                 return self._rollback_bundle(command)
             if kind == "export_diagnostics":
@@ -373,6 +378,163 @@ class RuntimeCommandRunner:
         result_payload["attestation"] = attestation_doc
         if attestation_doc.get("bundle_id") != expected_bundle_id:
             rollback = self._rollback_to_previous(result.previous_target)
+            result_payload["rollback"] = rollback.__dict__ if rollback else None
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if rollback and rollback.activated else "failed",
+                phase="attestation_gate",
+                failure_code=(
+                    "attestation_mismatch"
+                    if rollback and rollback.activated
+                    else "rollback_failed"
+                ),
+                result=result_payload,
+            )
+
+        return self._finish(
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            kind=kind,
+            status="applied",
+            phase="attested",
+            result=result_payload,
+        )
+
+    def _stage_bundle(self, spec: dict[str, Any]) -> staging.StagedBundle:
+        """Stage a new content-addressed bundle from the command spec's resolved
+        git refs into ``bundles/<digest>`` WITHOUT flipping ``current``.
+
+        Factored as a single seam so the clone/npm/assemble chain can be stubbed
+        in tests (``patch.object(runner, "_stage_bundle", ...)``). Delegates to
+        ``staging.stage_bundle`` which keeps every host effect injectable and
+        integrates with OpenClaw only via the official npm install + the
+        bundle's bake/platform subcommands.
+        """
+        return staging.stage_bundle(
+            runtime_ref=_required_string(spec, "runtime_ref"),
+            runtime_commit_sha=_required_string(spec, "runtime_commit_sha"),
+            plugin_ref=_required_string(spec, "plugin_ref"),
+            plugin_commit_sha=_required_string(spec, "plugin_commit_sha"),
+            framework_version=_required_string(spec, "framework_version"),
+            bundles_dir=self.bundles_dir,
+            current_link=self.current_link,
+            preinstall_plugins_hook=lambda _bundle_dir: hot_image.preinstall_hot_image_plugins(),
+            warm_config_hook=(
+                (lambda _bundle_dir: self.rewarm_channels())  # type: ignore[misc]
+                if self.rewarm_channels is not None
+                else None
+            ),
+        )
+
+    def _stage_and_activate_bundle(self, command: dict[str, Any]) -> dict[str, Any]:
+        spec = _spec(command)
+        command_id, idempotency_key, kind = _ids(command)
+
+        # ---- STAGE (no flip) --------------------------------------------------
+        # Resolved git refs -> a verified bundles/<digest>. The launcher owns the
+        # flip; nothing here touches current. A stage failure (bad ref, clone /
+        # npm / assemble failure) fails closed at phase=stage, current untouched.
+        self.ledger.update(command_id, status="running", phase="stage")
+        try:
+            staged = self._stage_bundle(spec)
+        except RuntimeCommandError:
+            # Missing/invalid spec field: surface as invalid_command via the
+            # execute() boundary, current never changed.
+            raise
+        except Exception as exc:  # noqa: BLE001 - report a clean staging failure
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_stage_failed",
+                result={"detail": redact_text(str(exc), limit=1000)},
+            )
+
+        bundle_dir = Path(staged.bundle_dir)
+        expected_bundle_id = staged.bundle_id
+        result_payload: dict[str, Any] = {
+            "bundle_id": expected_bundle_id,
+            "bundle_dir": str(bundle_dir),
+            "staged": {
+                "runtime_sha": staged.runtime_sha,
+                "plugin_sha": staged.plugin_sha,
+                "framework_version": staged.framework_version,
+            },
+        }
+
+        # The stage step must have produced a real, verifiable bundles/<digest>.
+        if not bundle_dir.exists():
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="failed",
+                phase="stage",
+                failure_code="bundle_not_found",
+                result=result_payload,
+            )
+        self.ledger.update(command_id, status="running", phase="verify")
+        manifest = bundle.load_manifest(bundle_dir)
+        bundle.verify_manifest(bundle_dir, manifest)
+        if manifest.get("bundle_id") != expected_bundle_id:
+            raise RuntimeCommandError("bundle_id does not match staged manifest")
+
+        # ---- channel rewarm BEFORE the start so the restart comes up polling --
+        # (same intent as _force_update: a fresh bundle resets channel config;
+        #  rewarm so the reactivated gateway is not "healthy but deaf").
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
+
+        # ---- ACTIVATE (flip + auto-rollback owned by the launcher) -----------
+        self.ledger.update(command_id, status="running", phase="activate")
+        activation = launcher.activate_bundle(
+            bundle_dir,
+            current_link=self.current_link,
+            stop_command=self.stop_command,
+            start_command=self.start_command,
+            health_command=self.health_command,
+        )
+        result_payload["activation"] = activation.__dict__
+        result_payload["restart_requested"] = True
+        if not activation.activated:
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if activation.rolled_back else "failed",
+                phase=activation.phase,
+                failure_code="activation_failed",
+                result=result_payload,
+            )
+
+        # ---- attest gate (bundle_id must match the just-flipped bundle) ------
+        self.ledger.update(command_id, status="running", phase="attest")
+        try:
+            attestation_doc = self._current_attestation()
+        except Exception as exc:  # noqa: BLE001 - rollback gate
+            rollback = self._rollback_to_previous(activation.previous_target)
+            result_payload["attestation_error"] = redact_text(str(exc), limit=1000)
+            result_payload["rollback"] = rollback.__dict__ if rollback else None
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="rolled_back" if rollback and rollback.activated else "failed",
+                phase="attestation_gate",
+                failure_code=(
+                    "attestation_failed"
+                    if rollback and rollback.activated
+                    else "rollback_failed"
+                ),
+                result=result_payload,
+            )
+        result_payload["attestation"] = attestation_doc
+        if attestation_doc.get("bundle_id") != expected_bundle_id:
+            rollback = self._rollback_to_previous(activation.previous_target)
             result_payload["rollback"] = rollback.__dict__ if rollback else None
             return self._finish(
                 command_id=command_id,

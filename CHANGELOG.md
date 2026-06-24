@@ -7,6 +7,42 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+Adds a forward-version channel for running Computers: the new
+`stage_and_activate_bundle` Command Ledger verb stages a NEW
+content-addressed bundle from resolved git refs (`runtime_ref` /
+`runtime_commit_sha`, `plugin_ref` / `plugin_commit_sha`,
+`framework_version`) into `/opt/tinyhat/bundles/<digest>` WITHOUT flipping
+`/opt/tinyhat/current`, then hands the flip to the existing
+`launcher.activate_bundle` (stop → flip → start → health → auto-rollback).
+This is the missing half the platform needed to move a live Computer to a new
+release in place, data-preserving, with no VM reset — the existing
+`activate_bundle` / `rollback_bundle` verbs only flip to an already-staged
+bundle, and `rebuild_app_layer` / `force_update` only reactivate the current
+bundle. Staging clones the runtime ref, installs the OpenClaw framework via the
+official `npm install openclaw@<version>`, assembles a verified bundle, and runs
+the bundle's own `install.sh` with the new `TINYHAT_BUNDLE_STAGE_ONLY=1` flag.
+Stays entirely within tiny_runtime (no legacy supervisor / `tinyhat_cli`) and
+integrates with OpenClaw only via official commands.
+
+### Added
+
+- `install.sh` honours `TINYHAT_BUNDLE_STAGE_ONLY=1`: it materializes +
+  verifies `bundles/<digest>` exactly as before but skips the
+  `ln -sfn … current` flip and the systemd unit install/enable, and prints
+  `{"staged":true,"activated":false,"bundle_id":…,"bundle_dir":…}`. Default
+  (unset) is byte-for-byte unchanged, so the boot/bootstrap install path still
+  flips inline.
+- `tinyhat_runtime.staging.stage_bundle(...)` — composable, fully
+  effect-injectable staging (clone / npm / assemble / install.sh stage-only /
+  plugin preinstall / warm-config hooks) returning the staged
+  `bundle_id` + `bundle_dir`.
+- `tinyhat-runtime bake stage-bundle` CLI for dev/bake-time staging parity.
+- New ledger verb `stage_and_activate_bundle` (in `ALLOWED_COMMAND_KINDS`) with
+  the `bundle_stage_failed` typed failure code; reuses the launcher flip,
+  channel rewarm, and attestation-match rollback gate of `activate_bundle` /
+  `force_update`. The platform gates the emit on
+  `computer_is_tiny_runtime_generation`.
+
 ## 0.16.11
 
 Restores arbitrary user secrets (for example `EXA_API_KEY`) in the agent's

@@ -19,6 +19,7 @@ from . import (
     paths,
     platform_loop,
     private_access,
+    staging,
 )
 from .command_ledger import CommandLedger
 from .platform_client import (
@@ -170,6 +171,26 @@ def _cmd_bake_preinstall_plugins(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bake_stage_bundle(args: argparse.Namespace) -> int:
+    """Stage a content-addressed bundle from resolved git refs WITHOUT flipping
+    current (dev/bake parity for the stage_and_activate_bundle ledger verb).
+
+    The ledger handler imports staging.stage_bundle directly; this subcommand is
+    only for manual / bake-time staging.
+    """
+    staged = staging.stage_bundle(
+        runtime_ref=args.runtime_ref,
+        runtime_commit_sha=args.runtime_commit_sha,
+        plugin_ref=args.plugin_ref,
+        plugin_commit_sha=args.plugin_commit_sha,
+        framework_version=args.framework_version,
+        bundles_dir=Path(args.bundles_dir),
+        current_link=Path(args.current_link),
+    )
+    print(json.dumps(staged.__dict__, sort_keys=True))
+    return 0
+
+
 def _cmd_openclaw_migrate_auth_store(_args: argparse.Namespace) -> int:
     """Run OpenClaw's official safe repair so a data-preserving reinstall
     reconciles the restored auth profiles into the current auth store.
@@ -282,6 +303,15 @@ def build_parser() -> argparse.ArgumentParser:
     bake_sub = bake.add_subparsers(dest="bake_command", required=True)
     preinstall_plugins = bake_sub.add_parser("preinstall-plugins")
     preinstall_plugins.set_defaults(func=_cmd_bake_preinstall_plugins)
+    stage_bundle = bake_sub.add_parser("stage-bundle")
+    stage_bundle.add_argument("--runtime-ref", required=True)
+    stage_bundle.add_argument("--runtime-commit-sha", required=True)
+    stage_bundle.add_argument("--plugin-ref", required=True)
+    stage_bundle.add_argument("--plugin-commit-sha", required=True)
+    stage_bundle.add_argument("--framework-version", required=True)
+    stage_bundle.add_argument("--bundles-dir", default=str(paths.BUNDLES_DIR))
+    stage_bundle.add_argument("--current-link", default=str(paths.CURRENT_LINK))
+    stage_bundle.set_defaults(func=_cmd_bake_stage_bundle)
 
     openclaw_parser = subparsers.add_parser("openclaw")
     openclaw_sub = openclaw_parser.add_subparsers(
