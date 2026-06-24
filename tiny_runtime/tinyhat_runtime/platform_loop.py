@@ -145,6 +145,16 @@ def _active_bundle_component_versions() -> dict[str, dict[str, str]]:
     return out
 
 
+def _active_bundle_id() -> str | None:
+    """Bundle id of the currently-activated tiny_runtime bundle, if readable."""
+    try:
+        manifest = bundle.load_manifest(paths.CURRENT_LINK)
+    except Exception as exc:  # noqa: BLE001 - heartbeat must not churn on a read
+        LOG.debug("active bundle manifest unavailable: %s", exc)
+        return None
+    return _text(manifest.get("bundle_id"))
+
+
 def _active_bundle_runtime_state_report() -> dict[str, Any]:
     versions = _active_bundle_component_versions()
     if not versions:
@@ -567,9 +577,31 @@ class TinyRuntimePlatformLoop:
         if private_report is not None:
             metrics["private_access"] = private_report
         component_versions = _active_bundle_component_versions()
+        openclaw_status = openclaw_adapter.gateway_status()
+        # Attest the live runtime identity into the status payload so the
+        # platform admin Status panel renders the real runtime generation,
+        # bundle id, and active model instead of "Unknown" / "Not reported"
+        # (tinyloophub/tinyloop#870 root cause #4). The platform's
+        # sanitize_openclaw_status already reads these top-level keys. Best-
+        # effort: a status-enrichment failure must never skip the heartbeat.
+        if isinstance(openclaw_status, dict):
+            openclaw_status.setdefault("runtime_generation", "tiny_runtime")
+            bundle_id = _active_bundle_id()
+            if bundle_id:
+                openclaw_status.setdefault("bundle_id", bundle_id)
+            if assigned:
+                try:
+                    model_ref = _observed_model_ref_from_status(
+                        openclaw_adapter.models_status()
+                    )
+                except Exception as exc:  # noqa: BLE001 - status read must not churn
+                    LOG.debug("live model status unavailable: %s", exc)
+                    model_ref = None
+                if model_ref:
+                    openclaw_status.setdefault("model_ref", model_ref)
         body: dict[str, Any] = {
             "metrics": metrics,
-            "openclaw_status": openclaw_adapter.gateway_status(),
+            "openclaw_status": openclaw_status,
         }
         if component_versions:
             body["component_versions"] = component_versions

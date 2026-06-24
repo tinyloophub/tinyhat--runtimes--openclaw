@@ -1994,6 +1994,62 @@ class PlatformLoopTests(unittest.TestCase):
         self.assertEqual(len(heartbeat_payloads), 1)
         self.assertFalse(heartbeat_payloads[0]["metrics"]["assigned"])
 
+    def test_heartbeat_attests_live_runtime_identity(self) -> None:
+        """The heartbeat openclaw_status payload carries runtime_generation,
+        bundle_id, and (when assigned) the live model_ref so the platform admin
+        Status panel shows real values instead of Unknown / Not reported
+        (tinyloophub/tinyloop#870)."""
+        from tinyhat_runtime import platform_loop
+
+        posts: list[tuple[str, dict]] = []
+        client = Mock()
+        client.post_json.side_effect = lambda path, payload: (
+            posts.append((path, payload)) or {}
+        )
+        loop = platform_loop.TinyRuntimePlatformLoop(client=client)
+
+        with (
+            patch.object(
+                platform_loop.openclaw_adapter,
+                "gateway_status",
+                # fresh dict per call, like the real adapter (no cross-call leak)
+                side_effect=lambda *a, **k: {"state": "ready", "gateway": {}},
+            ),
+            patch.object(
+                platform_loop, "_active_bundle_component_versions", return_value={}
+            ),
+            patch.object(
+                platform_loop, "_active_bundle_id", return_value="sha256:bundle123"
+            ),
+            patch.object(
+                platform_loop.private_access,
+                "private_access_report",
+                return_value=None,
+            ),
+            patch.object(
+                platform_loop.openclaw_adapter, "models_status", return_value={}
+            ),
+            patch.object(
+                platform_loop,
+                "_observed_model_ref_from_status",
+                return_value="openai/gpt-5.5",
+            ),
+        ):
+            loop._post_heartbeat(assigned=True)
+            loop._post_heartbeat(assigned=False)
+
+        hb = [p for path, p in posts if path == "/hapi/v1/computers/me/heartbeat"]
+        self.assertEqual(len(hb), 2)
+        assigned_status = hb[0]["openclaw_status"]
+        self.assertEqual(assigned_status["runtime_generation"], "tiny_runtime")
+        self.assertEqual(assigned_status["bundle_id"], "sha256:bundle123")
+        self.assertEqual(assigned_status["model_ref"], "openai/gpt-5.5")
+        # Unassigned: identity is still attested, but no live model is claimed.
+        unassigned_status = hb[1]["openclaw_status"]
+        self.assertEqual(unassigned_status["runtime_generation"], "tiny_runtime")
+        self.assertEqual(unassigned_status["bundle_id"], "sha256:bundle123")
+        self.assertNotIn("model_ref", unassigned_status)
+
     def test_unassigned_state_report_failure_does_not_exit_loop(self) -> None:
         from tinyhat_runtime import platform_loop
 
