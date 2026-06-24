@@ -538,11 +538,12 @@ class RuntimeCommandRunner:
                 failure_code="config_apply_failed",
                 result=_no_restart_failure_payload(exc),
             )
+        env_block_changed = bool(result.get("env_block_changed"))
         result_payload.update(
             {
                 "secret_count": int(result.get("secret_count") or len(secrets)),
                 "reload": result.get("reload") or {},
-                "env_block_changed": bool(result.get("env_block_changed")),
+                "env_block_changed": env_block_changed,
                 "gateway_config_changed": bool(result.get("gateway_config_changed")),
                 "model_auth_signature_changed": bool(
                     result.get("model_auth_signature_changed")
@@ -552,6 +553,32 @@ class RuntimeCommandRunner:
                 "systemd_restart_requested": False,
             }
         )
+        # The config `env` block (user secrets like EXA_API_KEY) is applied into
+        # the gateway's process.env at gateway START, so a changed env block only
+        # reaches the agent's exec shell after a local gateway rebind. SecretRef-
+        # only changes (model/channel keys) stay hot and skip this.
+        if env_block_changed:
+            rebound_ok = self._rebind_gateway_for_env_block(
+                command_id=command_id, result_payload=result_payload
+            )
+            if rebound_ok:
+                # Record the env now live in the restarted gateway ONLY after a
+                # confirmed stop+start+health. Until this is written, a retry
+                # keeps rebinding even though config.env already matches desired
+                # (a failed rebind must not look "done").
+                openclaw_adapter.write_rebound_env_marker(secrets)
+            rebind = result_payload.get("gateway_rebind") or {}
+            # Point at the lifecycle step that actually failed for diagnostics.
+            fail_phase = "stop_gateway" if not rebind.get("stopped") else "start_gateway"
+            return self._finish(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                kind=kind,
+                status="applied" if rebound_ok else "failed",
+                phase="env_block_rebound" if rebound_ok else fail_phase,
+                failure_code=None if rebound_ok else "config_apply_failed",
+                result=result_payload,
+            )
         return self._finish(
             command_id=command_id,
             idempotency_key=idempotency_key,
@@ -837,6 +864,59 @@ class RuntimeCommandRunner:
             health = openclaw_adapter.gateway_health()
             attempt += 1
         return health
+
+    def _rebind_gateway_for_env_block(
+        self, *, command_id: str, result_payload: dict[str, Any]
+    ) -> bool:
+        """Rebind the gateway so a changed config ``env`` block takes effect.
+
+        The ``env`` block is read into the gateway's process.env at gateway
+        START, so user secrets only reach the agent's exec shell after a stop →
+        start. Rewarm channels across the rebind so the restarted gateway
+        reconnects Telegram / model providers (the binding's channel config is
+        applied once at bind time, not re-applied on restart). Uses the same
+        gateway-lifecycle commands as Force-Upgrade, which resolve even when the
+        runner was built without ``service_restart``. Returns whether the
+        rebind actually happened: the stop AND start lifecycle commands must both
+        succeed AND the gateway must come back healthy. A healthy gateway alone
+        is NOT sufficient — if the stop command fails, the OLD gateway keeps
+        serving with the stale process.env, so the new config.env never took
+        effect even though health reads "healthy". The caller maps the returned
+        bool to applied/failed.
+        """
+        self.ledger.update(command_id, status="running", phase="stop_gateway")
+        stopped_ok, stop_detail = launcher._run_command(
+            self._gateway_stop_command(), timeout=60
+        )
+        self.ledger.update(command_id, status="running", phase="rewarm_channels")
+        self._maybe_rewarm_channels(result_payload)
+        self.ledger.update(command_id, status="running", phase="start_gateway")
+        started_ok, start_detail = launcher._run_command(
+            self._gateway_start_command(), timeout=60
+        )
+        health = self._wait_for_gateway_healthy()
+        gateway_up = str(health.get("state") or "") == "healthy"
+        # The rebind only counts if the gateway was actually stopped and started
+        # (so it re-read config.env) AND is healthy again. A failed stop with a
+        # still-healthy old process must NOT report success.
+        rebound_ok = bool(stopped_ok) and bool(started_ok) and gateway_up
+        result_payload.update(
+            {
+                "gateway_rebind_requested": True,
+                "restart_requested": True,
+                "systemd_restart_requested": self.stop_command is not None,
+                "gateway_rebind": {
+                    "stopped": bool(stopped_ok),
+                    "started": bool(started_ok),
+                    "gateway_up": gateway_up,
+                    "rebound": rebound_ok,
+                    "stop_detail": redact_text(stop_detail, limit=300),
+                    "start_detail": redact_text(start_detail, limit=300),
+                },
+                "gateway_health": health,
+            }
+        )
+        return rebound_ok
 
     def _maybe_rewarm_channels(self, result_payload: dict[str, Any]) -> None:
         """Re-apply the binding's channel config + secrets so OpenClaw reconnects

@@ -646,6 +646,145 @@ def config_patch(
     return {"state": "ready", "patch": payload, "detail": result.public_summary()}
 
 
+# --- User runtime-secret env block -------------------------------------------
+# OpenClaw exposes a saved secret to the agent's exec/bash shell ONLY through the
+# config `env` block: OpenClaw applies it into the gateway's process.env at
+# gateway start, and the exec tool's child shells inherit it. The SecretRef
+# provider file (tinyhat-secrets.json) resolves only a fixed set of config
+# credential FIELDS (model/channel keys) and never reaches the shell. So an
+# arbitrary user secret the operator saves in Tinyhat (e.g. EXA_API_KEY) must be
+# mirrored into config.env for `$EXA_API_KEY` to work in a skill. This re-lands
+# the legacy supervisor behavior (runtime v0.9.1) that tiny_runtime dropped.
+#
+# OPENAI_API_KEY is wired as a SecretRef on models.providers.openai.apiKey and
+# OPENROUTER_API_KEY is binding-managed (also a SecretRef); neither belongs in
+# the shell env block, so both are excluded from the mirror.
+ENV_BLOCK_EXCLUDED_KEYS = frozenset({"OPENAI_API_KEY", "OPENROUTER_API_KEY"})
+
+
+def runtime_secret_env_entries(secrets: dict[str, Any]) -> dict[str, str]:
+    """The subset of user runtime secrets that must become shell env vars.
+
+    Drops blank names/values and the provider-managed keys (handled as
+    SecretRefs, not shell env). Keys keep the env-style names the operator gave.
+    """
+    entries: dict[str, str] = {}
+    for raw_name, raw_value in (secrets or {}).items():
+        name = str(raw_name or "").strip()
+        value = "" if raw_value is None else str(raw_value)
+        if not name or not value.strip():
+            continue
+        if name in ENV_BLOCK_EXCLUDED_KEYS:
+            continue
+        entries[name] = value
+    return entries
+
+
+def read_config_env(*, config_path: Path | None = None) -> dict[str, str]:
+    """Read the current OpenClaw config ``env`` block (read-only, for change
+    detection). Returns ``{}`` when the config or block is absent/unreadable."""
+    path = config_path or paths.OPENCLAW_CONFIG_PATH
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def _env_rebound_marker_path(marker_path: Path | None = None) -> Path:
+    # The env block the gateway was last SUCCESSFULLY (re)started with. Kept next
+    # to the SecretRef file (a directory the runtime already owns + writes), so
+    # it is guaranteed writable; survives apply_config retries, not a recycle.
+    return marker_path or (
+        paths.OPENCLAW_SECRETS_PATH.parent / "tinyhat-env-rebound.json"
+    )
+
+
+def read_rebound_env_marker(*, marker_path: Path | None = None) -> dict[str, str] | None:
+    """The env block the gateway last SUCCESSFULLY (re)started with. Returns
+    ``None`` when the marker is ABSENT (never confirmed) — distinct from ``{}``
+    (the gateway was confirmed rebound with no user env). The absent case is
+    load-bearing: it must not look equal to an empty desired env, or removing the
+    last secret before any marker exists would skip the rebind."""
+    try:
+        data = json.loads(_env_rebound_marker_path(marker_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return None
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def write_rebound_env_marker(
+    secrets: dict[str, Any], *, marker_path: Path | None = None
+) -> dict[str, str]:
+    """Record (AFTER a successful gateway rebind) the env block now live in the
+    gateway's process.env, so a later apply can tell a written-but-not-rebound
+    env block from a truly-rebound one. Best-effort: a write failure just means
+    the next apply rebinds again, which is safe."""
+    desired = runtime_secret_env_entries(secrets)
+    path = _env_rebound_marker_path(marker_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps({"env": desired}, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError:
+        pass
+    return desired
+
+
+def apply_runtime_secret_env_block(
+    secrets: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    runner: Runner = subprocess.run,
+    config_path: Path | None = None,
+    marker_path: Path | None = None,
+) -> dict[str, Any]:
+    """Stage the user runtime secrets into the OpenClaw config ``env`` block and
+    report whether a gateway rebind is still needed.
+
+    Writes ``config.env`` via the official ``openclaw config patch --replace-path
+    env`` (``--replace-path`` swaps the whole object, so a secret removed in the
+    Mini App disappears on the next apply). ``env_block_changed`` is NOT a file
+    delta — it is "the gateway's live env differs from desired", tracked by the
+    rebound marker, which is written only AFTER a successful rebind
+    (``write_rebound_env_marker``). This is load-bearing: if a prior rebind
+    FAILED, ``config.env`` already matches desired, but the running gateway still
+    has the stale env, so the rebind must keep firing until it succeeds.
+    """
+    desired = runtime_secret_env_entries(secrets)
+    marker = read_rebound_env_marker(marker_path=marker_path)
+    current_file = read_config_env(config_path=config_path)
+    config_will_change = current_file != desired
+    # The ONLY signal that the gateway's live env matches desired is a marker
+    # written after a confirmed rebind. If the marker is absent the gateway's env
+    # is UNKNOWN — and crucially config.env is NOT a substitute, because the
+    # config is patched to desired BEFORE the rebind, so on a failed (or
+    # not-yet-run) rebind the file already matches while the running gateway is
+    # stale. So rebind until a successful rebind records marker == desired:
+    # absent marker => always rebind; present marker => rebind iff it differs.
+    rebind_needed = marker is None or marker != desired
+    if dry_run:
+        return {"state": "ready", "env_block_changed": rebind_needed, "dry_run": True}
+    # Keep config.env current so the NEXT gateway start reads the desired values;
+    # write only when the on-disk block actually differs (avoid redundant CLI).
+    if config_will_change:
+        patch_result = config_patch({"env": desired}, replace_paths=("env",), runner=runner)
+        if patch_result.get("state") != "ready":
+            raise RuntimeError(
+                "OpenClaw config env patch failed: "
+                + redact_text(json.dumps(patch_result, sort_keys=True), limit=1000)
+            )
+    return {"state": "ready", "env_block_changed": rebind_needed}
+
+
 def gateway_health(*, runner: Runner = subprocess.run) -> dict[str, Any]:
     result = run_openclaw(("gateway", "health", "--json"), runner=runner)
     if not result.ok:

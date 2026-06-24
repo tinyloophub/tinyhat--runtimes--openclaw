@@ -535,9 +535,14 @@ class TinyRuntimePlatformLoop:
         secrets: dict[str, str],
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        # This is intentionally no-restart. SecretRef-backed values are reloaded
-        # through the official OpenClaw secrets surface; env-block changes must
-        # move to OpenClaw hot secret refs rather than restarting the gateway.
+        # SecretRef-backed values (model/channel keys) reload HOT through the
+        # official OpenClaw secrets surface. Arbitrary USER secrets the operator
+        # saves (e.g. EXA_API_KEY) only reach the agent's exec shell via the
+        # config `env` block, which OpenClaw applies into the gateway's
+        # process.env at gateway START — so a changed env block needs a local
+        # gateway rebind, performed by the apply_config command handler when
+        # env_block_changed is true. (Re-lands the legacy v0.9.1 mirror that
+        # tiny_runtime dropped; SecretRef-only changes stay hot.)
         if not dry_run:
             openclaw_adapter.write_openclaw_secrets(secrets)
         reload_result = (
@@ -550,14 +555,19 @@ class TinyRuntimePlatformLoop:
                 "OpenClaw secrets reload failed: "
                 + redact_text(json.dumps(reload_result, sort_keys=True), limit=1000)
             )
+        env_result = openclaw_adapter.apply_runtime_secret_env_block(
+            secrets, dry_run=dry_run
+        )
+        env_block_changed = bool(env_result.get("env_block_changed"))
         return {
             "revision": revision,
             "secret_count": len(secrets),
             "reload": reload_result,
-            "env_block_changed": False,
-            "gateway_config_changed": False,
+            "env": env_result,
+            "env_block_changed": env_block_changed,
+            "gateway_config_changed": env_block_changed,
             "model_auth_signature_changed": False,
-            "gateway_rebind_required": False,
+            "gateway_rebind_required": env_block_changed,
         }
 
     def _start_chatgpt_link(self, command: dict[str, Any]) -> dict[str, Any]:

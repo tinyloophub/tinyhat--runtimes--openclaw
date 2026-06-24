@@ -7,6 +7,28 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+Restores arbitrary user secrets (for example `EXA_API_KEY`) in the agent's
+shell. `apply_config` now mirrors user runtime secrets into OpenClaw's config
+`env` block via the official `openclaw config patch --replace-path env` and
+rebinds the Gateway when that block changes, so a secret saved in Tinyhat is
+available as `$NAME` to the agent's exec/bash skills — not only inside the
+SecretRef provider file. SecretRef-only changes (model + channel keys) stay hot;
+`OPENAI_API_KEY` and `OPENROUTER_API_KEY` are excluded from the env mirror
+(handled as SecretRefs). This re-lands the legacy supervisor behavior
+(runtime v0.9.1) that the tiny_runtime rewrite dropped. Companion platform
+issue: tinyloophub/tinyloop#870.
+
+### Fixed
+
+- User secrets saved in Tinyhat reach the agent's exec shell again:
+  `apply_config` mirrors them into `config.env` through the official
+  `openclaw config patch --replace-path env`, then performs a single
+  channel-rewarmed Gateway rebind when the env block actually changes
+  (`env_block_changed` / `gateway_rebind_requested` / `restart_requested`
+  become `true`). A SecretRef-only change stays fully hot. A secret removed in
+  the Mini App is dropped from the shell on the next apply (`--replace-path`
+  replace semantics).
+
 ## 0.16.10
 
 Surfaces the live runtime identity on the platform admin Status panel. The
