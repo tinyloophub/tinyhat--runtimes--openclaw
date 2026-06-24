@@ -30,6 +30,21 @@ target="${bundles_dir}/${bundle_name}"
 tmp_target="${target}.tmp.$$"
 
 mkdir -p "${bundles_dir}"
+
+# Stage-only must never endanger the live rollback target. bundles/<digest> is
+# content-addressed, so an already-materialized target holds exactly this
+# content: reuse it (verify only) instead of rm -rf + recreate. This is the safe
+# path when the platform replays the same resolved refs, and it makes it
+# impossible to delete the directory ${current_link} points at -- an
+# interruption between `rm -rf` and `mv` would otherwise leave a live Computer's
+# `current` dangling at a missing bundle.
+if [[ "${stage_only}" == "1" && -d "${target}" ]]; then
+  PYTHONPATH="${target}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}" >/dev/null
+  printf '{"staged":true,"activated":false,"reused":true,"bundle_id":"%s","bundle_dir":"%s"}\n' \
+    "${bundle_id}" "${target}"
+  exit 0
+fi
 rm -rf -- "${tmp_target}"
 cp -a -- "${bundle_source}" "${tmp_target}"
 chmod +x "${tmp_target}"/bin/tinyhat-*

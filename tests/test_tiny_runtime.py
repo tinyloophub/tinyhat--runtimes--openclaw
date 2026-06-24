@@ -3104,10 +3104,36 @@ class SystemdUnitTests(unittest.TestCase):
             encoding="utf-8"
         )
         chown_pos = install_script.index('chown -R 0:0 "${tmp_target}"')
+        # Disambiguate from the stage-only reuse-guard verify (which precedes the
+        # copy): assert the chown precedes the verify of the freshly MATERIALIZED
+        # bundle -- the verify that follows the `mv` into ${target}.
+        mv_pos = install_script.index('mv -- "${tmp_target}" "${target}"')
         verify_pos = install_script.index(
-            'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"'
+            'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"',
+            mv_pos,
         )
         self.assertLess(chown_pos, verify_pos)
+
+    def test_install_stage_only_reuses_existing_bundle_without_delete(self) -> None:
+        """Stage-only must never ``rm -rf`` an already-materialized
+        ``bundles/<digest>`` (it is content-addressed, so it holds exactly this
+        content). Reusing it instead of delete+recreate makes it impossible to
+        leave a live Computer's ``current`` dangling at a missing bundle if the
+        process is interrupted between remove and publish -- the P1 raised on the
+        in-place-update review."""
+        install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        guard = 'if [[ "${stage_only}" == "1" && -d "${target}" ]]; then'
+        self.assertIn(guard, install_script)
+        # The reuse guard short-circuits (exit 0, reused:true) BEFORE any
+        # destructive remove of the target.
+        guard_pos = install_script.index(guard)
+        rm_target_pos = install_script.index('rm -rf -- "${target}"')
+        self.assertLess(guard_pos, rm_target_pos)
+        reuse_block = install_script[guard_pos:rm_target_pos]
+        self.assertIn('"reused":true', reuse_block)
+        self.assertIn("exit 0", reuse_block)
 
     def test_install_stage_only_flag_gates_the_flip(self) -> None:
         install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
@@ -5114,6 +5140,52 @@ class StageAndActivateBundleTests(unittest.TestCase):
             # Never flipped current.
             self.assertFalse(current.exists())
             self.assertFalse(current.is_symlink())
+
+    def test_verb_staging_is_pure_no_live_plugin_mutation(self) -> None:
+        """The verb's _stage_bundle keeps staging PURE: it must NOT wire the live
+        hot_image plugin preinstall (which mutates the live OpenClaw state dir at
+        the env-default ref, re-owns live trees, applies warm-image config, and
+        rewrites the live marker) or a warm-config hook into staging. So a later
+        activation/attestation failure cannot leave a running Computer drifted --
+        the stage-only / fail-closed boundary raised on the in-place-update
+        review. The plugin is baked into the bundle by assemble (--plugin-ref) at
+        the RESOLVED plugin_commit_sha and delivered by the flip, not installed
+        into live state at the env default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            current = base / "current"
+            runner = self._runner(base, bundles, current, health_exit=0)
+            captured: dict[str, object] = {}
+
+            def spy_stage_bundle(**kwargs):
+                captured.update(kwargs)
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id="sha256:" + "0" * 64,
+                    bundle_dir=str(bundles / "x"),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            with patch("tinyhat_runtime.staging.stage_bundle", spy_stage_bundle):
+                runner._stage_bundle(dict(_STAGE_SPEC))
+
+            # No live-mutating hooks are wired by the verb.
+            self.assertIsNone(captured.get("preinstall_plugins_hook"))
+            self.assertIsNone(captured.get("warm_config_hook"))
+            # The RESOLVED refs are threaded into staging so assemble bakes the
+            # plugin at plugin_commit_sha (not the env default), and the bundle
+            # is content-addressed off the pinned runtime sha.
+            self.assertEqual(
+                captured.get("plugin_commit_sha"), _STAGE_SPEC["plugin_commit_sha"]
+            )
+            self.assertEqual(
+                captured.get("runtime_commit_sha"), _STAGE_SPEC["runtime_commit_sha"]
+            )
 
     def test_attestation_mismatch_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

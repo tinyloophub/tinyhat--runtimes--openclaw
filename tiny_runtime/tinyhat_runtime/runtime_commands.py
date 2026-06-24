@@ -411,6 +411,21 @@ class RuntimeCommandRunner:
         ``staging.stage_bundle`` which keeps every host effect injectable and
         integrates with OpenClaw only via the official npm install + the
         bundle's bake/platform subcommands.
+
+        Staging is PURE: it clones the runtime ref, installs the OpenClaw
+        framework, and assembles a verified ``bundles/<digest>`` that already
+        bakes the tinyhat plugin checkout at the resolved ``plugin_commit_sha``
+        (``assemble-bundle.sh`` -> ``bundle write --plugin-ref``). It must NOT
+        touch any live OpenClaw state: no ``preinstall_plugins_hook`` (the old
+        ``hot_image.preinstall_hot_image_plugins`` mutates the *live* state dir
+        at the env-default ref, re-owns live trees, applies warm-image config,
+        and rewrites the live marker -- so a later activation/attestation
+        failure would leave the running Computer drifted, breaking the
+        stage-only / fail-closed boundary) and no warm-config hook (warm-image
+        config is for a fresh box, not an already-configured one; channel state
+        is rewarmed by ``_maybe_rewarm_channels`` before the flip). The flip
+        swaps runtime + framework in place; the box's existing plugin install
+        persists across the flip, which is what delivers a runtime-side fix.
         """
         return staging.stage_bundle(
             runtime_ref=_required_string(spec, "runtime_ref"),
@@ -420,12 +435,6 @@ class RuntimeCommandRunner:
             framework_version=_required_string(spec, "framework_version"),
             bundles_dir=self.bundles_dir,
             current_link=self.current_link,
-            preinstall_plugins_hook=lambda _bundle_dir: hot_image.preinstall_hot_image_plugins(),
-            warm_config_hook=(
-                (lambda _bundle_dir: self.rewarm_channels())  # type: ignore[misc]
-                if self.rewarm_channels is not None
-                else None
-            ),
         )
 
     def _stage_and_activate_bundle(self, command: dict[str, Any]) -> dict[str, Any]:
