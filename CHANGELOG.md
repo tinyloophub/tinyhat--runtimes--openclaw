@@ -7,6 +7,15 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.10
+
+Surfaces the live runtime identity on the platform admin Status panel. The
+heartbeat now attests the runtime generation, active bundle id, and (when
+assigned) the live model into `openclaw_status`, so a healthy tiny_runtime
+Computer shows its real runtime generation, bundle, and active model instead of
+`Unknown` / `Not reported`. `force-upgrade.sh` now defaults its target ref to
+`v0.16.10`. Companion platform issue: tinyloophub/tinyloop#870.
+
 ### Added
 
 - Heartbeat now attests the live runtime identity inside the `openclaw_status`
