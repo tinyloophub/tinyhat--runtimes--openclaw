@@ -703,16 +703,19 @@ def _env_rebound_marker_path(marker_path: Path | None = None) -> Path:
     )
 
 
-def read_rebound_env_marker(*, marker_path: Path | None = None) -> dict[str, str]:
-    """The env block the gateway last SUCCESSFULLY (re)started with, or ``{}`` if
-    it has never been rebound (so the next apply must rebind)."""
+def read_rebound_env_marker(*, marker_path: Path | None = None) -> dict[str, str] | None:
+    """The env block the gateway last SUCCESSFULLY (re)started with. Returns
+    ``None`` when the marker is ABSENT (never confirmed) — distinct from ``{}``
+    (the gateway was confirmed rebound with no user env). The absent case is
+    load-bearing: it must not look equal to an empty desired env, or removing the
+    last secret before any marker exists would skip the rebind."""
     try:
         data = json.loads(_env_rebound_marker_path(marker_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
+        return None
     env = data.get("env") if isinstance(data, dict) else None
     if not isinstance(env, dict):
-        return {}
+        return None
     return {str(key): str(value) for key, value in env.items()}
 
 
@@ -757,12 +760,23 @@ def apply_runtime_secret_env_block(
     has the stale env, so the rebind must keep firing until it succeeds.
     """
     desired = runtime_secret_env_entries(secrets)
-    rebind_needed = read_rebound_env_marker(marker_path=marker_path) != desired
+    marker = read_rebound_env_marker(marker_path=marker_path)
+    current_file = read_config_env(config_path=config_path)
+    config_will_change = current_file != desired
+    if marker is None:
+        # The gateway's live env is UNKNOWN (never confirmed). Rebind if there is
+        # anything to ensure present (desired non-empty) OR anything stale to
+        # remove from the running shell (the on-disk block has to change) — e.g.
+        # the last secret was removed before any marker existed.
+        rebind_needed = bool(desired) or config_will_change
+    else:
+        # The gateway's live env == the marker; rebind iff it differs from desired.
+        rebind_needed = marker != desired
     if dry_run:
         return {"state": "ready", "env_block_changed": rebind_needed, "dry_run": True}
     # Keep config.env current so the NEXT gateway start reads the desired values;
     # write only when the on-disk block actually differs (avoid redundant CLI).
-    if read_config_env(config_path=config_path) != desired:
+    if config_will_change:
         patch_result = config_patch({"env": desired}, replace_paths=("env",), runner=runner)
         if patch_result.get("state") != "ready":
             raise RuntimeError(

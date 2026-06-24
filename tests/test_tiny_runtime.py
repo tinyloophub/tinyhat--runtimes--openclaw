@@ -4049,6 +4049,38 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             )
             self.assertFalse(settled["env_block_changed"])
 
+    def test_apply_runtime_secret_env_block_rebinds_on_removal_before_any_marker(
+        self,
+    ) -> None:
+        # config.env still holds a mirrored secret, the desired mirror is now
+        # empty (last secret removed / only provider-managed keys left), and NO
+        # marker exists yet. "marker absent" must not look equal to "desired
+        # empty": the on-disk block has to change, so the gateway needs a rebind
+        # to drop the stale shell variable — not just a silent config patch.
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"
+            config_path.write_text(json.dumps({"env": {"EXA_API_KEY": "stale"}}))
+            marker_path = Path(tmp) / "marker.json"  # never written
+            seen: dict[str, object] = {}
+
+            def runner(argv, **kwargs):
+                seen["argv"] = argv
+                seen["input"] = kwargs.get("input")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"OPENROUTER_API_KEY": "managed-only"},  # all excluded -> desired {}
+                runner=runner,
+                config_path=config_path,
+                marker_path=marker_path,
+            )
+
+            self.assertTrue(result["env_block_changed"])  # rebind to drop stale env
+            # the stale entry was cleared on disk via the official CLI
+            self.assertEqual(json.loads(str(seen["input"])), {"env": {}})
+
     def test_apply_runtime_secret_env_block_dry_run_never_writes(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
