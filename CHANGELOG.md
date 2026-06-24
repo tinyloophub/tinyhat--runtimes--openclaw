@@ -7,6 +7,55 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+Adds a forward-version channel for running Computers: the new
+`stage_and_activate_bundle` Command Ledger verb stages a NEW
+content-addressed bundle from resolved git refs (`runtime_ref` /
+`runtime_commit_sha`, `plugin_ref` / `plugin_commit_sha`,
+`framework_version`) into `/opt/tinyhat/bundles/<digest>` WITHOUT flipping
+`/opt/tinyhat/current`, then hands the flip to the existing
+`launcher.activate_bundle` (stop → flip → start → health → auto-rollback).
+This is the missing half the platform needed to move a live Computer to a new
+release in place, data-preserving, with no VM reset — the existing
+`activate_bundle` / `rollback_bundle` verbs only flip to an already-staged
+bundle, and `rebuild_app_layer` / `force_update` only reactivate the current
+bundle. Staging clones the runtime ref, installs the OpenClaw framework via the
+official `npm install openclaw@<version>`, and assembles a verified bundle that
+bakes the tinyhat plugin checkout at the RESOLVED `plugin_commit_sha`
+(`assemble-bundle.sh` → `bundle write --plugin-ref`), then runs the bundle's own
+`install.sh` with the new `TINYHAT_BUNDLE_STAGE_ONLY=1` flag. Staging is PURE: it
+never touches any live OpenClaw state, so a failed activation/attestation leaves
+the running Computer untouched (fail-closed). The flip swaps runtime + framework
+in place; the box's existing plugin install persists across the flip, which is
+what delivers a runtime-side fix (e.g. the v0.16.11 user-secret fix). Stays
+entirely within tiny_runtime (no legacy supervisor / `tinyhat_cli`) and
+integrates with OpenClaw only via official commands.
+
+### Added
+
+- `install.sh` honours `TINYHAT_BUNDLE_STAGE_ONLY=1`: it materializes +
+  verifies `bundles/<digest>` exactly as before but skips the
+  `ln -sfn … current` flip and the systemd unit install/enable, and prints
+  `{"staged":true,"activated":false,"bundle_id":…,"bundle_dir":…}`. Default
+  (unset) is byte-for-byte unchanged, so the boot/bootstrap install path still
+  flips inline. Stage-only REUSES an already-materialized `bundles/<digest>`
+  (verify-only, prints `"reused":true`) instead of `rm -rf` + recreate, so it can
+  never delete the bundle `current` points at — a live Computer can never be left
+  with a dangling `current` if interrupted between remove and publish.
+- `tinyhat_runtime.staging.stage_bundle(...)` — composable, fully
+  effect-injectable staging (clone / npm / assemble / install.sh stage-only)
+  returning the staged `bundle_id` + `bundle_dir`. The verb wires NO live-state
+  hooks; staging stays pure.
+- `tinyhat-runtime bake stage-bundle` CLI for dev/bake-time staging parity.
+- New ledger verb `stage_and_activate_bundle` (in `ALLOWED_COMMAND_KINDS`) with
+  the `bundle_stage_failed` typed failure code; reuses the launcher flip and the
+  attestation-match rollback gate of `activate_bundle` (it is a pure flip, so —
+  like `activate_bundle` and unlike `force_update` — it runs NO channel rewarm:
+  `apply_binding_config` mutates live OpenClaw state outside the
+  bundles/`current` rollback boundary, so a pre-flip rewarm could strand a
+  Computer on the old `current` with new app-layer/config on a failed
+  activation; the binding persists across a pure flip unaided). The platform
+  gates the emit on `computer_is_tiny_runtime_generation`.
+
 ## 0.16.11
 
 Restores arbitrary user secrets (for example `EXA_API_KEY`) in the agent's

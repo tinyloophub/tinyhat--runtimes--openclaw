@@ -3104,10 +3104,67 @@ class SystemdUnitTests(unittest.TestCase):
             encoding="utf-8"
         )
         chown_pos = install_script.index('chown -R 0:0 "${tmp_target}"')
+        # Disambiguate from the stage-only reuse-guard verify (which precedes the
+        # copy): assert the chown precedes the verify of the freshly MATERIALIZED
+        # bundle -- the verify that follows the `mv` into ${target}.
+        mv_pos = install_script.index('mv -- "${tmp_target}" "${target}"')
         verify_pos = install_script.index(
-            'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"'
+            'python3 -m tinyhat_runtime.main bundle verify --bundle-dir "${target}"',
+            mv_pos,
         )
         self.assertLess(chown_pos, verify_pos)
+
+    def test_install_stage_only_reuses_existing_bundle_without_delete(self) -> None:
+        """Stage-only must never ``rm -rf`` an already-materialized
+        ``bundles/<digest>`` (it is content-addressed, so it holds exactly this
+        content). Reusing it instead of delete+recreate makes it impossible to
+        leave a live Computer's ``current`` dangling at a missing bundle if the
+        process is interrupted between remove and publish -- the P1 raised on the
+        in-place-update review."""
+        install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        guard = 'if [[ "${stage_only}" == "1" && -d "${target}" ]]; then'
+        self.assertIn(guard, install_script)
+        # The reuse guard short-circuits (exit 0, reused:true) BEFORE any
+        # destructive remove of the target.
+        guard_pos = install_script.index(guard)
+        rm_target_pos = install_script.index('rm -rf -- "${target}"')
+        self.assertLess(guard_pos, rm_target_pos)
+        reuse_block = install_script[guard_pos:rm_target_pos]
+        self.assertIn('"reused":true', reuse_block)
+        self.assertIn("exit 0", reuse_block)
+
+    def test_install_stage_only_flag_gates_the_flip(self) -> None:
+        install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('stage_only="${TINYHAT_BUNDLE_STAGE_ONLY:-0}"', install_script)
+        # The flip (and only the flip) is guarded by the stage-only flag.
+        self.assertIn(
+            'if [[ "${stage_only}" != "1" ]]; then\n'
+            '  ln -sfn -- "${target}" "${current_link}"\n'
+            "fi",
+            install_script,
+        )
+        # The chown->verify staging ordering is preserved (unconditional).
+        chown_pos = install_script.index('chown -R 0:0 "${tmp_target}"')
+        flip_pos = install_script.index('ln -sfn -- "${target}" "${current_link}"')
+        self.assertLess(chown_pos, flip_pos)
+        # Stage-only emits the bundle_dir the verb consumes.
+        self.assertIn('"staged":true,"activated":false', install_script)
+
+    def test_install_stage_only_skips_systemd_and_flip(self) -> None:
+        """The stage-only systemd guard skips unit install/enable AND the flip in
+        one conditional (a stage step must not enable a non-current bundle's
+        units), proven at the script level alongside the flip gate above."""
+        install_script = (_REPO_ROOT / "tiny_runtime" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'if [[ "${stage_only}" != "1" && "${skip_systemd}" != "1" ]]; then',
+            install_script,
+        )
 
     def test_computer_startup_script_owns_bundle_boot_path(self) -> None:
         script_path = _REPO_ROOT / "tiny_runtime" / "bin" / "tinyhat-computer-startup"
@@ -4828,6 +4885,448 @@ class BackupRestoreTests(unittest.TestCase):
             with patch.object(runtime_paths, "OPENCLAW_STATE_DIR", state_dir):
                 result = openclaw_adapter.backup_restore(input_path=archive)
             self.assertEqual(result["state"], "failed", result)
+
+
+_STAGE_SPEC = {
+    "runtime_ref": "v0.16.11",
+    "runtime_commit_sha": "a" * 40,
+    "plugin_ref": "v0.9.0",
+    "plugin_commit_sha": "b" * 40,
+    "framework_version": "openclaw@2026.6.8",
+}
+
+
+class StageAndActivateBundleTests(unittest.TestCase):
+    """The stage_and_activate_bundle verb: STAGE (no flip) then launcher flip.
+
+    The STAGE step (clone + npm + assemble + install.sh stage-only) is stubbed
+    via patch.object(runner, "_stage_bundle", ...) so no real clone/npm runs;
+    the stub drops a verifiable fake bundle into bundles/<digest> exactly the
+    way the real stage would, then asserts the identical flip/attest/rollback
+    behaviour the activate_bundle handler already proves.
+    """
+
+    def _runner(self, base: Path, bundles: Path, current: Path, *, health_exit: int):
+        return RuntimeCommandRunner(
+            ledger=CommandLedger(root=base / "commands"),
+            bundles_dir=bundles,
+            current_link=current,
+            diagnostics_dir=base / "diagnostics",
+            health_command=[sys.executable, "-c", f"raise SystemExit({health_exit})"],
+            service_restart=False,
+        )
+
+    def test_kind_is_registered(self) -> None:
+        from tinyhat_runtime.runtime_commands import ALLOWED_COMMAND_KINDS
+
+        self.assertIn("stage_and_activate_bundle", ALLOWED_COMMAND_KINDS)
+
+    def test_stage_then_flip_then_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _ = _install_bundle_under_id(bundles, base / "previous", marker="prev")
+            current = base / "current"
+            os.symlink(previous, current)
+            holder: dict[str, object] = {}
+
+            def fake_stage(_spec):
+                target, manifest = _install_bundle_under_id(
+                    bundles, base / "staged-src", marker="staged"
+                )
+                holder["target"] = target
+                holder["manifest"] = manifest
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            runner = self._runner(base, bundles, current, health_exit=0)
+            with (
+                patch.object(runner, "_stage_bundle", fake_stage),
+                patch.object(
+                    runner,
+                    "_current_attestation",
+                    lambda: {
+                        "bundle_id": holder["manifest"]["bundle_id"],
+                        "state": "ready",
+                    },
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-stage",
+                        "idempotency_key": "idem-stage",
+                        "kind": "stage_and_activate_bundle",
+                        "spec": dict(_STAGE_SPEC),
+                    }
+                )
+
+            target = holder["target"]
+            manifest = holder["manifest"]
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "attested")
+            self.assertEqual(os.readlink(current), str(target.resolve()))
+            self.assertEqual(result["result"]["bundle_id"], manifest["bundle_id"])
+            self.assertTrue(result["result"]["activation"]["activated"])
+            self.assertFalse(result["result"]["activation"]["rolled_back"])
+            mirror = json.loads(
+                (base / "commands" / "cmd-stage" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["status"], "applied")
+            self.assertEqual(mirror["phase"], "attested")
+
+    def test_health_failure_rolls_back_to_previous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _ = _install_bundle_under_id(bundles, base / "previous", marker="prev")
+            current = base / "current"
+            os.symlink(previous, current)
+            holder: dict[str, object] = {}
+
+            def fake_stage(_spec):
+                target, manifest = _install_bundle_under_id(
+                    bundles, base / "staged-src", marker="candidate"
+                )
+                holder["target"] = target
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            runner = self._runner(base, bundles, current, health_exit=9)  # health FAILS
+            with patch.object(runner, "_stage_bundle", fake_stage):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-stage-rollback",
+                        "idempotency_key": "idem-stage-rollback",
+                        "kind": "stage_and_activate_bundle",
+                        "spec": dict(_STAGE_SPEC),
+                    }
+                )
+
+            target = holder["target"]
+            self.assertEqual(result["status"], "rolled_back")
+            self.assertEqual(result["failure_code"], "activation_failed")
+            # Data-preserving revert: current points back at the PREVIOUS bundle.
+            self.assertEqual(os.readlink(current), str(previous))
+            self.assertNotEqual(os.readlink(current), str(target.resolve()))
+            self.assertTrue(result["result"]["activation"]["rolled_back"])
+            self.assertFalse(result["result"]["activation"]["activated"])
+            mirror = json.loads(
+                (base / "commands" / "cmd-stage-rollback" / "command.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["status"], "rolled_back")
+
+    def test_stage_failure_never_flips_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _ = _install_bundle_under_id(bundles, base / "previous", marker="prev")
+            current = base / "current"
+            os.symlink(previous, current)
+
+            def boom_stage(_spec):
+                raise RuntimeError("git clone failed: bad ref")
+
+            runner = self._runner(base, bundles, current, health_exit=0)
+            with patch.object(runner, "_stage_bundle", boom_stage):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-stage-fail",
+                        "idempotency_key": "idem-stage-fail",
+                        "kind": "stage_and_activate_bundle",
+                        "spec": dict(_STAGE_SPEC),
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "stage")
+            self.assertEqual(result["failure_code"], "bundle_stage_failed")
+            # The whole hard-constraint guarantee: a stage failure never flips.
+            self.assertEqual(os.readlink(current), str(previous))
+
+    def test_missing_spec_field_is_invalid_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _ = _install_bundle_under_id(bundles, base / "previous", marker="prev")
+            current = base / "current"
+            os.symlink(previous, current)
+            runner = self._runner(base, bundles, current, health_exit=0)
+            spec = dict(_STAGE_SPEC)
+            del spec["framework_version"]
+
+            result = runner.execute(
+                {
+                    "command_id": "cmd-bad-spec",
+                    "idempotency_key": "idem-bad-spec",
+                    "kind": "stage_and_activate_bundle",
+                    "spec": spec,
+                }
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_code"], "invalid_command")
+            self.assertEqual(os.readlink(current), str(previous))
+
+    def test_staging_round_trip_stages_digest_without_flip(self) -> None:
+        """staging.stage_bundle with every host hook stubbed (no clone/npm/git)
+        returns the staged bundles/<digest> + bundle_id and never touches
+        current — the composable/injectable contract the verb relies on."""
+        from tinyhat_runtime import staging
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            current = base / "current"
+            holder: dict[str, object] = {}
+
+            def fake_install_stage(*, bundle_out, bundles_dir, current_link, runner):
+                target, manifest = _install_bundle_under_id(
+                    bundles_dir, base / "staged-src", marker="rt"
+                )
+                holder["target"] = target
+                return staging.StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="",
+                    plugin_sha="",
+                    framework_version="",
+                )
+
+            preinstall_calls: list[Path] = []
+            staged = staging.stage_bundle(
+                runtime_ref="v0.16.11",
+                runtime_commit_sha="a" * 40,
+                plugin_ref="v0.9.0",
+                plugin_commit_sha="b" * 40,
+                framework_version="openclaw@2026.6.8",
+                bundles_dir=bundles,
+                current_link=current,
+                clone_hook=lambda **_k: "a" * 40,  # no real git clone
+                install_framework_hook=lambda **_k: "/usr/bin/openclaw",  # no npm
+                assemble_hook=lambda **_k: None,  # no assemble
+                install_stage_hook=fake_install_stage,
+                preinstall_plugins_hook=lambda bd: preinstall_calls.append(bd) or {},
+                warm_config_hook=None,
+            )
+
+            self.assertEqual(staged.bundle_dir, str(holder["target"]))
+            self.assertEqual(staged.runtime_sha, "a" * 40)
+            self.assertEqual(staged.plugin_sha, "b" * 40)
+            self.assertTrue(staged.bundle_id.startswith("sha256:"))
+            self.assertEqual(preinstall_calls, [holder["target"]])
+            # Never flipped current.
+            self.assertFalse(current.exists())
+            self.assertFalse(current.is_symlink())
+
+    def test_verb_staging_is_pure_no_live_plugin_mutation(self) -> None:
+        """The verb's _stage_bundle keeps staging PURE: it must NOT wire the live
+        hot_image plugin preinstall (which mutates the live OpenClaw state dir at
+        the env-default ref, re-owns live trees, applies warm-image config, and
+        rewrites the live marker) or a warm-config hook into staging. So a later
+        activation/attestation failure cannot leave a running Computer drifted --
+        the stage-only / fail-closed boundary raised on the in-place-update
+        review. The plugin is baked into the bundle by assemble (--plugin-ref) at
+        the RESOLVED plugin_commit_sha and delivered by the flip, not installed
+        into live state at the env default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            current = base / "current"
+            runner = self._runner(base, bundles, current, health_exit=0)
+            captured: dict[str, object] = {}
+
+            def spy_stage_bundle(**kwargs):
+                captured.update(kwargs)
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id="sha256:" + "0" * 64,
+                    bundle_dir=str(bundles / "x"),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            with patch("tinyhat_runtime.staging.stage_bundle", spy_stage_bundle):
+                runner._stage_bundle(dict(_STAGE_SPEC))
+
+            # No live-mutating hooks are wired by the verb.
+            self.assertIsNone(captured.get("preinstall_plugins_hook"))
+            self.assertIsNone(captured.get("warm_config_hook"))
+            # The RESOLVED refs are threaded into staging so assemble bakes the
+            # plugin at plugin_commit_sha (not the env default), and the bundle
+            # is content-addressed off the pinned runtime sha.
+            self.assertEqual(
+                captured.get("plugin_commit_sha"), _STAGE_SPEC["plugin_commit_sha"]
+            )
+            self.assertEqual(
+                captured.get("runtime_commit_sha"), _STAGE_SPEC["runtime_commit_sha"]
+            )
+
+    def test_attestation_mismatch_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundles = base / "bundles"
+            bundles.mkdir()
+            previous, _ = _install_bundle_under_id(bundles, base / "previous", marker="prev")
+            current = base / "current"
+            os.symlink(previous, current)
+            holder: dict[str, object] = {}
+
+            def fake_stage(_spec):
+                target, manifest = _install_bundle_under_id(
+                    bundles, base / "staged-src", marker="candidate"
+                )
+                holder["target"] = target
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            runner = self._runner(base, bundles, current, health_exit=0)
+            with (
+                patch.object(runner, "_stage_bundle", fake_stage),
+                # Attestation reports a DIFFERENT bundle_id -> mismatch gate fires.
+                patch.object(
+                    runner,
+                    "_current_attestation",
+                    lambda: {"bundle_id": "sha256:" + "0" * 64, "state": "ready"},
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-attest-mismatch",
+                        "idempotency_key": "idem-attest-mismatch",
+                        "kind": "stage_and_activate_bundle",
+                        "spec": dict(_STAGE_SPEC),
+                    }
+                )
+
+            self.assertEqual(result["status"], "rolled_back")
+            self.assertEqual(result["failure_code"], "attestation_mismatch")
+            self.assertEqual(Path(os.readlink(current)).resolve(), previous.resolve())
+
+    def test_stage_and_activate_never_invokes_rewarm(self) -> None:
+        """Fail-closed boundary: the verb must NOT run the channel rewarm
+        (``rewarm_channels`` -> ``apply_binding_config``), which mutates live
+        OpenClaw state -- the secrets file, the plugin checkout + ``plugins
+        install``, and ``config patch`` against the live config -- ALL OUTSIDE
+        the bundles/<digest> + ``current`` symlink rollback boundary, and is
+        best-effort (it does not gate the flip). Running it before activation
+        could leave a Computer on the OLD ``current`` with NEW app-layer/config
+        if activation or attestation later fails. A pure flip preserves the
+        binding (it lives in the persistent state dirs the flip never touches),
+        exactly like the plain ``_activate_bundle`` verb, which also ships with
+        no rewarm. Proven on BOTH the success and the attestation-rollback paths:
+        rewarm is never invoked, so no out-of-boundary live-state mutation can
+        occur and a rollback of ``current`` cannot strand drifted app state."""
+
+        def fake_stage_factory(base: Path, bundles: Path, holder: dict):
+            def fake_stage(_spec):
+                target, manifest = _install_bundle_under_id(
+                    bundles, base / "staged-src", marker="staged"
+                )
+                holder["target"] = target
+                holder["manifest"] = manifest
+                from tinyhat_runtime.staging import StagedBundle
+
+                return StagedBundle(
+                    bundle_id=manifest["bundle_id"],
+                    bundle_dir=str(target),
+                    runtime_sha="a" * 40,
+                    plugin_sha="b" * 40,
+                    framework_version="openclaw@2026.6.8",
+                )
+
+            return fake_stage
+
+        for case, expected_status in (
+            ("success", "applied"),
+            ("attestation_rollback", "rolled_back"),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                bundles = base / "bundles"
+                bundles.mkdir()
+                previous, _ = _install_bundle_under_id(
+                    bundles, base / "previous", marker="prev"
+                )
+                current = base / "current"
+                os.symlink(previous, current)
+                holder: dict[str, object] = {}
+
+                runner = self._runner(base, bundles, current, health_exit=0)
+                rewarm_calls: list[object] = []
+                # Tripwire: any rewarm invocation is a fail-closed violation.
+                runner.rewarm_channels = lambda *a, **k: rewarm_calls.append(1)
+
+                if case == "success":
+
+                    def attest():
+                        return {
+                            "bundle_id": holder["manifest"]["bundle_id"],
+                            "state": "ready",
+                        }
+
+                else:
+
+                    def attest():
+                        raise RuntimeError("attestation read failed")
+
+                with (
+                    patch.object(
+                        runner, "_stage_bundle", fake_stage_factory(base, bundles, holder)
+                    ),
+                    patch.object(runner, "_current_attestation", attest),
+                ):
+                    result = runner.execute(
+                        {
+                            "command_id": f"cmd-{case}",
+                            "idempotency_key": f"idem-{case}",
+                            "kind": "stage_and_activate_bundle",
+                            "spec": dict(_STAGE_SPEC),
+                        }
+                    )
+
+                self.assertEqual(result["status"], expected_status)
+                # The core invariant: the rewarm (the only out-of-boundary
+                # mutator) is never invoked on EITHER path.
+                self.assertEqual(rewarm_calls, [])
+                if case == "attestation_rollback":
+                    # current rolled back to the OLD bundle; since rewarm never
+                    # ran, no live config/secrets/plugin state drifted from it.
+                    self.assertEqual(
+                        Path(os.readlink(current)).resolve(), previous.resolve()
+                    )
 
 
 if __name__ == "__main__":
