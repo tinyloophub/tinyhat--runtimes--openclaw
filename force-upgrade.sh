@@ -15,14 +15,14 @@
 # fully current in one shot.
 #
 # Usage (on the box, as root):
-#   curl -fsSL https://raw.githubusercontent.com/tinyloophub/tinyhat--runtimes--openclaw/v0.16.9/force-upgrade.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/tinyloophub/tinyhat--runtimes--openclaw/v0.16.10/force-upgrade.sh | sudo bash
 #
 # or, fetched and run with a pinned runtime ref:
-#   sudo TINYHAT_FORCE_UPGRADE_REF=v0.16.9 bash force-upgrade.sh
+#   sudo TINYHAT_FORCE_UPGRADE_REF=v0.16.10 bash force-upgrade.sh
 #
 # Run remotely without copying the file:
 #   gcloud compute ssh <instance> --zone <zone> --tunnel-through-iap --command \
-#     'curl -fsSL https://raw.githubusercontent.com/tinyloophub/tinyhat--runtimes--openclaw/v0.16.9/force-upgrade.sh | sudo bash'
+#     'curl -fsSL https://raw.githubusercontent.com/tinyloophub/tinyhat--runtimes--openclaw/v0.16.10/force-upgrade.sh | sudo bash'
 #
 # Platform / OpenClaw / plugin config (base URL, identity audience, framework
 # version, plugin ref) is read from the box's own GCE metadata, just like the
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 REPO_URL="${TINYHAT_FORCE_UPGRADE_REPO_URL:-https://github.com/tinyloophub/tinyhat--runtimes--openclaw.git}"
-REF="${TINYHAT_FORCE_UPGRADE_REF:-v0.16.9}"
+REF="${TINYHAT_FORCE_UPGRADE_REF:-v0.16.10}"
 
 log() { echo "[force-upgrade] $*"; }
 fail() { echo "[force-upgrade] ERROR: $*" >&2; exit 1; }
