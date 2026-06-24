@@ -561,6 +561,12 @@ class RuntimeCommandRunner:
             rebound_ok = self._rebind_gateway_for_env_block(
                 command_id=command_id, result_payload=result_payload
             )
+            if rebound_ok:
+                # Record the env now live in the restarted gateway ONLY after a
+                # confirmed stop+start+health. Until this is written, a retry
+                # keeps rebinding even though config.env already matches desired
+                # (a failed rebind must not look "done").
+                openclaw_adapter.write_rebound_env_marker(secrets)
             rebind = result_payload.get("gateway_rebind") or {}
             # Point at the lifecycle step that actually failed for diagnostics.
             fail_phase = "stop_gateway" if not rebind.get("stopped") else "start_gateway"

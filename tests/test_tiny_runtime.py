@@ -3957,6 +3957,7 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "openclaw.json"
             config_path.write_text(json.dumps({"env": {"OLD_KEY": "stale"}}))
+            marker_path = Path(tmp) / "marker.json"  # never rebound
             seen: dict[str, object] = {}
 
             def runner(argv, **kwargs):
@@ -3968,6 +3969,7 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 {"EXA_API_KEY": "exa-123", "OPENAI_API_KEY": "sk-openai"},
                 runner=runner,
                 config_path=config_path,
+                marker_path=marker_path,
             )
 
             self.assertTrue(result["env_block_changed"])
@@ -3980,12 +3982,17 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
             # OPENAI_API_KEY excluded; OLD_KEY dropped by replace semantics
             self.assertEqual(payload, {"env": {"EXA_API_KEY": "exa-123"}})
 
-    def test_apply_runtime_secret_env_block_noop_when_unchanged(self) -> None:
+    def test_apply_runtime_secret_env_block_noop_when_already_rebound(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "openclaw.json"
             config_path.write_text(json.dumps({"env": {"EXA_API_KEY": "exa-123"}}))
+            marker_path = Path(tmp) / "marker.json"
+            # the gateway was already successfully rebound on this exact env
+            openclaw_adapter.write_rebound_env_marker(
+                {"EXA_API_KEY": "exa-123"}, marker_path=marker_path
+            )
             calls: list = []
 
             def runner(argv, **_kwargs):
@@ -3996,16 +4003,58 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 {"EXA_API_KEY": "exa-123"},
                 runner=runner,
                 config_path=config_path,
+                marker_path=marker_path,
             )
 
-            self.assertFalse(result["env_block_changed"])
-            self.assertEqual(calls, [])  # no CLI write when nothing changed
+            self.assertFalse(result["env_block_changed"])  # no rebind needed
+            self.assertEqual(calls, [])  # config already matches -> no CLI write
+
+    def test_apply_runtime_secret_env_block_requires_rebind_until_marker_written(
+        self,
+    ) -> None:
+        # The retry path: config.env already matches desired (a prior apply wrote
+        # it) but the rebind FAILED, so no marker was recorded. The next apply
+        # must STILL report a rebind is needed even though the file matches —
+        # otherwise the stale gateway env is never refreshed.
+        from tinyhat_runtime import openclaw_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "openclaw.json"
+            config_path.write_text(json.dumps({"env": {"EXA_API_KEY": "exa-123"}}))
+            marker_path = Path(tmp) / "marker.json"  # rebind failed -> never written
+            calls: list = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            result = openclaw_adapter.apply_runtime_secret_env_block(
+                {"EXA_API_KEY": "exa-123"},
+                runner=runner,
+                config_path=config_path,
+                marker_path=marker_path,
+            )
+            self.assertTrue(result["env_block_changed"])  # rebind still needed
+            self.assertEqual(calls, [])  # config already matches -> no redundant patch
+
+            # ...and once a successful rebind records the marker, it settles.
+            openclaw_adapter.write_rebound_env_marker(
+                {"EXA_API_KEY": "exa-123"}, marker_path=marker_path
+            )
+            settled = openclaw_adapter.apply_runtime_secret_env_block(
+                {"EXA_API_KEY": "exa-123"},
+                runner=runner,
+                config_path=config_path,
+                marker_path=marker_path,
+            )
+            self.assertFalse(settled["env_block_changed"])
 
     def test_apply_runtime_secret_env_block_dry_run_never_writes(self) -> None:
         from tinyhat_runtime import openclaw_adapter
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "openclaw.json"  # absent -> current env {}
+            marker_path = Path(tmp) / "marker.json"  # never rebound
             calls: list = []
 
             def runner(argv, **_kwargs):
@@ -4017,6 +4066,7 @@ class OpenClawAdapterBoundaryTests(unittest.TestCase):
                 dry_run=True,
                 runner=runner,
                 config_path=config_path,
+                marker_path=marker_path,
             )
 
             self.assertTrue(result["env_block_changed"])  # would change
