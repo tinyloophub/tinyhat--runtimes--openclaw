@@ -7,6 +7,8 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.12
+
 Adds a forward-version channel for running Computers: the new
 `stage_and_activate_bundle` Command Ledger verb stages a NEW
 content-addressed bundle from resolved git refs (`runtime_ref` /
