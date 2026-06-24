@@ -7,6 +7,8 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.11
+
 Restores arbitrary user secrets (for example `EXA_API_KEY`) in the agent's
 shell. `apply_config` now mirrors user runtime secrets into OpenClaw's config
 `env` block via the official `openclaw config patch --replace-path env` and
