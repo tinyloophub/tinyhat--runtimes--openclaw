@@ -87,6 +87,121 @@ PY
   echo "[dev-entrypoint] tiny_runtime bundle installed: $(cat /tmp/tinyhat-dev-bundle-install.json)"
 }
 
+install_dev_systemctl_shim() {
+  # tiny_runtime's gateway-control verbs (the secret-apply rebind that makes a
+  # newly-saved user secret reach the agent's exec shell, plus force-upgrade)
+  # stop/start the gateway via `systemctl`, which assumes systemd. A plain
+  # Docker dev container has no systemd, so those calls ENOENT and the
+  # secret-apply rebind can never advance applied_config_revision -> the
+  # "✅ <NAME> is now available on your Computer" confirmation never fires (a
+  # real systemd Computer completes it). Emulate just the gateway unit's
+  # stop/start/restart as plain process management (procps-free: /proc scan +
+  # kill, setsid relaunch) so the dev container behaves like a systemd
+  # Computer for the one operation that needs a real gateway restart. Every
+  # other systemctl call is a dev no-op. The match is deliberately narrow
+  # (argv0 python* AND "-m tinyhat_runtime.main gateway run"), and PID 1 / the
+  # shim itself are never targeted, so it cannot kill the entrypoint.
+  cat > /usr/local/bin/systemctl <<'SYSTEMCTL_SHIM'
+#!/usr/bin/env bash
+set -uo pipefail
+action="${1:-}"
+unit="${2:-}"
+log="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}/openclaw-gateway.log"
+# Tunable so a focused test can use short windows; defaults emulate systemd's
+# stop grace before SIGKILL.
+term_secs="${TINYHAT_DEV_GATEWAY_STOP_TERM_SECONDS:-10}"
+kill_secs="${TINYHAT_DEV_GATEWAY_STOP_KILL_SECONDS:-5}"
+# Overridable so a test can match a fake gateway process; real default is the
+# tiny_runtime gateway command.
+gw_match="${TINYHAT_DEV_GATEWAY_MATCH_SUBSTR:--m tinyhat_runtime.main gateway run}"
+
+_is_gateway() {
+  case "$1" in
+    python*"$gw_match"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A process counts as "alive" only if /proc/<pid> exists AND it is not a zombie.
+# Liveness is read from /proc state, NOT `kill -0`: `kill -0` cannot distinguish
+# "gone" (ESRCH) from "exists but we may not signal it" (EPERM), and it also
+# succeeds for a zombie. A zombie (state Z) has exited but is not yet reaped, so
+# it counts as gone. /proc/<pid>/stat is world-readable, so this is correct even
+# for a process the shim cannot signal.
+_is_alive() {
+  _st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  case "${_st##*) }" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Block until $1 is gone (truly exited or a zombie), polling every 0.2s up to
+# $2 seconds. Returns 0 if gone, 1 on timeout.
+_wait_gone() {
+  _pid="$1"
+  _iters=$(( $2 * 5 ))
+  _i=0
+  while _is_alive "$_pid"; do
+    [ "$_i" -ge "$_iters" ] && return 1
+    sleep 0.2
+    _i=$(( _i + 1 ))
+  done
+  return 0
+}
+
+# Stop like `systemctl stop`: block until every matched gateway PID is actually
+# gone (SIGTERM, bounded wait, then SIGKILL), and return non-zero if one cannot
+# be signalled or reaped. A non-blocking "send TERM and exit 0" stop would let
+# the rebind's start + health-check pass against the still-alive old gateway and
+# falsely mark the new env block applied.
+_stop_gateway() {
+  self=$$
+  rc=0
+  for d in /proc/[0-9]*; do
+    pid="${d##*/}"
+    [ "$pid" = "1" ] && continue
+    [ "$pid" = "$self" ] && continue
+    [ -r "${d}/cmdline" ] || continue
+    cmd=$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)
+    _is_gateway "$cmd" || continue
+    if ! kill -TERM "$pid" 2>/dev/null; then
+      # SIGTERM failed: the process is either gone (ESRCH) or exists but cannot
+      # be signalled (EPERM). `kill -0` cannot tell those apart, so use /proc
+      # state: a still-present, non-zombie match means we could not stop it.
+      _is_alive "$pid" && rc=1
+      continue
+    fi
+    if ! _wait_gone "$pid" "$term_secs"; then
+      # Ignored or slow SIGTERM -> escalate to SIGKILL, then confirm gone.
+      kill -KILL "$pid" 2>/dev/null || true
+      _wait_gone "$pid" "$kill_secs" || rc=1
+    fi
+  done
+  return "$rc"
+}
+
+_start_gateway() {
+  setsid bash -c "exec python3 -m tinyhat_runtime.main gateway run >>'${log}' 2>&1" \
+    </dev/null >/dev/null 2>&1 &
+}
+
+rc=0
+case "${unit%.service}" in
+  tinyhat-runtime-gateway)
+    case "${action}" in
+      stop) _stop_gateway; rc=$? ;;
+      start) _start_gateway; rc=$? ;;
+      restart) _stop_gateway && _start_gateway; rc=$? ;;
+    esac
+    ;;
+esac
+exit "$rc"
+SYSTEMCTL_SHIM
+  chmod 0755 /usr/local/bin/systemctl
+  echo "[dev-entrypoint] installed dev systemctl shim for gateway control"
+}
+
 if [[ "${TINYHAT_PRIVATE_ACCESS_PROVIDER:-}" == "tailscale" ]]; then
   mkdir -p "${PRIVATE_ACCESS_STATUS_DIR}"
   if [[ -n "${TINYHAT_TAILSCALE_AUTH_KEY_FILE:-}" \
@@ -167,6 +282,7 @@ if [[ "${runtime_mode}" == "tiny_runtime" ]]; then
   prepare_tiny_runtime_bundle
   export PYTHONPATH="${TINY_RUNTIME_BUNDLE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
   export TINYHAT_RUNTIME_NO_SERVICE_RESTART="${TINYHAT_RUNTIME_NO_SERVICE_RESTART:-1}"
+  install_dev_systemctl_shim
   exec gosu tinyhat bash -lc '
     set -euo pipefail
     runtime_home="${TINYHAT_RUNTIME_HOME:-/home/tinyhat/runtime}"
