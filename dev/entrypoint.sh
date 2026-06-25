@@ -122,12 +122,13 @@ _is_gateway() {
   esac
 }
 
-# A process counts as "alive" only if it exists AND is not a zombie. A zombie
-# has already exited but has not been reaped by its parent; the gateway it was
-# is no longer serving, so it counts as gone. `kill -0` alone returns success
-# for a zombie, which would otherwise make the stop hang or falsely fail.
+# A process counts as "alive" only if /proc/<pid> exists AND it is not a zombie.
+# Liveness is read from /proc state, NOT `kill -0`: `kill -0` cannot distinguish
+# "gone" (ESRCH) from "exists but we may not signal it" (EPERM), and it also
+# succeeds for a zombie. A zombie (state Z) has exited but is not yet reaped, so
+# it counts as gone. /proc/<pid>/stat is world-readable, so this is correct even
+# for a process the shim cannot signal.
 _is_alive() {
-  kill -0 "$1" 2>/dev/null || return 1
   _st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
   case "${_st##*) }" in
     Z*) return 1 ;;
@@ -165,8 +166,10 @@ _stop_gateway() {
     cmd=$(tr '\0' ' ' < "${d}/cmdline" 2>/dev/null)
     _is_gateway "$cmd" || continue
     if ! kill -TERM "$pid" 2>/dev/null; then
-      # Couldn't signal it; if it's still present that is a failed stop.
-      kill -0 "$pid" 2>/dev/null && rc=1
+      # SIGTERM failed: the process is either gone (ESRCH) or exists but cannot
+      # be signalled (EPERM). `kill -0` cannot tell those apart, so use /proc
+      # state: a still-present, non-zombie match means we could not stop it.
+      _is_alive "$pid" && rc=1
       continue
     fi
     if ! _wait_gone "$pid" "$term_secs"; then

@@ -13,6 +13,7 @@ Usage (from the repo root):
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -138,6 +139,43 @@ class SystemctlShimStopTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(proc.poll(), "no-op systemctl call must not stop the fake")
+
+    @unittest.skipUnless(
+        os.geteuid() == 0 and shutil.which("runuser") is not None,
+        "EPERM case needs root to start a privileged process + runuser to drop to nobody",
+    )
+    def test_stop_fails_when_it_cannot_signal_a_live_match(self) -> None:
+        # The fake runs as root (this test runs as root); the shim runs as
+        # `nobody`, which cannot SIGTERM the root process (EPERM). The stop must
+        # report failure (non-zero) and the gateway must remain alive -- never a
+        # false success while the stale gateway is still serving.
+        body = (
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)"
+        )
+        proc = self._spawn_fake(body)
+        result = subprocess.run(
+            [
+                "runuser", "-u", "nobody", "--", "env",
+                f"TINYHAT_DEV_GATEWAY_MATCH_SUBSTR={MARKER}",
+                "TINYHAT_DEV_GATEWAY_STOP_TERM_SECONDS=1",
+                "TINYHAT_DEV_GATEWAY_STOP_KILL_SECONDS=1",
+                self._shim_path, "stop", "tinyhat-runtime-gateway.service",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "stop must fail when it cannot signal a live matched gateway (EPERM)",
+        )
+        self.assertIsNone(
+            proc.poll(),
+            "the unsignallable gateway must still be alive after the failed stop",
+        )
 
 
 if __name__ == "__main__":
