@@ -7,6 +7,25 @@ runtime's published `VERSION` on each new Computer row.
 
 ## Unreleased
 
+## 0.16.13
+
+Dev-only fix. A plain Docker `dev/` container has no systemd, but the
+gateway-control verbs — the secret-apply rebind that makes a newly-saved user
+secret reach the agent's exec shell, and force-upgrade — stop/start the gateway
+via `systemctl`, which ENOENTs there. So a config apply that needs a gateway
+restart never completed: `applied_config_revision` stayed behind the desired
+revision and the owner-facing "now available on your Computer" confirmation
+never fired. The dev entrypoint now installs a narrow, dev-only `systemctl`
+shim that emulates only the gateway unit's `stop`/`start`/`restart` as plain
+process management. The shim blocks until the gateway has actually exited
+(SIGTERM → bounded wait → SIGKILL), reports failure if a matched process cannot
+be reaped, reads liveness from `/proc/<pid>/stat` (so a zombie counts as gone
+and a process that exists but cannot be signalled is never mistaken for
+stopped), and never targets PID 1 or itself. Production Computers run real
+systemd and are unaffected — they never see the shim. Adds a Linux-only test
+harness pinning the stop contract (delayed-exit, ignored-SIGTERM → SIGKILL,
+EPERM-fails-stop, unrelated-unit no-op). (#170)
+
 ## 0.16.12
 
 Adds a forward-version channel for running Computers: the new
