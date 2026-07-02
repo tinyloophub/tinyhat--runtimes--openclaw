@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Shell syntax
-        run: bash -n bootstrap.sh dev/entrypoint.sh tiny_runtime/install.sh tiny_runtime/bake/assemble-bundle.sh tiny_runtime/bake/verify-bundle.sh tiny_runtime/dev/entrypoint.sh tiny_runtime/dev/fake-openclaw
+        run: bash -n bootstrap.sh dev/entrypoint.sh scripts/openclaw-hermes-takeover.sh tiny_runtime/install.sh tiny_runtime/bake/assemble-bundle.sh tiny_runtime/bake/verify-bundle.sh tiny_runtime/dev/entrypoint.sh tiny_runtime/dev/fake-openclaw
       - name: Byte-compile
         run: python -m compileall -q supervisor.py tinyhat_cli tiny_runtime
       - name: Characterization net

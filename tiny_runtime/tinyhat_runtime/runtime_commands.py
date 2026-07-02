@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-import shlex
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -46,8 +44,6 @@ ALLOWED_COMMAND_KINDS = frozenset(
         "force_backup",
         "force_update",
         "force_recover",
-        "prepare_hermes_migration",
-        "install_hermes_takeover",
     }
 )
 FAILURE_CODES = frozenset(
@@ -74,8 +70,6 @@ FAILURE_CODES = frozenset(
         "resume_failed",
         "rollback_failed",
         "stop_failed",
-        "hermes_takeover_failed",
-        "identity_not_found",
         "tinyhat_plugin_failed",
         "unsupported_kind",
     }
@@ -288,10 +282,6 @@ class RuntimeCommandRunner:
                 return self._force_update(command)
             if kind == "force_recover":
                 return self._force_recover(command)
-            if kind == "prepare_hermes_migration":
-                return self._prepare_hermes_migration(command)
-            if kind == "install_hermes_takeover":
-                return self._install_hermes_takeover(command)
         except (bundle.BundleVerificationError, RuntimeCommandError) as exc:
             return self._finish(
                 command_id=command_id,
@@ -1450,203 +1440,6 @@ class RuntimeCommandRunner:
             result=result_payload,
         )
 
-    # ── OpenClaw -> Hermes migration ───────────────────────────────────
-
-    def _migration_dir(self, command_id: str) -> Path:
-        return paths.MIGRATION_ROOT / "openclaw-to-hermes" / command_id
-
-    def _ensure_private_migration_dir(self, migration_dir: Path) -> None:
-        migration_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            migration_dir.chmod(0o700)
-        except OSError:
-            pass
-
-    def _write_migration_manifest(
-        self,
-        *,
-        command_id: str,
-        migration_dir: Path,
-        backup_path: Path | None,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        self._ensure_private_migration_dir(migration_dir)
-        manifest = {
-            "schema": "tinyhat_openclaw_to_hermes_migration_manifest_v1",
-            "command_id": command_id,
-            "created_at": utc_now_iso(),
-            "openclaw_state_dir": str(paths.OPENCLAW_STATE_DIR),
-            "openclaw_config_path": str(paths.OPENCLAW_CONFIG_PATH),
-            "openclaw_secrets_path": str(paths.OPENCLAW_SECRETS_PATH),
-            "backup_path": str(backup_path) if backup_path is not None else None,
-            "backup_sha256": _sha256_file(backup_path) if backup_path else None,
-            "payload": payload,
-        }
-        manifest_path = migration_dir / "manifest.json"
-        safe_manifest = redact_json(manifest)
-        manifest_path.write_text(
-            json.dumps(safe_manifest, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return {"path": str(manifest_path), "manifest": safe_manifest}
-
-    def _prepare_hermes_migration(self, command: dict[str, Any]) -> dict[str, Any]:
-        command_id, idempotency_key, kind = _ids(command)
-        migration_dir = self._migration_dir(command_id)
-        result_payload: dict[str, Any] = {
-            "migration_dir": str(migration_dir),
-            "openclaw_state_dir": str(paths.OPENCLAW_STATE_DIR),
-        }
-
-        self.ledger.update(command_id, status="running", phase="stop_gateway")
-        stopped_ok, stop_detail = launcher._run_command(
-            self._gateway_stop_command(), timeout=60
-        )
-        health = openclaw_adapter.gateway_health()
-        gateway_down = str(health.get("state") or "") != "healthy"
-        result_payload["stop"] = {
-            "stopped": bool(stopped_ok),
-            "gateway_down": gateway_down,
-            "gateway_health": health,
-            "detail": redact_text(stop_detail, limit=500),
-        }
-        if not (stopped_ok and gateway_down):
-            return self._finish(
-                command_id=command_id,
-                idempotency_key=idempotency_key,
-                kind=kind,
-                status="failed",
-                phase="stop_gateway",
-                failure_code="stop_failed",
-                result=result_payload,
-            )
-
-        self.ledger.update(command_id, status="running", phase="backup")
-        self._ensure_private_migration_dir(migration_dir)
-        backup_path = migration_dir / "openclaw-backup.tar.gz"
-        backup_result = openclaw_adapter.backup_create(output_path=backup_path)
-        result_payload["backup"] = backup_result
-        result_payload["backup_path"] = str(backup_path)
-        if backup_result.get("state") != "ready":
-            return self._finish(
-                command_id=command_id,
-                idempotency_key=idempotency_key,
-                kind=kind,
-                status="failed",
-                phase="backup",
-                failure_code="backup_failed",
-                result=result_payload,
-            )
-
-        self.ledger.update(command_id, status="running", phase="manifest")
-        result_payload["manifest"] = self._write_migration_manifest(
-            command_id=command_id,
-            migration_dir=migration_dir,
-            backup_path=backup_path,
-            payload=result_payload,
-        )
-        return self._finish(
-            command_id=command_id,
-            idempotency_key=idempotency_key,
-            kind=kind,
-            status="applied",
-            phase="backup_ready",
-            result=result_payload,
-        )
-
-    def _install_hermes_takeover(self, command: dict[str, Any]) -> dict[str, Any]:
-        spec = _spec(command)
-        command_id, idempotency_key, kind = _ids(command)
-        identity_doc = load_identity_document()
-        platform_url = _string_or_default(
-            spec,
-            "platform_url",
-            str(identity_doc.get("platform_base_url") or ""),
-        )
-        computer_id = _string_or_default(
-            spec,
-            "computer_id",
-            str(identity_doc.get("computer_id") or ""),
-        )
-        if not platform_url or not computer_id:
-            return self._finish(
-                command_id=command_id,
-                idempotency_key=idempotency_key,
-                kind=kind,
-                status="failed",
-                phase="identity",
-                failure_code="identity_not_found",
-                result={
-                    "detail": "platform_url and computer_id are required for Hermes takeover",
-                    "identity": identity_doc,
-                },
-            )
-        installer_ref = _string_or_default(spec, "installer_ref", "channels/lts")
-        # The override is a dev/test seam; production callers should use the
-        # public Hermes runtime installer URL derived from the requested ref.
-        installer_url = _string_or_default(
-            spec,
-            "installer_url",
-            (
-                "https://raw.githubusercontent.com/"
-                f"tinyloophub/tinyhat--runtimes--hermes/{installer_ref}/install.sh"
-            ),
-        )
-        local_dev_token = _string_or_default(spec, "local_dev_token", "")
-        run_foreground = bool(spec.get("run_foreground") or local_dev_token)
-
-        install_args = [
-            "--ref",
-            installer_ref,
-            "--platform-url",
-            platform_url,
-            "--computer-id",
-            computer_id,
-        ]
-        if local_dev_token:
-            install_args.extend(["--local-dev-token", local_dev_token])
-        if run_foreground:
-            install_args.append("--run-foreground")
-
-        shell_args = " ".join(_shell_quote(arg) for arg in install_args)
-        script = f"""
-set -euo pipefail
-curl -fsSL {_shell_quote(installer_url)} | bash -s -- {shell_args}
-if command -v systemctl >/dev/null 2>&1; then
-  legacy_runtime_units="tinyhat-runtime-gateway.service tinyhat-runtime-attestation.service"
-  systemctl disable --now ${{legacy_runtime_units}} 2>/dev/null || true
-  systemctl disable tinyhat-runtime-platform.service 2>/dev/null || true
-  # Stop the command loop only after this command has had time to report success.
-  if command -v systemd-run >/dev/null 2>&1; then
-    systemd-run --unit=tinyhat-runtime-platform-stop-after-hermes --on-active=30s --collect \\
-      /bin/systemctl stop tinyhat-runtime-platform.service >/dev/null 2>&1 || true
-  else
-    nohup sh -c 'sleep 30; systemctl stop tinyhat-runtime-platform.service' \\
-      >/dev/null 2>&1 &
-  fi
-fi
-""".strip()
-        self.ledger.update(command_id, status="running", phase="install_hermes")
-        ok, detail = launcher._run_command(("bash", "-lc", script), timeout=30 * 60)
-        result_payload = {
-            "installer_ref": installer_ref,
-            "installer_url": installer_url,
-            "platform_url": platform_url,
-            "computer_id": computer_id,
-            "local_dev": bool(local_dev_token),
-            "run_foreground": run_foreground,
-            "detail": redact_text(detail, limit=1000),
-        }
-        return self._finish(
-            command_id=command_id,
-            idempotency_key=idempotency_key,
-            kind=kind,
-            status="applied" if ok else "failed",
-            phase="hermes_installer_started" if ok else "install_hermes",
-            failure_code=None if ok else "hermes_takeover_failed",
-            result=result_payload,
-        )
-
     def _enroll_private_access(self, command: dict[str, Any]) -> dict[str, Any]:
         command_id, idempotency_key, kind = _ids(command)
         if self.platform_get_json is None:
@@ -1837,27 +1630,6 @@ def _required_string(spec: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise RuntimeCommandError(f"spec.{key} is required")
     return value
-
-
-def _string_or_default(spec: dict[str, Any], key: str, default: str) -> str:
-    value = spec.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return default.strip()
-
-
-def _shell_quote(value: str) -> str:
-    return shlex.quote(str(value))
-
-
-def _sha256_file(path: Path | None) -> str | None:
-    if path is None or not path.exists() or not path.is_file():
-        return None
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _required_int(spec: dict[str, Any], key: str) -> int:

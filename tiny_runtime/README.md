@@ -28,10 +28,7 @@ runtime. The stable contract is:
   on-box listing/querying;
 - execute only the closed runtime command set:
   `activate_bundle`, `rollback_bundle`, `export_diagnostics`,
-  `apply_config`, `link_chatgpt`, `rebuild_app_layer`, `enroll_private_access`,
-  `force_stop`, `force_resume`, `force_backup`, `force_update`,
-  `force_recover`, `prepare_hermes_migration`, and
-  `install_hermes_takeover`.
+  `apply_config`, `link_chatgpt`, and `rebuild_app_layer`.
 
 Bundle verification proves the local files match the declared manifest and
 bundle id. It is not a signature system; production promotion should still pin
@@ -40,8 +37,7 @@ the expected bundle id from a trusted build.
 Non-goals:
 
 - no platform default flip;
-- no arbitrary Computer migration shell; Hermes migration is limited to the
-  typed `prepare_hermes_migration` and `install_hermes_takeover` commands;
+- no Computer migration path;
 - no product-specific logic inside the runtime.
 
 ## Command ledger
