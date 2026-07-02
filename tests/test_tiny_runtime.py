@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import io
 import importlib
 import json
@@ -42,6 +43,7 @@ from tinyhat_runtime import (  # noqa: E402
     platform_client,
     platform_loop,
     private_access,
+    runtime_commands,
     subscription_link,
 )
 from tinyhat_runtime.command_ledger import CommandLedger  # noqa: E402
@@ -762,6 +764,101 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
                 )
             )
             self.assertEqual(mirror["status"], "canceled")
+
+    def test_prepare_hermes_migration_stops_and_backs_up_openclaw(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            backup_calls: list[Path] = []
+
+            def fake_backup_create(*, output_path: Path) -> dict:
+                backup_calls.append(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"backup")
+                return {"state": "ready", "size_bytes": 6}
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                stop_command=["true"],
+                service_restart=False,
+            )
+            with (
+                patch.object(runtime_commands.paths, "MIGRATION_ROOT", base / "migrations"),
+                patch.object(launcher, "_run_command", return_value=(True, "stopped")),
+                patch.object(
+                    openclaw_adapter,
+                    "gateway_health",
+                    return_value={"state": "stopped"},
+                ),
+                patch.object(openclaw_adapter, "backup_create", fake_backup_create),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-hermes-prepare",
+                        "idempotency_key": "idem-hermes-prepare",
+                        "kind": "prepare_hermes_migration",
+                        "spec": {},
+                    }
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "backup_ready")
+            self.assertEqual(len(backup_calls), 1)
+            manifest_path = (
+                base
+                / "migrations"
+                / "openclaw-to-hermes"
+                / "cmd-hermes-prepare"
+                / "manifest.json"
+            )
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["backup_sha256"], hashlib.sha256(b"backup").hexdigest())
+
+    def test_install_hermes_takeover_runs_public_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run_command(command: tuple[str, ...], *, timeout: int) -> tuple[bool, str]:
+                calls.append(tuple(command))
+                self.assertEqual(timeout, 30 * 60)
+                return True, "ok"
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+            with (
+                patch.object(
+                    runtime_commands,
+                    "load_identity_document",
+                    return_value={
+                        "platform_base_url": "https://tinyloop.example",
+                        "computer_id": 42,
+                    },
+                ),
+                patch.object(launcher, "_run_command", fake_run_command),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-hermes-takeover",
+                        "idempotency_key": "idem-hermes-takeover",
+                        "kind": "install_hermes_takeover",
+                        "spec": {"installer_ref": "v0.0.30"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(result["phase"], "hermes_installer_started")
+            self.assertEqual(calls[0][:2], ("bash", "-lc"))
+            script = calls[0][2]
+            self.assertIn("tinyhat--runtimes--hermes/v0.0.30/install.sh", script)
+            self.assertIn("--platform-url https://tinyloop.example", script)
+            self.assertIn("--computer-id 42", script)
 
     def test_invalid_command_id_returns_failed_without_raising(self) -> None:
         # A legacy/malformed platform command (e.g. the type-based
