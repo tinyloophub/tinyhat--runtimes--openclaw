@@ -74,7 +74,6 @@ FAILURE_CODES = frozenset(
         "resume_failed",
         "rollback_failed",
         "stop_failed",
-        "hermes_migration_prepare_failed",
         "hermes_takeover_failed",
         "identity_not_found",
         "tinyhat_plugin_failed",
@@ -1456,6 +1455,13 @@ class RuntimeCommandRunner:
     def _migration_dir(self, command_id: str) -> Path:
         return paths.MIGRATION_ROOT / "openclaw-to-hermes" / command_id
 
+    def _ensure_private_migration_dir(self, migration_dir: Path) -> None:
+        migration_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            migration_dir.chmod(0o700)
+        except OSError:
+            pass
+
     def _write_migration_manifest(
         self,
         *,
@@ -1464,11 +1470,7 @@ class RuntimeCommandRunner:
         backup_path: Path | None,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        migration_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            migration_dir.chmod(0o700)
-        except OSError:
-            pass
+        self._ensure_private_migration_dir(migration_dir)
         manifest = {
             "schema": "tinyhat_openclaw_to_hermes_migration_manifest_v1",
             "command_id": command_id,
@@ -1520,7 +1522,7 @@ class RuntimeCommandRunner:
             )
 
         self.ledger.update(command_id, status="running", phase="backup")
-        migration_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_migration_dir(migration_dir)
         backup_path = migration_dir / "openclaw-backup.tar.gz"
         backup_result = openclaw_adapter.backup_create(output_path=backup_path)
         result_payload["backup"] = backup_result
@@ -1580,6 +1582,8 @@ class RuntimeCommandRunner:
                 },
             )
         installer_ref = _string_or_default(spec, "installer_ref", "channels/lts")
+        # The override is a dev/test seam; production callers should use the
+        # public Hermes runtime installer URL derived from the requested ref.
         installer_url = _string_or_default(
             spec,
             "installer_url",
@@ -1607,13 +1611,20 @@ class RuntimeCommandRunner:
         shell_args = " ".join(_shell_quote(arg) for arg in install_args)
         script = f"""
 set -euo pipefail
-if command -v systemctl >/dev/null 2>&1; then
-  legacy_prefix=tinyhat-openclaw
-  legacy_units="${{legacy_prefix}}-gateway.service ${{legacy_prefix}}.service"
-  systemctl stop ${{legacy_units}} 2>/dev/null || true
-  systemctl disable ${{legacy_units}} 2>/dev/null || true
-fi
 curl -fsSL {_shell_quote(installer_url)} | bash -s -- {shell_args}
+if command -v systemctl >/dev/null 2>&1; then
+  legacy_runtime_units="tinyhat-runtime-gateway.service tinyhat-runtime-attestation.service"
+  systemctl disable --now ${{legacy_runtime_units}} 2>/dev/null || true
+  systemctl disable tinyhat-runtime-platform.service 2>/dev/null || true
+  # Stop the command loop only after this command has had time to report success.
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --unit=tinyhat-runtime-platform-stop-after-hermes --on-active=30s --collect \\
+      /bin/systemctl stop tinyhat-runtime-platform.service >/dev/null 2>&1 || true
+  else
+    nohup sh -c 'sleep 30; systemctl stop tinyhat-runtime-platform.service' \\
+      >/dev/null 2>&1 &
+  fi
+fi
 """.strip()
         self.ledger.update(command_id, status="running", phase="install_hermes")
         ok, detail = launcher._run_command(("bash", "-lc", script), timeout=30 * 60)

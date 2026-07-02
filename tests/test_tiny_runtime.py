@@ -771,6 +771,8 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             backup_calls: list[Path] = []
 
             def fake_backup_create(*, output_path: Path) -> dict:
+                mode = output_path.parent.stat().st_mode & 0o777
+                self.assertEqual(mode, 0o700)
                 backup_calls.append(output_path)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_bytes(b"backup")
@@ -859,6 +861,135 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
             self.assertIn("tinyhat--runtimes--hermes/v0.0.30/install.sh", script)
             self.assertIn("--platform-url https://tinyloop.example", script)
             self.assertIn("--computer-id 42", script)
+            self.assertIn("tinyhat-runtime-gateway.service", script)
+            self.assertIn("tinyhat-runtime-platform.service", script)
+            self.assertIn("tinyhat-runtime-attestation.service", script)
+            self.assertNotIn("tinyhat-openclaw", script)
+            self.assertLess(
+                script.index("curl -fsSL"),
+                script.index("systemctl disable --now"),
+            )
+            self.assertIn(
+                "systemd-run --unit=tinyhat-runtime-platform-stop-after-hermes",
+                script,
+            )
+
+    def test_install_hermes_takeover_reports_identity_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            calls: list[tuple[str, ...]] = []
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+            with (
+                patch.object(runtime_commands, "load_identity_document", return_value={}),
+                patch.object(
+                    launcher,
+                    "_run_command",
+                    lambda command, *, timeout: calls.append(tuple(command)) or (True, "ok"),
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-hermes-takeover-no-identity",
+                        "idempotency_key": "idem-hermes-takeover-no-identity",
+                        "kind": "install_hermes_takeover",
+                        "spec": {},
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "identity")
+            self.assertEqual(result["failure_code"], "identity_not_found")
+            self.assertEqual(calls, [])
+
+    def test_install_hermes_takeover_reports_installer_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+            with (
+                patch.object(
+                    runtime_commands,
+                    "load_identity_document",
+                    return_value={
+                        "platform_base_url": "https://tinyloop.example",
+                        "computer_id": 42,
+                    },
+                ),
+                patch.object(
+                    launcher,
+                    "_run_command",
+                    return_value=(False, "curl failed with sk-1234567890abcdef"),
+                ),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-hermes-takeover-fails",
+                        "idempotency_key": "idem-hermes-takeover-fails",
+                        "kind": "install_hermes_takeover",
+                        "spec": {"installer_ref": "v0.0.30"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["phase"], "install_hermes")
+            self.assertEqual(result["failure_code"], "hermes_takeover_failed")
+            self.assertIn("curl failed", result["result"]["detail"])
+            self.assertNotIn("sk-1234567890abcdef", result["result"]["detail"])
+
+    def test_install_hermes_takeover_local_dev_forces_foreground(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run_command(command: tuple[str, ...], *, timeout: int) -> tuple[bool, str]:
+                calls.append(tuple(command))
+                return True, "ok"
+
+            runner = RuntimeCommandRunner(
+                ledger=CommandLedger(root=base / "commands"),
+                current_link=base / "current",
+                diagnostics_dir=base / "diagnostics",
+                service_restart=False,
+            )
+            with (
+                patch.object(
+                    runtime_commands,
+                    "load_identity_document",
+                    return_value={
+                        "platform_base_url": "https://tinyloop.example",
+                        "computer_id": 42,
+                    },
+                ),
+                patch.object(launcher, "_run_command", fake_run_command),
+            ):
+                result = runner.execute(
+                    {
+                        "command_id": "cmd-hermes-takeover-local",
+                        "idempotency_key": "idem-hermes-takeover-local",
+                        "kind": "install_hermes_takeover",
+                        "spec": {
+                            "installer_ref": "v0.0.30",
+                            "local_dev_token": "dev-token-secret",
+                        },
+                    }
+                )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertTrue(result["result"]["local_dev"])
+            self.assertTrue(result["result"]["run_foreground"])
+            self.assertNotIn("dev-token-secret", result["result"]["detail"])
+            script = calls[0][2]
+            self.assertIn("--local-dev-token dev-token-secret", script)
+            self.assertIn("--run-foreground", script)
 
     def test_invalid_command_id_returns_failed_without_raising(self) -> None:
         # A legacy/malformed platform command (e.g. the type-based
