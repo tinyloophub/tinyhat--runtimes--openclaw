@@ -16,22 +16,32 @@ HERMES_REF=""
 PLATFORM_URL=""
 COMPUTER_ID=""
 
+require_value() {
+  local flag="$1"
+  local value="${2:-}"
+  [[ -n "${value}" && "${value}" != --* ]] || fail "${flag} requires a value"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --hermes-installer-url)
-      HERMES_INSTALLER_URL="${2:-}"
+      require_value "$1" "${2:-}"
+      HERMES_INSTALLER_URL="$2"
       shift 2
       ;;
     --hermes-ref)
-      HERMES_REF="${2:-}"
+      require_value "$1" "${2:-}"
+      HERMES_REF="$2"
       shift 2
       ;;
     --platform-url)
-      PLATFORM_URL="${2:-}"
+      require_value "$1" "${2:-}"
+      PLATFORM_URL="$2"
       shift 2
       ;;
     --computer-id)
-      COMPUTER_ID="${2:-}"
+      require_value "$1" "${2:-}"
+      COMPUTER_ID="$2"
       shift 2
       ;;
     *)
@@ -47,6 +57,9 @@ done
 [[ "${COMPUTER_ID}" =~ ^[0-9]+$ ]] || fail "--computer-id must be numeric"
 [[ "${HERMES_INSTALLER_URL}" == https://raw.githubusercontent.com/tinyloophub/tinyhat--runtimes--hermes/*/install.sh ]] \
   || fail "unsupported Hermes installer URL"
+[[ "${HERMES_REF}" != *..* ]] || fail "--hermes-ref must not contain '..'"
+[[ "${HERMES_INSTALLER_URL}" != *"/../"* && "${HERMES_INSTALLER_URL}" != *"/.." ]] \
+  || fail "--hermes-installer-url must not contain path traversal"
 
 command -v bash >/dev/null 2>&1 || fail "bash is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
@@ -58,6 +71,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 WORKDIR="${MIGRATION_ROOT}/${RUN_ID}"
 BACKUP_ARCHIVE="${WORKDIR}/openclaw-backup.tar.zst"
 BACKUP_OUTPUT="${WORKDIR}/openclaw-backup-result.json"
+INSTALLER_SCRIPT="${WORKDIR}/hermes-install.sh"
 MANIFEST="${WORKDIR}/manifest.json"
 
 mkdir -p "${WORKDIR}"
@@ -132,8 +146,22 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
 fi
 
-log "running Hermes installer ${HERMES_REF}"
-if ! curl -fsSL "${HERMES_INSTALLER_URL}" | bash -s -- \
+log "fetching Hermes installer ${HERMES_REF}"
+if ! curl --proto '=https' --tlsv1.2 -fsSL \
+  -o "${INSTALLER_SCRIPT}" \
+  "${HERMES_INSTALLER_URL}"; then
+  write_manifest "failed" "${BACKUP_SHA}" "Hermes installer download failed"
+  fail "Hermes installer download failed"
+fi
+[[ -s "${INSTALLER_SCRIPT}" ]] || {
+  write_manifest "failed" "${BACKUP_SHA}" "Hermes installer was empty"
+  fail "Hermes installer was empty"
+}
+chmod 0700 "${INSTALLER_SCRIPT}" 2>/dev/null || true
+INSTALLER_SHA="$(sha256_file "${INSTALLER_SCRIPT}")"
+
+log "running Hermes installer ${HERMES_REF} sha256=${INSTALLER_SHA}"
+if ! bash "${INSTALLER_SCRIPT}" \
   --ref "${HERMES_REF}" \
   --platform-url "${PLATFORM_URL}" \
   --computer-id "${COMPUTER_ID}"; then

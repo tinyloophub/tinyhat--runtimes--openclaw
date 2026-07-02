@@ -5329,5 +5329,35 @@ class StageAndActivateBundleTests(unittest.TestCase):
                     )
 
 
+class OpenClawHermesTakeoverScriptTests(unittest.TestCase):
+    def _script_text(self) -> str:
+        return (_REPO_ROOT / "scripts" / "openclaw-hermes-takeover.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_takeover_script_cleans_up_live_runtime_units(self) -> None:
+        script = self._script_text()
+
+        for unit in (
+            "tinyhat-runtime-gateway.service",
+            "tinyhat-runtime-platform.service",
+            "tinyhat-runtime-attestation.service",
+        ):
+            self.assertIn(unit, script)
+
+    def test_takeover_script_downloads_installer_before_execution(self) -> None:
+        script = self._script_text()
+
+        self.assertIn('-o "${INSTALLER_SCRIPT}"', script)
+        self.assertIn('bash "${INSTALLER_SCRIPT}"', script)
+        self.assertNotIn('curl -fsSL "${HERMES_INSTALLER_URL}" | bash', script)
+
+    def test_takeover_script_rejects_path_traversal_refs(self) -> None:
+        script = self._script_text()
+
+        self.assertIn('--hermes-ref must not contain', script)
+        self.assertIn('--hermes-installer-url must not contain path traversal', script)
+
+
 if __name__ == "__main__":
     unittest.main()
