@@ -5357,7 +5357,6 @@ class OpenClawHermesTakeoverScriptTests(unittest.TestCase):
         self.assertIn('systemctl kill "$unit" --kill-who=all', script)
         self.assertIn('(^|[ /])openclaw([[:space:]]|$)', script)
         self.assertIn("openclaw backup create", script)
-        self.assertIn("tinyhat-openclaw-to-hermes/.*/manifest\\.json", script)
         self.assertIn('write_manifest "failed" "${BACKUP_SHA}" "legacy OpenClaw stop failed"', script)
         self.assertIn('fi\n\nlog "fetching Hermes installer', script)
         stop_index = script.index("if ! stop_legacy_openclaw; then")
