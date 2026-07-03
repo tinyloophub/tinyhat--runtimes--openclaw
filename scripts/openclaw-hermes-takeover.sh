@@ -65,6 +65,8 @@ command -v bash >/dev/null 2>&1 || fail "bash is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v openclaw >/dev/null 2>&1 || fail "openclaw CLI is required for verified backup"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for migration manifest"
+command -v pgrep >/dev/null 2>&1 || fail "pgrep is required to verify legacy process shutdown"
+command -v ps >/dev/null 2>&1 || fail "ps is required to verify legacy process shutdown"
 
 MIGRATION_ROOT="${TINYHAT_OPENCLAW_HERMES_MIGRATION_ROOT:-/var/lib/tinyhat-migrations/openclaw-to-hermes}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -82,6 +84,49 @@ sha256_file() {
     sha256sum "$1" | awk '{print $1}'
   else
     shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+legacy_openclaw_pids() {
+  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat/|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation))' \
+    2>/dev/null \
+    | while read -r pid; do
+        [[ -n "${pid}" ]] || continue
+        [[ "${pid}" != "$$" ]] || continue
+        ps -p "${pid}" -o args= 2>/dev/null \
+          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes' >/dev/null \
+          && printf '%s\n' "${pid}"
+      done
+}
+
+stop_legacy_openclaw() {
+  log "stopping legacy OpenClaw services if present"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop tinyhat-openclaw-gateway.service tinyhat-runtime-gateway.service >/dev/null 2>&1 || true
+    systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
+  fi
+
+  local pids=""
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  if [[ -n "${pids}" ]]; then
+    log "terminating legacy OpenClaw process(es): ${pids//$'\n'/ }"
+    # shellcheck disable=SC2086
+    kill ${pids} >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  if [[ -n "${pids}" ]]; then
+    log "force killing legacy OpenClaw process(es): ${pids//$'\n'/ }"
+    # shellcheck disable=SC2086
+    kill -9 ${pids} >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  if [[ -n "${pids}" ]]; then
+    echo "[openclaw-hermes-takeover] ERROR: legacy OpenClaw processes are still running: ${pids//$'\n'/ }" >&2
+    return 1
   fi
 }
 
@@ -140,10 +185,9 @@ BACKUP_SHA="$(sha256_file "${BACKUP_ARCHIVE}")"
 write_manifest "backup_ready" "${BACKUP_SHA}" "verified OpenClaw backup created"
 log "backup ready: ${BACKUP_ARCHIVE} sha256=${BACKUP_SHA}"
 
-log "stopping legacy OpenClaw services if present"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop tinyhat-openclaw-gateway.service tinyhat-runtime-gateway.service >/dev/null 2>&1 || true
-  systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
+if ! stop_legacy_openclaw; then
+  write_manifest "failed" "${BACKUP_SHA}" "legacy OpenClaw stop failed"
+  fail "legacy OpenClaw stop failed"
 fi
 
 log "fetching Hermes installer ${HERMES_REF}"
