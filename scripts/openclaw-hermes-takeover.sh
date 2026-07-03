@@ -65,6 +65,8 @@ command -v bash >/dev/null 2>&1 || fail "bash is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v openclaw >/dev/null 2>&1 || fail "openclaw CLI is required for verified backup"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for migration manifest"
+command -v pgrep >/dev/null 2>&1 || fail "pgrep is required to verify legacy process shutdown"
+command -v ps >/dev/null 2>&1 || fail "ps is required to verify legacy process shutdown"
 
 MIGRATION_ROOT="${TINYHAT_OPENCLAW_HERMES_MIGRATION_ROOT:-/var/lib/tinyhat-migrations/openclaw-to-hermes}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -86,7 +88,7 @@ sha256_file() {
 }
 
 legacy_openclaw_pids() {
-  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation)|openclaw gateway)' \
+  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat/|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation))' \
     2>/dev/null \
     | while read -r pid; do
         [[ -n "${pid}" ]] || continue
@@ -122,7 +124,10 @@ stop_legacy_openclaw() {
   fi
 
   pids="$(legacy_openclaw_pids | sort -u || true)"
-  [[ -z "${pids}" ]] || fail "legacy OpenClaw processes are still running: ${pids//$'\n'/ }"
+  if [[ -n "${pids}" ]]; then
+    echo "[openclaw-hermes-takeover] ERROR: legacy OpenClaw processes are still running: ${pids//$'\n'/ }" >&2
+    return 1
+  fi
 }
 
 write_manifest() {
@@ -180,7 +185,10 @@ BACKUP_SHA="$(sha256_file "${BACKUP_ARCHIVE}")"
 write_manifest "backup_ready" "${BACKUP_SHA}" "verified OpenClaw backup created"
 log "backup ready: ${BACKUP_ARCHIVE} sha256=${BACKUP_SHA}"
 
-stop_legacy_openclaw
+if ! stop_legacy_openclaw; then
+  write_manifest "failed" "${BACKUP_SHA}" "legacy OpenClaw stop failed"
+  fail "legacy OpenClaw stop failed"
+fi
 
 log "fetching Hermes installer ${HERMES_REF}"
 if ! curl --proto '=https' --tlsv1.2 -fsSL \
