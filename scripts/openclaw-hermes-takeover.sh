@@ -85,6 +85,46 @@ sha256_file() {
   fi
 }
 
+legacy_openclaw_pids() {
+  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation)|openclaw gateway)' \
+    2>/dev/null \
+    | while read -r pid; do
+        [[ -n "${pid}" ]] || continue
+        [[ "${pid}" != "$$" ]] || continue
+        ps -p "${pid}" -o args= 2>/dev/null \
+          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes' >/dev/null \
+          && printf '%s\n' "${pid}"
+      done
+}
+
+stop_legacy_openclaw() {
+  log "stopping legacy OpenClaw services if present"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop tinyhat-openclaw-gateway.service tinyhat-runtime-gateway.service >/dev/null 2>&1 || true
+    systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
+  fi
+
+  local pids=""
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  if [[ -n "${pids}" ]]; then
+    log "terminating legacy OpenClaw process(es): ${pids//$'\n'/ }"
+    # shellcheck disable=SC2086
+    kill ${pids} >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  if [[ -n "${pids}" ]]; then
+    log "force killing legacy OpenClaw process(es): ${pids//$'\n'/ }"
+    # shellcheck disable=SC2086
+    kill -9 ${pids} >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  pids="$(legacy_openclaw_pids | sort -u || true)"
+  [[ -z "${pids}" ]] || fail "legacy OpenClaw processes are still running: ${pids//$'\n'/ }"
+}
+
 write_manifest() {
   local status="$1"
   local backup_sha="${2:-}"
@@ -140,11 +180,7 @@ BACKUP_SHA="$(sha256_file "${BACKUP_ARCHIVE}")"
 write_manifest "backup_ready" "${BACKUP_SHA}" "verified OpenClaw backup created"
 log "backup ready: ${BACKUP_ARCHIVE} sha256=${BACKUP_SHA}"
 
-log "stopping legacy OpenClaw services if present"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop tinyhat-openclaw-gateway.service tinyhat-runtime-gateway.service >/dev/null 2>&1 || true
-  systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
-fi
+stop_legacy_openclaw
 
 log "fetching Hermes installer ${HERMES_REF}"
 if ! curl --proto '=https' --tlsv1.2 -fsSL \

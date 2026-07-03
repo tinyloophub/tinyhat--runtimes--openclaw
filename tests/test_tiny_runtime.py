@@ -5345,6 +5345,16 @@ class OpenClawHermesTakeoverScriptTests(unittest.TestCase):
         ):
             self.assertIn(unit, script)
 
+    def test_takeover_script_verifies_legacy_stop_before_hermes_install(self) -> None:
+        script = self._script_text()
+
+        self.assertIn('stop_legacy_openclaw\n\nlog "fetching Hermes installer', script)
+        stop_index = script.index('stop_legacy_openclaw\n\nlog "fetching')
+        install_index = script.index('bash "${INSTALLER_SCRIPT}"')
+        self.assertLess(stop_index, install_index)
+        self.assertIn("legacy OpenClaw processes are still running", script)
+        self.assertIn("legacy_openclaw_pids", script)
+
     def test_takeover_script_downloads_installer_before_execution(self) -> None:
         script = self._script_text()
 
