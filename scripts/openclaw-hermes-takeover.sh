@@ -75,6 +75,13 @@ BACKUP_ARCHIVE="${WORKDIR}/openclaw-backup.tar.zst"
 BACKUP_OUTPUT="${WORKDIR}/openclaw-backup-result.json"
 INSTALLER_SCRIPT="${WORKDIR}/hermes-install.sh"
 MANIFEST="${WORKDIR}/manifest.json"
+LEGACY_OPENCLAW_UNITS=(
+  tinyhat-openclaw-gateway.service
+  tinyhat-openclaw.service
+  tinyhat-runtime-gateway.service
+  tinyhat-runtime-platform.service
+  tinyhat-runtime-attestation.service
+)
 
 mkdir -p "${WORKDIR}"
 chmod 0700 "${MIGRATION_ROOT}" "${WORKDIR}" 2>/dev/null || true
@@ -88,13 +95,13 @@ sha256_file() {
 }
 
 legacy_openclaw_pids() {
-  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat/|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation))' \
+  pgrep -f '(/var/lib/tinyhat-openclaw|/opt/tinyhat/|tinyhat-openclaw|tinyhat-runtime-(gateway|platform|attestation)|(^|[ /])openclaw([[:space:]]|$)|python[0-9.]* .*openclaw)' \
     2>/dev/null \
     | while read -r pid; do
         [[ -n "${pid}" ]] || continue
         [[ "${pid}" != "$$" ]] || continue
         ps -p "${pid}" -o args= 2>/dev/null \
-          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes' >/dev/null \
+          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes|openclaw backup create|tinyhat-openclaw-to-hermes/.*/manifest\.json|tinyhat-openclaw-to-hermes/manifest\.json' >/dev/null \
           && printf '%s\n' "${pid}"
       done
 }
@@ -102,8 +109,12 @@ legacy_openclaw_pids() {
 stop_legacy_openclaw() {
   log "stopping legacy OpenClaw services if present"
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop tinyhat-openclaw-gateway.service tinyhat-runtime-gateway.service >/dev/null 2>&1 || true
-    systemctl stop tinyhat-openclaw.service tinyhat-runtime-platform.service tinyhat-runtime-attestation.service >/dev/null 2>&1 || true
+    systemctl reset-failed "${LEGACY_OPENCLAW_UNITS[@]}" >/dev/null 2>&1 || true
+    for unit in "${LEGACY_OPENCLAW_UNITS[@]}"; do
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      systemctl kill "$unit" --kill-who=all >/dev/null 2>&1 || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
   local pids=""
@@ -171,6 +182,13 @@ PY
 }
 
 write_manifest "starting" "" "migration workspace created"
+
+if ! stop_legacy_openclaw; then
+  write_manifest "failed" "" "legacy OpenClaw stop failed"
+  fail "legacy OpenClaw stop failed"
+fi
+
+write_manifest "legacy_stopped" "" "legacy OpenClaw services and processes stopped"
 
 log "creating verified OpenClaw backup"
 if ! openclaw backup create --output "${BACKUP_ARCHIVE}" --verify --json >"${BACKUP_OUTPUT}" 2>&1; then
