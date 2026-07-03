@@ -101,7 +101,7 @@ legacy_openclaw_pids() {
         [[ -n "${pid}" ]] || continue
         [[ "${pid}" != "$$" ]] || continue
         ps -p "${pid}" -o args= 2>/dev/null \
-          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes|openclaw backup create' >/dev/null \
+          | grep -Ev 'openclaw-hermes-takeover|hermes-install.sh|tinyhat--runtimes--hermes|openclaw backup create|tinyhat-openclaw-to-hermes/.*/manifest\.json|tinyhat-openclaw-to-hermes/manifest\.json' >/dev/null \
           && printf '%s\n' "${pid}"
       done
 }
