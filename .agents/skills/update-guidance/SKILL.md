@@ -5,12 +5,17 @@ description: Edit AGENTS.md, CLAUDE adapters, or SKILL.md files in the public Ti
 
 # update-guidance - runtime repo adapter
 
-Parent alignment: when this standalone repo is nested under Tinyloop, skim the same-named skill from the parent skill root described in `AGENTS.md` and the parent guidance files before changing skill shape.
+Apply the [shared skill contract](../../../AGENTS.md#shared-skill-contract).
 
 ## Rules
 
-- Keep always-loaded files (`AGENTS.md`) short; put procedures in skills.
+- Keep repository-wide constraints and task routing in `AGENTS.md`; put procedures
+  in the relevant skill. Keep `CLAUDE.md` as an `@AGENTS.md` import.
+- Before removing a rule, identify whether it is duplicated, obsolete, or still
+  needed. Preserve safety boundaries, identity, tests, review, and release gates;
+  verify every moved rule remains reachable from its task trigger.
 - Canonical dev skills live in `.agents/skills`.
 - Claude adapters under `.claude/skills` are symlinks only.
 - If a parent workflow changes, update the adapter skill's overrides, not a copied parent body.
-- Run `python3 scripts/check_dev_skills.py` after any skill or adapter change.
+- Run the guidance checks in [define-tests](../define-tests/SKILL.md), and check
+  changed local links plus the Claude import and skill symlinks.

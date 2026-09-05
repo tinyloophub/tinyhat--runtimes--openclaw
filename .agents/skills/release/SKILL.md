@@ -5,7 +5,7 @@ description: Cut or verify a release of the public Tinyhat OpenClaw runtime repo
 
 # release - runtime repo adapter
 
-Parent alignment: when this standalone repo is nested under Tinyloop, skim the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
+Apply the [shared skill contract](../../../AGENTS.md#shared-skill-contract).
 This repo releases the runtime package itself.
 
 ## Before Release
@@ -23,6 +23,8 @@ This repo releases the runtime package itself.
 
 ## Release Shape
 
-- Tags use `vX.Y.Z`.
+- Follow [RELEASING.md](../../../RELEASING.md) for final `vX.Y.Z` and
+  candidate `vX.Y.Z-rc.N` tags, immutable tags, matching release titles, and
+  Pre-release/Latest markers. Verify the live release payload before calling it done.
 - The GitHub release notes should be public-safe and should name any required companion monorepo or plugin repo PRs.
 - Do not publish a runtime that pins or requires unavailable plugin behavior unless the release notes call out the dependency.

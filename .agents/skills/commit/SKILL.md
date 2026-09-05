@@ -5,28 +5,16 @@ description: Commit changes in the public Tinyhat OpenClaw runtime repo. Use par
 
 # commit - runtime repo adapter
 
-Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
+Apply the [shared skill contract](../../../AGENTS.md#shared-skill-contract).
 Apply the runtime-specific checks below instead of the monorepo `./scripts/pre-commit.sh` gate.
 
 ## Steps
 
 1. Run `git status --short` and group the diff into one logical change.
    Split unrelated docs, runtime behavior, CI, and release changes into separate commits.
-2. Run baseline checks:
-
-   ```bash
-   git diff --check
-   python3 scripts/check_dev_skills.py
-   ```
-
-3. For runtime code, bootstrap, or dev image changes, also run:
-
-   ```bash
-   bash -n bootstrap.sh dev/entrypoint.sh
-   python -m unittest tests.test_supervisor -v
-   docker build -f dev/Dockerfile -t tinyhat-openclaw-runtime:<topic> .
-   ```
-
+2. Run the applicable checks from [define-tests](../define-tests/SKILL.md).
+   These replace the monorepo pre-commit gate. Fix failures; never bypass hooks.
+3. Stage only this logical change and review the staged diff.
 4. Commit with a Conventional Commit subject such as:
 
    ```bash
