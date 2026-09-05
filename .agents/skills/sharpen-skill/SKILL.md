@@ -5,7 +5,7 @@ description: Edit or add development skills in the public Tinyhat OpenClaw runti
 
 # sharpen-skill - runtime repo adapter
 
-Parent alignment: when this standalone repo is nested under Tinyloop, first read the same-named skill from the parent skill root described in `AGENTS.md`, then apply this repo's override.
+Apply the [shared skill contract](../../../AGENTS.md#shared-skill-contract).
 Then keep runtime repo skills small and adapter-shaped.
 
 ## Rules
